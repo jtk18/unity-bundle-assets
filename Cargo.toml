@@ -1,0 +1,15 @@
+[package]
+name = "unity-sprites"
+version = "0.1.0"
+edition = "2021"
+description = "Read Unity serialized asset files and export their sprites as images, in pure Rust"
+license = "MIT"
+repository = "https://github.com/jtk18/unity-sprites"
+keywords = ["unity", "sprite", "texture", "assets"]
+categories = ["game-development", "parser-implementations"]
+
+[dependencies]
+thiserror = "2"
+
+[dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }
