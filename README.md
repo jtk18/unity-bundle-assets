@@ -14,6 +14,9 @@ for sprite in assets.sprites(|name| name.starts_with("Icon_"))? {
 `sprites` returns sprites ordered by the texture that holds them, so `export` decodes each
 texture (a 4096x4096 atlas is 64 MB decoded) once.
 
+To use several threads, group sprites by `texture_id`, then per group call `decode_texture` once
+and `cut` for each sprite. Both take `&self`.
+
 ## What it handles
 
 - Serialized file format versions 17 to 22, little- or big-endian, with or without type

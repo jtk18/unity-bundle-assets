@@ -20,6 +20,10 @@ pub struct Image {
 }
 
 /// One serialized file opened for sprite export.
+///
+/// Single-threaded: call [`Assets::export`] on sprites from [`Assets::sprites`]. Parallel:
+/// group sprites by [`Assets::texture_id`], then per group [`Assets::decode_texture`] once and
+/// [`Assets::cut`] each sprite; both take `&self`.
 pub struct Assets {
     pub file: SerializedFile,
     dir: PathBuf,
@@ -77,40 +81,48 @@ impl Assets {
             .unwrap_or(sprite.own)
     }
 
-    /// Decode a texture in this file to RGBA8, bottom row first (Unity's order).
-    fn texture(&mut self, path_id: i64) -> Result<&Image> {
-        if self.cache.as_ref().is_none_or(|(id, _)| *id != path_id) {
-            let object = self
-                .file
-                .object(path_id)
-                .ok_or_else(|| Error::Invalid(format!("no texture object {path_id}")))?;
-            if object.class_id != class::TEXTURE_2D {
-                return Err(Error::Invalid(format!(
-                    "object {path_id} is not a Texture2D"
-                )));
-            }
-            let texture = Texture2D::read(&self.file, object)?;
-            let data = texture.data(&self.dir)?;
-            let rgba = decode::decode(texture.format, texture.width, texture.height, &data)
-                .map_err(|e| match e {
+    /// Decode a texture in this file to RGBA8, bottom row first (Unity's order). Takes
+    /// `&self`, so textures can be decoded on several threads at once; pair it with
+    /// [`Assets::cut`].
+    pub fn decode_texture(&self, path_id: i64) -> Result<Image> {
+        let object = self
+            .file
+            .object(path_id)
+            .ok_or_else(|| Error::Invalid(format!("no texture object {path_id}")))?;
+        if object.class_id != class::TEXTURE_2D {
+            return Err(Error::Invalid(format!(
+                "object {path_id} is not a Texture2D"
+            )));
+        }
+        let texture = Texture2D::read(&self.file, object)?;
+        let data = texture.data(&self.dir)?;
+        let rgba =
+            decode::decode(texture.format, texture.width, texture.height, &data).map_err(|e| {
+                match e {
                     Error::Unsupported(what) => {
                         Error::Unsupported(format!("{what} (texture {})", texture.name))
                     }
                     e => e,
-                })?;
-            self.cache = Some((
-                path_id,
-                Image {
-                    width: texture.width,
-                    height: texture.height,
-                    rgba,
-                },
-            ));
-        }
-        Ok(&self.cache.as_ref().unwrap().1)
+                }
+            })?;
+        Ok(Image {
+            width: texture.width,
+            height: texture.height,
+            rgba,
+        })
     }
 
+    /// Export one sprite, decoding its texture unless it's the one decoded last.
     pub fn export(&mut self, sprite: &Sprite) -> Result<Image> {
+        let texture = self.texture_id(sprite)?;
+        if self.cache.as_ref().is_none_or(|(id, _)| *id != texture) {
+            self.cache = Some((texture, self.decode_texture(texture)?));
+        }
+        self.cut(sprite, &self.cache.as_ref().unwrap().1)
+    }
+
+    /// The path ID of the texture holding the sprite's pixels.
+    pub fn texture_id(&self, sprite: &Sprite) -> Result<i64> {
         let placement = self.placement(sprite);
         if placement.texture.is_null() {
             return Err(Error::Invalid(format!(
@@ -124,7 +136,12 @@ impl Assets {
                 sprite.name
             )));
         }
-        let texture = self.texture(placement.texture.path_id)?;
+        Ok(placement.texture.path_id)
+    }
+
+    /// Cut a sprite out of its decoded texture (from [`Assets::decode_texture`]).
+    pub fn cut(&self, sprite: &Sprite, texture: &Image) -> Result<Image> {
+        let placement = self.placement(sprite);
         let r = placement.texture_rect;
         let x0 = (r.x.floor().max(0.0) as u32).min(texture.width);
         let y0 = (r.y.floor().max(0.0) as u32).min(texture.height);
