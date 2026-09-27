@@ -52,6 +52,13 @@ pub struct SerializedFile {
 
 impl SerializedFile {
     pub fn parse(data: Vec<u8>) -> Result<SerializedFile> {
+        if crate::bundle::is_bundle(&data) {
+            return Err(Error::Unsupported(
+                "this is an asset bundle (UnityFS), not a serialized file; open it with \
+                 Assets::open or Bundle::parse"
+                    .into(),
+            ));
+        }
         let mut r = Reader::new(&data, true);
         let _metadata_size = r.u32()?;
         let mut file_size = r.u32()? as u64;

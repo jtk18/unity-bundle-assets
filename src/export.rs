@@ -2,6 +2,7 @@
 //! texture, crop, undo packing rotation, mask tight-packed sprites to their mesh, and flip to
 //! top-down rows.
 
+use crate::bundle::{self, Bundle};
 use crate::decode;
 use crate::serialized::{class, SerializedFile};
 use crate::sprite::{Placement, Rotation, Sprite, SpriteAtlas};
@@ -10,6 +11,7 @@ use crate::{Error, Result};
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// An RGBA8 image, top row first.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19,23 +21,63 @@ pub struct Image {
     pub rgba: Vec<u8>,
 }
 
-/// One serialized file opened for sprite export.
+/// One serialized file opened for sprite and texture export: a plain file (`*.assets`,
+/// `level*`) or one inside an asset bundle.
 ///
 /// Single-threaded: call [`Assets::export`] on sprites from [`Assets::sprites`]. Parallel:
 /// group sprites by [`Assets::texture_id`], then per group [`Assets::decode_texture`] once and
 /// [`Assets::cut`] each sprite; both take `&self`.
 pub struct Assets {
     pub file: SerializedFile,
-    dir: PathBuf,
+    streams: Streams,
     atlases: HashMap<i64, SpriteAtlas>,
     /// The most recently decoded texture. Sprites sharing an atlas decode it once when
     /// exported in texture order (see [`Assets::sprites`]).
     cache: Option<(i64, Image)>,
 }
 
+/// Where streamed texture data lives.
+enum Streams {
+    /// `.resS` files beside the serialized file.
+    Dir(PathBuf),
+    /// `.resS` entries in the same bundle.
+    Bundle(Arc<Bundle>),
+}
+
 impl Assets {
+    /// Open a serialized file, or an asset bundle holding exactly one. For a bundle holding
+    /// several (scene bundles), use [`Bundle::parse`] and [`Assets::from_bundle`].
     pub fn open(path: &Path) -> Result<Assets> {
-        let file = SerializedFile::open(path)?;
+        let data = std::fs::read(path)?;
+        if !bundle::is_bundle(&data) {
+            let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
+            return Assets::new(SerializedFile::parse(data)?, Streams::Dir(dir));
+        }
+        let bundle = Arc::new(Bundle::parse(&data)?);
+        drop(data);
+        let names: Vec<String> = bundle.serialized_files().map(|e| e.path.clone()).collect();
+        match names.as_slice() {
+            [one] => Assets::from_bundle(bundle.clone(), one),
+            _ => Err(Error::Unsupported(format!(
+                "bundle holds {} serialized files ({}); open each with Assets::from_bundle",
+                names.len(),
+                names.join(", ")
+            ))),
+        }
+    }
+
+    /// Open the serialized file at `path` inside `bundle`.
+    pub fn from_bundle(bundle: Arc<Bundle>, path: &str) -> Result<Assets> {
+        let entry = bundle
+            .entries
+            .iter()
+            .find(|e| e.path == path)
+            .ok_or_else(|| Error::Invalid(format!("bundle has no entry {path}")))?;
+        let file = SerializedFile::parse(bundle.bytes(entry).to_vec())?;
+        Assets::new(file, Streams::Bundle(bundle))
+    }
+
+    fn new(file: SerializedFile, streams: Streams) -> Result<Assets> {
         let mut atlases = HashMap::new();
         for o in file
             .objects
@@ -46,7 +88,7 @@ impl Assets {
         }
         Ok(Assets {
             file,
-            dir: path.parent().map(Path::to_path_buf).unwrap_or_default(),
+            streams,
             atlases,
             cache: None,
         })
@@ -69,6 +111,18 @@ impl Assets {
         }
         out.sort_by_key(|s| self.placement(s).texture.path_id);
         Ok(out)
+    }
+
+    /// Every texture whose name passes `keep`, as (path ID, name), for
+    /// [`Assets::decode_texture`].
+    pub fn textures(&self, keep: impl Fn(&str) -> bool) -> Vec<(i64, String)> {
+        self.file
+            .objects
+            .iter()
+            .filter(|o| o.class_id == class::TEXTURE_2D)
+            .filter_map(|o| Some((o.path_id, self.file.name(o)?)))
+            .filter(|(_, name)| keep(name))
+            .collect()
     }
 
     /// Where the sprite's pixels are: its atlas entry when it has one, its own render
@@ -95,7 +149,10 @@ impl Assets {
             )));
         }
         let texture = Texture2D::read(&self.file, object)?;
-        let data = texture.data(&self.dir)?;
+        let data = match &self.streams {
+            Streams::Dir(dir) => texture.data(dir)?,
+            Streams::Bundle(bundle) => texture.data_in(bundle)?,
+        };
         let rgba =
             decode::decode(texture.format, texture.width, texture.height, &data).map_err(|e| {
                 match e {

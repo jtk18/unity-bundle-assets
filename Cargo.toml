@@ -2,13 +2,14 @@
 name = "unity-sprites"
 version = "0.1.0"
 edition = "2021"
-description = "Read Unity serialized asset files and export their sprites as images, in pure Rust"
+description = "Read Unity serialized asset files and asset bundles, and export their sprites and textures as images, in pure Rust"
 license = "MIT"
 repository = "https://github.com/jtk18/unity-sprites"
-keywords = ["unity", "sprite", "texture", "assets"]
+keywords = ["unity", "sprite", "texture", "assets", "assetbundle"]
 categories = ["game-development", "parser-implementations"]
 
 [dependencies]
+lzma-rs = "0.3"
 thiserror = "2"
 
 [dev-dependencies]

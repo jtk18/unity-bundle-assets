@@ -1,5 +1,7 @@
-//! Read Unity serialized asset files and export their sprites, in pure Rust.
+//! Read Unity serialized asset files and asset bundles, and export their sprites and
+//! textures, in pure Rust.
 
+pub mod bundle;
 pub mod decode;
 pub mod export;
 pub mod reader;
@@ -7,6 +9,7 @@ pub mod serialized;
 pub mod sprite;
 pub mod texture;
 
+pub use bundle::Bundle;
 pub use export::{Assets, Image};
 pub use serialized::{class, ObjectInfo, SerializedFile};
 pub use sprite::{Placement, Sprite, SpriteAtlas};
