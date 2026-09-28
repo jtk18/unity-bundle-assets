@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use unity_bundle_assets::{Assets, Settings};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let path = std::env::args().nth(1).ok_or("usage: survey <file>")?;
+    let path = std::env::args_os().nth(1).ok_or("usage: survey <file>")?;
     let assets = Assets::open(&path)?;
     let list = assets.sprites(|_| true);
     for s in list.skipped.iter().take(5) {

@@ -46,6 +46,9 @@ fn format_numbers_are_unitys() {
     assert_eq!(
         [
             crate_format::ALPHA8,
+            crate_format::ARGB4444,
+            crate_format::RGB565,
+            crate_format::RGBA4444,
             crate_format::RGB24,
             crate_format::RGBA32,
             crate_format::ARGB32,
@@ -53,7 +56,7 @@ fn format_numbers_are_unitys() {
             crate_format::DXT5,
             crate_format::BGRA32
         ],
-        [1, 3, 4, 5, 10, 12, 14]
+        [1, 2, 7, 13, 3, 4, 5, 10, 12, 14]
     );
 }
 
@@ -308,11 +311,14 @@ fn kept(img: &Image) -> Vec<u8> {
 
 #[test]
 fn mask_and_copy_work_are_charged() {
-    // Decoding 16 pixels, masking a 4x4 box, copying 16: 48 in all.
-    let (_d, mut a, s) = one_sprite(tight(&TRIANGLE, 0), Limits::DEFAULT.with_max_total_work(48));
+    // Decoding 16 pixels, masking, copying 16. The triangle (0,0) (4,0) (0,4) crosses rows
+    // 0 to 3; each row's span, from where its sample lines (y + 0.25, y + 0.75) meet the
+    // triangle widened a column each side and cut to the 4 columns, holds 4, 4, 3 and 2
+    // columns. A step for each row and a test for each column: 17. In all, 49.
+    let (_d, mut a, s) = one_sprite(tight(&TRIANGLE, 0), Limits::DEFAULT.with_max_total_work(49));
     assert!(a.export(&s).is_ok());
-    assert_eq!(a.work_done(), 48);
-    let (_d, mut a, s) = one_sprite(tight(&TRIANGLE, 0), Limits::DEFAULT.with_max_total_work(47));
+    assert_eq!(a.work_done(), 49);
+    let (_d, mut a, s) = one_sprite(tight(&TRIANGLE, 0), Limits::DEFAULT.with_max_total_work(48));
     assert!(matches!(
         a.export(&s),
         Err(Error::LimitExceeded {
@@ -497,7 +503,7 @@ fn stream_names_that_are_devices_or_data_streams_are_refused() {
         );
     }
     // Names that only look like devices are ordinary files.
-    for name in ["COM0.resS", "COM10.resS", "CONSOLE.resS", "lpt.resS"] {
+    for name in ["COM10.resS", "CONSOLE.resS", "lpt.resS", "COMA.resS"] {
         dir.file(name, &[3; 16]);
         let px = Pixels::Streamed {
             path: name,
@@ -871,7 +877,9 @@ fn an_undecodable_texture_is_refused_before_its_stream_is_read() {
     let a = Assets::open(dir.file("t.assets", &file_2018(&[(7, TEXTURE_2D, obj)]))).unwrap();
     match a.decode_texture(7) {
         Err(Error::UnsupportedTextureFormat {
-            texture, format, ..
+            name: texture,
+            format,
+            ..
         }) => {
             assert_eq!((texture.as_deref(), format), (Some("t"), format::BC7));
         }
@@ -1049,8 +1057,9 @@ fn export_tries_a_failing_texture_once() {
     let list = a.sprites(|_| true);
     let first = a.export(&list.sprites[0]).unwrap_err();
     assert!(
-        matches!(&first, Error::TextureUnreadable { texture: TEX, error, .. }
-            if error.io_error().map(std::io::Error::kind) == Some(std::io::ErrorKind::NotFound)),
+        matches!(&first, Error::TextureUnreadable { path_id: TEX, .. }
+            if first.io_error().map(std::io::Error::kind) == Some(std::io::ErrorKind::NotFound)
+                && matches!(first.root(), Error::Io { .. })),
         "{first:?}"
     );
     // The file appears; the failure is remembered until the cache is cleared.
@@ -1062,9 +1071,9 @@ fn export_tries_a_failing_texture_once() {
 
 #[test]
 fn a_mask_refused_for_the_total_is_never_built() {
-    // A tight 4x4 sprite: decode 16, mask 16, copy 16. At a total of 47 the mask and copy
+    // A tight 4x4 sprite: decode 16, mask 17, copy 16. At a total of 48 the mask and copy
     // are refused together, before either starts, and nothing is charged for them.
-    let (_d, mut a, s) = one_sprite(tight(&TRIANGLE, 0), Limits::DEFAULT.with_max_total_work(47));
+    let (_d, mut a, s) = one_sprite(tight(&TRIANGLE, 0), Limits::DEFAULT.with_max_total_work(48));
     for _ in 0..3 {
         assert!(matches!(
             a.export(&s),
@@ -1094,6 +1103,8 @@ fn least_decompression_limit(bundle: &[u8]) -> u64 {
     hi
 }
 
+// The charges below are in-memory sizes on a 64-bit target.
+#[cfg(target_pointer_width = "64")]
 #[test]
 fn the_directory_and_lzma_working_memory_are_charged() {
     let data: Vec<u8> = (0..4000u32).map(|i| (i * 7 % 251) as u8).collect();
@@ -1114,9 +1125,10 @@ fn the_directory_and_lzma_working_memory_are_charged() {
     // and twice the largest block for the dictionary.
     let tables = 2 * (0x300 << 3) + 4096;
     let one = least_decompression_limit(&with(vec![1]));
-    assert_eq!(one, stored + tables + 2 * 4000);
+    // (The dictionary never counts as less than lzma-rs's 4 KiB floor.)
+    assert_eq!(one, stored + tables + 2 * 4096);
     let four = least_decompression_limit(&with(vec![1; 4]));
-    assert_eq!(four, stored + 3 * 24 + 3 * 10 + 4 * tables + 2 * 1000);
+    assert_eq!(four, stored + 3 * 24 + 3 * 10 + 4 * tables + 2 * 4096);
 }
 
 #[test]
@@ -1252,6 +1264,10 @@ fn windows_device_names_are_refused_however_spelled() {
         "nul..resS",
         "Com1  .resource",
         "LPT\u{b9}.resS",
+        "COM0.resS",
+        "lpt0.resource",
+        "caf\u{e9}.resS",
+        "\u{17f}.resS",
         "conin$ .resS",
         "AUX.x.resS",
     ] {
@@ -1497,7 +1513,7 @@ fn a_bundle_of_many_files_lists_five() {
 }
 
 #[test]
-fn a_sprite_whose_name_cannot_be_read_is_skipped_not_filtered() {
+fn a_name_that_cannot_be_read_is_offered_to_the_filter_as_empty() {
     let tex = rgba_texture(Layout::U2022_3, "t", 4, 4, &Pixels::Inline(&rgba_4x4()));
     let file = serialized(
         22,
@@ -1507,9 +1523,14 @@ fn a_sprite_whose_name_cannot_be_read_is_skipped_not_filtered() {
         &[(TEX, TEXTURE_2D, tex), (1, SPRITE, Vec::new())],
     );
     let a = Assets::from_serialized(SerializedFile::parse(file).unwrap(), "").unwrap();
-    let list = a.sprites(|_| false);
+    // Filtered out like any other name the filter refuses; kept, then skipped as unreadable.
+    assert!(a.sprites(|n| n == "Hero").skipped.is_empty());
+    let list = a.sprites(str::is_empty);
     assert_eq!(list.skipped.len(), 1, "{list:?}");
     assert!(list.skipped[0].name.is_none());
+    // Textures do the same.
+    let names: Vec<_> = a.textures(|_| true).into_iter().map(|t| t.name).collect();
+    assert_eq!(names, [Some("t".to_string())]);
 }
 
 #[test]
@@ -1854,10 +1875,13 @@ fn tight_8x8(mesh: &Mesh, limits: Limits) -> (TempDir, Assets, Sprite) {
 }
 
 #[test]
-fn mask_work_is_each_triangles_box_and_nothing_for_a_flat_one() {
-    // A triangle whose box is x 1..5, y 2..7 (20 pixels), and a flat one along a diagonal,
-    // which has no area and costs nothing. Decode 64, mask 20, copy 64.
-    let mesh = Mesh {
+fn mask_work_is_each_rows_span_and_nothing_for_a_flat_triangle() {
+    // A triangle (1,2) (5,2) (1,7), and a flat one along a diagonal, which has no area and
+    // costs nothing. The triangle crosses rows 2 to 6; its long edge is x = 5 - 0.8 (y - 2),
+    // so each row's span (its sample lines' crossings, a column wider each side, cut to the
+    // box's columns 1 to 4) holds 4, 4, 3, 3 and 2 columns: with a step a row, 21. Decode 64,
+    // mask 21, copy 64.
+    let triangle = Mesh {
         vertices: &[
             [1.0, 2.0],
             [5.0, 2.0],
@@ -1866,14 +1890,20 @@ fn mask_work_is_each_triangles_box_and_nothing_for_a_flat_one() {
             [4.0, 5.0],
             [6.0, 7.0],
         ],
-        indices: &[0, 1, 2, 3, 4, 5],
+        indices: &[0, 1, 2],
         ..Mesh::BASE
     };
-    let (_d, mut a, s) = tight_8x8(&mesh, Limits::default());
-    a.export(&s).unwrap();
-    assert_eq!(a.work_done(), 64 + 20 + 64);
-    // Its box is the whole charge: one less and it is refused.
-    let (_d, mut a, s) = tight_8x8(&mesh, Limits::DEFAULT.with_max_mask_work(19));
+    let with_flat = Mesh {
+        indices: &[0, 1, 2, 3, 4, 5],
+        ..triangle
+    };
+    for mesh in [&triangle, &with_flat] {
+        let (_d, mut a, s) = tight_8x8(mesh, Limits::default());
+        a.export(&s).unwrap();
+        assert_eq!(a.work_done(), 64 + 21 + 64);
+    }
+    // The span is the whole charge: one less and it is refused.
+    let (_d, mut a, s) = tight_8x8(&with_flat, Limits::DEFAULT.with_max_mask_work(20));
     assert!(matches!(
         a.export(&s),
         Err(Error::LimitExceeded {
@@ -1881,6 +1911,55 @@ fn mask_work_is_each_triangles_box_and_nothing_for_a_flat_one() {
             ..
         })
     ));
+}
+
+#[test]
+fn a_thin_triangle_costs_its_height_not_its_box() {
+    // 4096 slivers from (0,0) to (64,32), each a hundredth of a pixel thick at its end: each
+    // box is 64 x 32 = 2048 pixels, 8M in all, but each row's span is a few columns.
+    let vertices: &[[f32; 2]] = &[[0.0, 0.0], [64.0, 32.0], [64.0, 32.01]];
+    let indices: Vec<u16> = std::iter::repeat_n([0u16, 1, 2], 4096).flatten().collect();
+    let mesh = Mesh {
+        vertices,
+        indices: &indices,
+        ..Mesh::BASE
+    };
+    let dir = TempDir::new("slivers");
+    let tex = rgba_texture(
+        Layout::U2022_3,
+        "t",
+        64,
+        64,
+        &Pixels::Inline(&[9; 64 * 64 * 4]),
+    );
+    let r = [0.0, 0.0, 64.0, 64.0];
+    let s = sprite(
+        false,
+        false,
+        "s",
+        r,
+        [0.0, 0.0],
+        1,
+        0,
+        TEX,
+        0,
+        r,
+        0,
+        1.0,
+        &mesh,
+    );
+    let file = serialized(
+        22,
+        "2022.3.62f1",
+        false,
+        19,
+        &[(TEX, TEXTURE_2D, tex), (1, SPRITE, s)],
+    );
+    let mut a = Assets::open(dir.file("t.assets", &file)).unwrap();
+    let s = a.sprites(|_| true).sprites.remove(0);
+    a.export(&s).unwrap();
+    let mask = a.work_done() - 2 * 64 * 64;
+    assert!(mask < 4096 * 33 * 6, "{mask}");
 }
 
 #[test]
@@ -2401,8 +2480,668 @@ fn lzma_blocks_with_pb_4_and_short_headers() {
         .unwrap();
     info[size_at + 4..size_at + 8].copy_from_slice(&3u32.to_be_bytes());
     info.truncate(at + 3);
+    fix_bundle_size(&mut info);
     match Bundle::parse(&info) {
         Err(Error::Invalid(msg)) => assert!(msg.contains("5-byte header"), "{msg}"),
         other => panic!("{other:?}"),
+    }
+}
+
+// UnityPy's output (Pillow's raw decoders) for 4x2 pixels of these bytes, rows flipped.
+const WORDS_4X2: &str = "a54dca182530bb1d6d132cded6237b2e";
+const ARGB4444_OUT: &str = "3366dd11ee22ccdd33dd6622ee77bb22ddaa554488ccaa1100225533ddbbbb11";
+const RGB565_OUT: &str = "106d6affdec662ff2079b4ff29cedeff4ab629ff181852ff310429ff18b6deff";
+const RGBA4444_OUT: &str = "113366ddddee22cc2233dd6622ee77bb44ddaa551188ccaa3300225511ddbbbb";
+
+#[test]
+fn sixteen_bit_formats_match_the_reference_decoder() {
+    for (fmt, out) in [
+        (format::ARGB4444, ARGB4444_OUT),
+        (format::RGB565, RGB565_OUT),
+        (format::RGBA4444, RGBA4444_OUT),
+    ] {
+        assert_eq!(
+            decode::decode(fmt, 4, 2, &hex(WORDS_4X2)).unwrap(),
+            hex(out),
+            "{fmt}"
+        );
+        assert_eq!(decode::mip0_size(fmt, 4, 2), Some(16));
+    }
+    // Every level of each channel: 0 and the top level are 0 and 255, and levels round down.
+    let all: Vec<u8> = (0..=u16::MAX).flat_map(u16::to_le_bytes).collect();
+    let rgb = decode::decode(format::RGB565, 256, 256, &all).unwrap();
+    let levels = |channel: usize| {
+        let mut v: Vec<u8> = rgb.chunks(4).map(|p| p[channel]).collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    };
+    let expect = |max: u32| {
+        (0..=max)
+            .map(|c| (c * 255 / max) as u8)
+            .collect::<Vec<u8>>()
+    };
+    assert_eq!(levels(0), expect(31));
+    assert_eq!(levels(1), expect(63));
+    assert_eq!(levels(2), expect(31));
+}
+
+// Round 6.
+
+fn one_texture_file() -> Vec<u8> {
+    let t = rgba_texture(Layout::U2022_3, "t", 4, 4, &Pixels::Inline(&[3; 64]));
+    serialized(22, "2022.3.62f1", false, 19, &[(10, TEXTURE_2D, t)])
+}
+
+#[test]
+fn newer_bundles_with_compressed_directories() {
+    // From 2020.3.34 (and with a stripped version) flag 0x200 is padding and 0x1400 is
+    // encryption; a compressed directory must still parse.
+    for info in [1u32, 2, 3] {
+        for (format, revision) in [(8, "2022.3.62f1"), (7, "2020.3.34f1"), (6, "0.0.0")] {
+            let mut o = BundleOpts::new(format, revision);
+            o.info = info;
+            o.blocks = vec![0];
+            o.padding_flag = format == 8;
+            let b = bundle(&o, &[("CAB-a", &one_texture_file(), 4)]);
+            let parsed = Bundle::parse(&b);
+            assert!(
+                parsed.is_ok(),
+                "info {info}, {revision}: {:?}",
+                parsed.err()
+            );
+        }
+    }
+}
+
+#[test]
+fn a_bundles_declared_size_rules_open_and_parse_alike() {
+    let dir = TempDir::new("declared");
+    let mut o = BundleOpts::new(6, "2018.4.36f1");
+    o.blocks = vec![0];
+    let good = bundle(&o, &[("CAB-a", &one_texture_file(), 4)]);
+    let at_size = |b: &[u8]| {
+        let mut i = 12;
+        for _ in 0..2 {
+            while b[i] != 0 {
+                i += 1;
+            }
+            i += 1;
+        }
+        i
+    };
+    let with_size = |size: i64, tail: usize| {
+        let mut b = good.clone();
+        let at = at_size(&b);
+        b[at..at + 8].copy_from_slice(&size.to_be_bytes());
+        b.extend(vec![0xee; tail]);
+        b
+    };
+    let len = good.len() as i64;
+    // (declared size, bytes after the bundle, parses)
+    for (size, tail, ok) in [
+        (len, 0, true),
+        (len, 100, true), // what follows the declared size is not the bundle's
+        (0, 0, false),
+        (-1, 0, false),
+        (100, 0, false),
+        (len + 1, 0, false),
+        (i64::MAX, 0, false),
+    ] {
+        let b = with_size(size, tail);
+        let parsed = Bundle::parse(&b).is_ok();
+        let opened = Bundle::open(dir.file("x.bundle", &b)).is_ok();
+        let assets = Assets::from_bytes(b.clone(), "", Limits::default()).is_ok();
+        assert_eq!(
+            (parsed, opened, assets),
+            (ok, ok, ok),
+            "declared {size}, {tail} after"
+        );
+    }
+}
+
+#[test]
+fn objects_must_reach_their_final_padding() {
+    // A stream path of 6 bytes is followed by 2 bytes of padding; without them the texture
+    // ends inside its own alignment.
+    let t = rgba_texture(Layout::U2022_3, "t", 4, 4, &streamed("a.resS", 0, 64));
+    let mut short = t.clone();
+    short.truncate(t.len() - 2);
+    for (object, ok) in [(t, true), (short, false)] {
+        let file = SerializedFile::parse(serialized(
+            22,
+            "2022.3.62f1",
+            false,
+            19,
+            &[(10, TEXTURE_2D, object)],
+        ))
+        .unwrap();
+        assert_eq!(Texture2D::read(&file, &file.objects()[0]).is_ok(), ok);
+    }
+    let a = atlas(false, &[(5, TEX, [0.0, 0.0, 1.0, 1.0], RECT, 1.0)]);
+    let mut short = a.clone();
+    short.truncate(a.len() - 3);
+    for (object, ok) in [(a, true), (short, false)] {
+        let file = SerializedFile::parse(serialized(
+            22,
+            "2022.3.62f1",
+            false,
+            19,
+            &[(30, SPRITE_ATLAS, object)],
+        ))
+        .unwrap();
+        let read = unity_bundle_assets::SpriteAtlas::read(&file, &file.objects()[0]);
+        assert_eq!(read.is_ok(), ok, "{read:?}");
+    }
+}
+
+#[test]
+fn a_stream_entry_with_the_directory_bit_is_still_a_stream() {
+    let file = textures_on(&[("archive:/CAB-a/CAB-a.resS", 0, 64)]);
+    let b = bundle(
+        &BundleOpts::new(6, "2018.4.36f1"),
+        &[("CAB-a", &file, 4), ("CAB-a.resS", &[1; 64], 1)],
+    );
+    let a = Assets::from_bytes(b, "", Limits::default()).unwrap();
+    assert!(a.decode_texture(1).is_ok());
+}
+
+#[test]
+fn racing_threads_never_share_a_range() {
+    // Room for the big texture once (64) and the small one (16), not the big one twice.
+    let dir = TempDir::new("race");
+    dir.file("t.resS", &[7; 256]);
+    let big = rgba_texture(Layout::U2018_4, "big", 8, 8, &streamed("t.resS", 0, 256));
+    let small = rgba_texture(Layout::U2018_4, "small", 4, 4, &streamed("t.resS", 0, 64));
+    let path = dir.file(
+        "t.assets",
+        &file_2018(&[(1, TEXTURE_2D, big), (2, TEXTURE_2D, small)]),
+    );
+    for _ in 0..2000 {
+        let a = Assets::open_with(&path, Limits::DEFAULT.with_max_total_work(100)).unwrap();
+        let barrier = std::sync::Barrier::new(4);
+        let decoded = std::thread::scope(|scope| {
+            let threads: Vec<_> = (0..4)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        a.decode_texture(1).is_ok()
+                    })
+                })
+                .collect();
+            threads
+                .into_iter()
+                .map(|t| t.join().unwrap())
+                .filter(|&ok| ok)
+                .count()
+        });
+        assert_eq!(decoded, 1);
+        assert!(
+            a.decode_texture(2).is_err(),
+            "the range was read by a second texture"
+        );
+    }
+}
+
+#[test]
+fn a_texture_refused_its_budget_keeps_the_range_it_read() {
+    let dir = TempDir::new("keep");
+    dir.file("t.resS", &[7; 256]);
+    let big = rgba_texture(Layout::U2018_4, "big", 8, 8, &streamed("t.resS", 0, 256));
+    let small = rgba_texture(Layout::U2018_4, "small", 4, 4, &streamed("t.resS", 0, 64));
+    let file = file_2018(&[(1, TEXTURE_2D, big), (2, TEXTURE_2D, small)]);
+    let a = Assets::open_with(
+        dir.file("t.assets", &file),
+        Limits::DEFAULT.with_max_total_work(80),
+    )
+    .unwrap();
+    assert!(a.decode_texture(1).is_ok());
+    assert!(matches!(
+        a.decode_texture(1),
+        Err(Error::LimitExceeded { .. })
+    ));
+    assert!(
+        a.decode_texture(2).is_err(),
+        "range read by texture 1 was handed to texture 2"
+    );
+}
+
+#[test]
+fn a_stream_conflict_names_the_file() {
+    let dir = TempDir::new("owner");
+    dir.file("t.resS", &[7; 64]);
+    let p = dir.file(
+        "x.assets",
+        &textures_on(&[("t.resS", 0, 64), ("t.resS", 0, 64)]),
+    );
+    let a = Assets::open(&p).unwrap();
+    a.decode_texture(1).unwrap();
+    let e = a.decode_texture(2).unwrap_err().to_string();
+    assert!(
+        e.contains("x.assets") && e.contains("texture 2") && e.contains("texture 1"),
+        "{e}"
+    );
+}
+
+#[test]
+fn from_bytes_holds_to_the_file_size_limit() {
+    let r = Assets::from_bytes(
+        one_texture_file(),
+        "",
+        Limits::DEFAULT.with_max_file_size(10),
+    );
+    assert!(
+        matches!(
+            r,
+            Err(Error::LimitExceeded {
+                kind: LimitKind::FileSize,
+                ..
+            })
+        ),
+        "{:?}",
+        r.err()
+    );
+}
+
+#[test]
+fn an_atlas_in_another_file_is_not_looked_up_here() {
+    // The sprite's atlas is (file 1, 30); this file's own atlas 30 holds the sprite's key and
+    // must not be used.
+    let r = [0.0, 0.0, 2.0, 2.0];
+    let mut s = sprite(
+        false,
+        false,
+        "s",
+        r,
+        [0.0, 0.0],
+        5,
+        30,
+        0,
+        0,
+        r,
+        RECT,
+        1.0,
+        &Mesh::BASE,
+    );
+    let at = s
+        .windows(12)
+        .position(|w| w == [0, 0, 0, 0, 30, 0, 0, 0, 0, 0, 0, 0])
+        .unwrap();
+    s[at..at + 4].copy_from_slice(&1i32.to_le_bytes());
+    let tex = rgba_texture(Layout::U2022_3, "t", 4, 4, &Pixels::Inline(&rgba_4x4()));
+    let atl = atlas(false, &[(5, TEX, r, RECT, 1.0)]);
+    let extras = Extras {
+        externals: vec!["other.assets".into()],
+        ..Extras::default()
+    };
+    let file = serialized_with(
+        22,
+        "2022.3.62f1",
+        false,
+        19,
+        &[
+            (TEX, TEXTURE_2D, tex),
+            (1, SPRITE, s),
+            (30, SPRITE_ATLAS, atl),
+        ],
+        &extras,
+    );
+    let mut a = Assets::from_serialized(SerializedFile::parse(file).unwrap(), "").unwrap();
+    let list = a.sprites(|_| true);
+    assert_eq!(list.sprites[0].atlas.file_id, 1);
+    assert!(matches!(
+        a.export(&list.sprites[0]),
+        Err(Error::Unsupported(_))
+    ));
+}
+
+#[test]
+fn a_sprite_with_no_atlas_and_no_texture_has_no_texture() {
+    let r = [0.0, 0.0, 1.0, 1.0];
+    let s = sprite(
+        false,
+        false,
+        "s",
+        r,
+        [0.0, 0.0],
+        1,
+        0,
+        0,
+        0,
+        r,
+        RECT,
+        1.0,
+        &Mesh::BASE,
+    );
+    let f = serialized(22, "2022.3.62f1", false, 19, &[(1, SPRITE, s)]);
+    let a = Assets::from_serialized(SerializedFile::parse(f).unwrap(), "").unwrap();
+    let list = a.sprites(|_| true);
+    // Its placement is its own render data (no atlas to look up); that names no texture.
+    assert!(a.placement(&list.sprites[0]).is_ok());
+    match a.texture_id(&list.sprites[0]) {
+        Err(Error::Invalid(msg)) => assert!(msg.contains("has no texture"), "{msg}"),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn a_rect_as_wide_as_the_snapping_tolerance_covers_nothing() {
+    let r = [0.0, 0.0, 4.0, 4.0];
+    let s = sprite(
+        false,
+        false,
+        "s",
+        r,
+        [0.0, 0.0],
+        1,
+        0,
+        TEX,
+        0,
+        [0.0, 0.0, 0.001, 1.0],
+        RECT,
+        1.0,
+        &Mesh::BASE,
+    );
+    let (_d, mut a, s) = one_sprite(s, Limits::default());
+    match a.export(&s) {
+        Err(Error::Invalid(msg)) => assert!(msg.contains("no whole pixel"), "{msg}"),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn a_triangle_of_area_one_billionth_is_kept() {
+    // Area exactly 1e-9 (as f32): not flat, so the sprite exports (fully transparent).
+    let mesh = Mesh {
+        vertices: &[[0.0, 0.0], [1e-9, 0.0], [0.0, 1.0]],
+        indices: &[0, 1, 2],
+        ..Mesh::BASE
+    };
+    let (_d, mut a, s) = one_sprite(tight(&mesh, 0), Limits::default());
+    let img = a.export(&s).unwrap();
+    assert!(img.rgba.iter().all(|&b| b == 0));
+    // Area below it is flat: no triangle with area, an error.
+    let flat = Mesh {
+        vertices: &[[0.0, 0.0], [1e-10, 0.0], [0.0, 1.0]],
+        ..mesh
+    };
+    let (_d, mut a, s) = one_sprite(tight(&flat, 0), Limits::default());
+    assert!(matches!(a.export(&s), Err(Error::Invalid(_))));
+}
+
+#[test]
+fn every_object_in_a_bundle_counts_toward_one_limit() {
+    let tex = || rgba_texture(Layout::U2018_4, "t", 4, 4, &Pixels::Inline(&rgba_4x4()));
+    let a = file_2018(&[(1, TEXTURE_2D, tex()), (2, TEXTURE_2D, tex())]);
+    let b = file_2018(&[(1, TEXTURE_2D, tex()), (2, TEXTURE_2D, tex())]);
+    let bytes = bundle(
+        &BundleOpts::new(6, "2018.4.36f1"),
+        &[("CAB-a", &a, 4), ("CAB-b", &b, 4)],
+    );
+    for (limit, second) in [(4, true), (3, false)] {
+        let bundle =
+            Arc::new(Bundle::parse_with(&bytes, Limits::DEFAULT.with_max_objects(limit)).unwrap());
+        assert!(Assets::from_bundle(bundle.clone(), "CAB-a").is_ok());
+        let opened = Assets::from_bundle(bundle, "CAB-b");
+        assert_eq!(opened.is_ok(), second, "{limit}: {:?}", opened.err());
+    }
+}
+
+#[test]
+fn files_too_short_for_a_header_are_not_unity() {
+    let dir = TempDir::new("tiny");
+    for bytes in [&b""[..], b"hello", &[0; 19]] {
+        let p = dir.file("tiny", bytes);
+        assert!(
+            matches!(Assets::open(&p), Err(Error::NotUnity(_))),
+            "{bytes:?}"
+        );
+        assert!(
+            matches!(
+                SerializedFile::parse(bytes.to_vec()),
+                Err(Error::NotUnity(_))
+            ),
+            "{bytes:?}"
+        );
+    }
+}
+
+#[test]
+fn error_messages_quote_at_most_64_characters_of_a_name() {
+    let name = "\u{1}".repeat(4000);
+    let obj = rgba_texture(Layout::U2018_4, &name, 4, 4, &Pixels::Inline(&[1; 60]));
+    let a = Assets::from_bytes(file_2018(&[(7, TEXTURE_2D, obj)]), "", Limits::default()).unwrap();
+    let msg = a.decode_texture(7).unwrap_err().to_string();
+    assert!(msg.len() < 700, "{}", msg.len());
+    assert!(msg.contains("... (4000 bytes)"), "{msg}");
+}
+
+#[test]
+fn the_root_error_is_the_same_through_export() {
+    let dir = TempDir::new("root");
+    let r = [0.0, 0.0, 1.0, 1.0];
+    let s = sprite(
+        false,
+        false,
+        "s",
+        r,
+        [0.0, 0.0],
+        1,
+        0,
+        TEX,
+        0,
+        r,
+        RECT,
+        1.0,
+        &Mesh::BASE,
+    );
+    let bc7 = texture(
+        Layout::U2022_3,
+        false,
+        "t",
+        4,
+        4,
+        format::BC7,
+        &Pixels::Inline(&[0; 16]),
+        &[],
+    );
+    let f = serialized(
+        22,
+        "2022.3.62f1",
+        false,
+        19,
+        &[(TEX, TEXTURE_2D, bc7), (1, SPRITE, s)],
+    );
+    let mut a = Assets::open(dir.file("t.assets", &f)).unwrap();
+    let direct = a.decode_texture(TEX).unwrap_err();
+    let list = a.sprites(|_| true);
+    let exported = a.export(&list.sprites[0]).unwrap_err();
+    assert!(matches!(
+        exported,
+        Error::TextureUnreadable { path_id: TEX, .. }
+    ));
+    for e in [&direct, &exported] {
+        assert!(
+            matches!(e.root(), Error::UnsupportedTextureFormat { format: 25, .. }),
+            "{e:?}"
+        );
+        assert!(e.io_error().is_none());
+    }
+}
+
+#[test]
+fn an_lzma_directory_is_held_to_the_same_rules_as_its_blocks() {
+    let mut o = BundleOpts::new(6, "2018.4.36f1");
+    o.info = 1;
+    o.blocks = vec![0];
+    let good = bundle(&o, &[("CAB-a", &one_texture_file(), 4)]);
+    assert!(Bundle::parse(&good).is_ok());
+    // lzma-rs writes lc 3, lp 0, pb 2 (0x5d) and an 8 MiB dictionary; the directory is the
+    // first LZMA stream in the file.
+    let at = good
+        .windows(5)
+        .position(|w| w == [0x5d, 0, 0, 0x80, 0])
+        .unwrap();
+    let mut wide = good.clone();
+    wide[at] = 8 + 4 * 9 + 2 * 45; // lc 8, lp 4: 6 MiB of tables
+    assert!(matches!(Bundle::parse(&wide), Err(Error::Unsupported(msg)) if msg.contains("LZMA")));
+    // Its tables and dictionary count against the decompression limit like a block's.
+    let least = least_decompression_limit(&good);
+    let mut stored = o;
+    stored.info = 0;
+    assert!(
+        least
+            > least_decompression_limit(&bundle(&stored, &[("CAB-a", &one_texture_file(), 4)]))
+                + 16_000
+    );
+}
+
+#[test]
+fn an_lzma_directory_is_charged_its_tables_and_dictionary() {
+    // A small bundle whose LZMA directory's working memory outweighs everything else: its
+    // 60 bytes, tables for lc 3, lp 0 (2 * 0x300 << 3, plus 4 KiB) and a dictionary counted at
+    // twice lzma-rs's 4 KiB floor.
+    let mut o = BundleOpts::new(6, "2018.4.36f1");
+    o.info = 1;
+    o.blocks = vec![0];
+    let b = bundle(&o, &[("CAB-a", &[1; 8], 4)]);
+    let info = 16 + 4 + 10 + 4 + 20 + 6;
+    assert_eq!(
+        least_decompression_limit(&b),
+        info + (2 * (0x300 << 3) + 4096) + 2 * 4096
+    );
+}
+
+#[test]
+fn an_lzma_dictionary_counts_as_at_least_4_kib() {
+    // A 10,000-byte block: with an 8 MiB dictionary it is charged 2 * 10,000; with a 16-byte
+    // one, lzma-rs still uses 4 KiB, so 2 * 4096.
+    let data: Vec<u8> = (0..10_000u32).map(|i| (i % 7) as u8).collect();
+    let mut o = BundleOpts::new(6, "2018.4.36f1");
+    o.blocks = vec![1];
+    let big = bundle(&o, &[("a.resS", &data, 0)]);
+    let at = big
+        .windows(5)
+        .position(|w| w == [0x5d, 0, 0, 0x80, 0])
+        .unwrap();
+    let mut small = big.clone();
+    small[at + 1..at + 5].copy_from_slice(&16u32.to_le_bytes());
+    assert!(Bundle::parse(&small).is_ok());
+    assert_eq!(
+        least_decompression_limit(&big) - least_decompression_limit(&small),
+        2 * 10_000 - 2 * 4096
+    );
+}
+
+#[test]
+fn twenty_bytes_are_enough_to_be_read_as_a_header() {
+    // Nineteen are too short to say what they are; twenty are read, and are not Unity.
+    for (len, short) in [(19, true), (20, false)] {
+        match SerializedFile::parse(vec![0; len]) {
+            Err(Error::NotUnity(msg)) => assert_eq!(msg.contains("too short"), short, "{msg}"),
+            other => panic!("{len}: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn atlas_entries_step_over_their_secondary_textures() {
+    // Every entry carries two secondary textures from 2020.2.
+    let r = [0.0, 0.0, 2.0, 2.0];
+    let atl = atlas_full(
+        false,
+        true,
+        "atlas",
+        &[],
+        &[(5, TEX, r, RECT, 1.0), (6, TEX, r, RECT, 1.0)],
+    );
+    let file = SerializedFile::parse(serialized(
+        22,
+        "2022.3.62f1",
+        false,
+        19,
+        &[(30, SPRITE_ATLAS, atl)],
+    ))
+    .unwrap();
+    let read = unity_bundle_assets::SpriteAtlas::read(&file, &file.objects()[0]).unwrap();
+    assert_eq!(read.entries().len(), 2);
+}
+
+/// Which pixels of a `w` x `h` image the triangles cover by the documented rule, tested pixel
+/// by pixel over the whole image: kept when any quarter point lies on or inside a triangle.
+fn reference_mask(triangles: &[[[f32; 2]; 3]], w: u32, h: u32) -> Vec<bool> {
+    let inside = |t: &[[f32; 2]; 3], px: f32, py: f32| {
+        let side =
+            |p: [f32; 2], q: [f32; 2]| (q[0] - p[0]) * (py - p[1]) - (q[1] - p[1]) * (px - p[0]);
+        let d = [side(t[0], t[1]), side(t[1], t[2]), side(t[2], t[0])];
+        !(d.iter().any(|&v| v < 0.0) && d.iter().any(|&v| v > 0.0))
+    };
+    let mut out = Vec::new();
+    for y in (0..h).rev() {
+        for x in 0..w {
+            let hit = triangles.iter().any(|t| {
+                let area = (t[1][0] - t[0][0]) * (t[2][1] - t[0][1])
+                    - (t[1][1] - t[0][1]) * (t[2][0] - t[0][0]);
+                area.abs() >= 1e-9
+                    && [0.25f32, 0.75].iter().any(|&u| {
+                        [0.25f32, 0.75]
+                            .iter()
+                            .any(|&v| inside(t, x as f32 + u, y as f32 + v))
+                    })
+            });
+            out.push(hit);
+        }
+    }
+    out
+}
+
+#[test]
+fn masks_match_a_whole_image_test_of_every_pixel() {
+    // Random triangles over an 8x8 sprite, many with corners on quarter points and edges
+    // along the sample lines, where rounding in the row spans would show.
+    let mut seed = 0x1234_5678_9abc_def0u64;
+    let mut rnd = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    for round in 0..400 {
+        let point = |rnd: &mut dyn FnMut() -> u64| {
+            let quarter = |r: u64| (r % 41) as f32 * 0.25 - 1.0;
+            let v = [quarter(rnd()), quarter(rnd())];
+            if rnd() % 4 == 0 {
+                [v[0] + (rnd() % 1000) as f32 * 1e-4, v[1]]
+            } else {
+                v
+            }
+        };
+        let mut triangles = Vec::new();
+        let mut verts = Vec::new();
+        for _ in 0..=(rnd() % 3) {
+            let mut t = [point(&mut rnd), point(&mut rnd), point(&mut rnd)];
+            if rnd() % 3 == 0 {
+                t[1][1] = t[0][1]; // an edge along a row
+            }
+            triangles.push(t);
+            verts.extend(t);
+        }
+        let indices: Vec<u16> = (0..verts.len() as u16).collect();
+        let mesh = Mesh {
+            vertices: &verts,
+            indices: &indices,
+            ..Mesh::BASE
+        };
+        let want = reference_mask(&triangles, 8, 8);
+        let (_d, mut a, s) = tight_8x8(&mesh, Limits::default());
+        match a.export(&s) {
+            Ok(img) => {
+                let got: Vec<bool> = img.rgba.chunks(4).map(|p| p[3] != 0).collect();
+                assert_eq!(got, want, "round {round}: {triangles:?}");
+            }
+            // No triangle with area: nothing for the reference to keep either.
+            Err(Error::Invalid(_)) => assert!(want.iter().all(|&k| !k), "round {round}"),
+            Err(e) => panic!("round {round}: {e}"),
+        }
     }
 }

@@ -1,12 +1,19 @@
 //! Hex-dump one object: `cargo run --example dump -- <file-or-bundle> <path-id> [max-bytes]`.
 
+mod common;
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut args = std::env::args().skip(1);
+    let mut args = std::env::args_os().skip(1);
     let path = args
         .next()
         .ok_or("usage: dump <file> <path-id> [max-bytes]")?;
-    let id: i64 = args.next().ok_or("path id")?.parse()?;
-    let max: usize = args.next().map(|s| s.parse()).transpose()?.unwrap_or(512);
+    let id: i64 = common::text_arg(&mut args, "the path id")?
+        .ok_or("path id")?
+        .parse()?;
+    let max: usize = common::text_arg(&mut args, "the byte count")?
+        .map(|s| s.parse())
+        .transpose()?
+        .unwrap_or(512);
     let assets = unity_bundle_assets::Assets::open(&path)?;
     let file = assets.file();
     let object = file.object(id).ok_or("no such object")?;

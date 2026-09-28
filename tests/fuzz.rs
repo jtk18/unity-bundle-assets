@@ -229,8 +229,19 @@ const fn limits(tight: bool) -> Limits {
     }
 }
 
-fn exercise(kind: &Kind, data: &[u8], tight: bool) {
+fn exercise(kind: &Kind, data: &[u8], tight: bool, from_disk: bool) {
     let limits = limits(tight);
+    if from_disk {
+        // Through the file: the header checked from the first bytes, a bundle read to its
+        // declared size.
+        let path = SCRATCH.with(|d| d.0.join("input.assets"));
+        std::fs::write(&path, data).unwrap();
+        if let Ok(a) = Assets::open_with(&path, limits) {
+            let dir = SCRATCH.with(|d| d.0.clone());
+            exercise_assets(a, None, &dir);
+        }
+        return;
+    }
     match kind {
         Kind::Bundle => {
             if let Ok(b) = Bundle::parse_with(data, limits) {
@@ -260,6 +271,8 @@ fn exercise(kind: &Kind, data: &[u8], tight: bool) {
 
 thread_local! {
     static EMPTY: PathBuf = TempDir::new("fuzz-empty").0.clone();
+    /// Kept for the thread's life: dropping a `TempDir` removes its folder.
+    static SCRATCH: TempDir = TempDir::new("fuzz-disk");
 }
 
 fn failures_dir() -> PathBuf {
@@ -401,13 +414,17 @@ fn mutated_files_never_panic_or_hang() {
     let done = Arc::new(AtomicBool::new(false));
     watchdog(running.clone(), done.clone(), Duration::from_secs(20));
     let previous_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
+    // Quiet: every panic is recorded as a failure. `UBA_FUZZ_VERBOSE=1` shows them.
+    if std::env::var_os("UBA_FUZZ_VERBOSE").is_none() {
+        std::panic::set_hook(Box::new(|_| {}));
+    }
     let mut failures = Vec::new();
     let mut unopened = Vec::new();
     for seed in seeds(&stream_dir) {
         // Control: the unmutated seed must open and reach the decoders.
         let before = (OPENED.load(Relaxed), DECODED.load(Relaxed));
-        exercise(&seed.kind, &seed.data, false);
+        exercise(&seed.kind, &seed.data, false, false);
+        exercise(&seed.kind, &seed.data, false, true);
         let after = (OPENED.load(Relaxed), DECODED.load(Relaxed));
         assert!(
             after.0 > before.0 && after.1 > before.1,
@@ -426,7 +443,10 @@ fn mutated_files_never_panic_or_hang() {
             let start = Instant::now();
             // One input in four under small limits, so the refusals are exercised too.
             let tight = i % 4 == 3;
-            let panicked = std::panic::catch_unwind(|| exercise(&seed.kind, &m, tight)).is_err();
+            // And one in eight through a file on disk.
+            let from_disk = i % 8 == 5;
+            let panicked =
+                std::panic::catch_unwind(|| exercise(&seed.kind, &m, tight, from_disk)).is_err();
             let slow = start.elapsed() > SLOW;
             running.lock().unwrap().since = None;
             if panicked || slow {
@@ -454,7 +474,10 @@ fn mutated_files_never_panic_or_hang() {
         DECODED.load(Relaxed),
         EXPORTED.load(Relaxed),
     );
-    eprintln!("{iters} mutations per seed: {opened} opened, {decoded} textures decoded, {exported} sprites exported");
+    eprintln!(
+        "{iters} mutations per seed: {opened} opened, {decoded} textures decoded, \
+         {exported} sprites exported"
+    );
     assert!(unopened.is_empty(), "mutations of {unopened:?} rarely open");
     assert!(
         decoded > iters && exported > iters,

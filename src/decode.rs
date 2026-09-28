@@ -8,6 +8,14 @@ pub mod format {
     /// Alpha only, one byte. Decodes to white with that alpha, as `AssetStudio` does (`UnityPy`
     /// gives black).
     pub const ALPHA8: i32 = 1;
+    /// Alpha, red, green, blue, four bits each in a little-endian 16-bit word (alpha in the
+    /// top bits).
+    pub const ARGB4444: i32 = 2;
+    /// Red 5 bits, green 6, blue 5 in a little-endian 16-bit word (red in the top bits).
+    pub const RGB565: i32 = 7;
+    /// Red, green, blue, alpha, four bits each in a little-endian 16-bit word (red in the top
+    /// bits).
+    pub const RGBA4444: i32 = 13;
     /// Red, green, blue, one byte each.
     pub const RGB24: i32 = 3;
     /// Red, green, blue, alpha, one byte each.
@@ -31,6 +39,7 @@ pub fn mip0_size(format: i32, width: u32, height: u32) -> Option<usize> {
     let pixels = w.checked_mul(h)?;
     match format {
         format::ALPHA8 => Some(pixels),
+        format::ARGB4444 | format::RGB565 | format::RGBA4444 => pixels.checked_mul(2),
         format::RGB24 => pixels.checked_mul(3),
         format::RGBA32 | format::ARGB32 | format::BGRA32 => pixels.checked_mul(4),
         format::DXT1 => blocks.checked_mul(8),
@@ -56,10 +65,7 @@ pub fn is_supported(format: i32) -> bool {
 /// than the first mip level.
 pub fn decode(format: i32, width: u32, height: u32, data: &[u8]) -> Result<Vec<u8>> {
     if !is_supported(format) {
-        return Err(Error::UnsupportedTextureFormat {
-            texture: None,
-            format,
-        });
+        return Err(Error::UnsupportedTextureFormat { name: None, format });
     }
     let (w, h) = (width as usize, height as usize);
     let out_len = w
@@ -74,7 +80,7 @@ pub fn decode(format: i32, width: u32, height: u32, data: &[u8]) -> Result<Vec<u
     let data = data
         .get(..size)
         .ok_or_else(|| Error::Invalid(format!("{} bytes of pixels, need {size}", data.len())))?;
-    let mut out = vec![0u8; out_len];
+    let mut out = crate::zeroed(out_len)?;
     match format {
         format::DXT1 => blocks(data, &mut out, w, h, 8, |b, px| color_block(b, px, true)),
         format::DXT5 => blocks(data, &mut out, w, h, 16, |b, px| {
@@ -87,6 +93,20 @@ pub fn decode(format: i32, width: u32, height: u32, data: &[u8]) -> Result<Vec<u
                 format::RGB24 => (3, |s, d| d.copy_from_slice(&[s[0], s[1], s[2], 255])),
                 format::RGBA32 => (4, |s, d| d.copy_from_slice(s)),
                 format::ARGB32 => (4, |s, d| d.copy_from_slice(&[s[1], s[2], s[3], s[0]])),
+                format::ARGB4444 => (2, |s, d| {
+                    let argb = nibbles(s);
+                    d.copy_from_slice(&[argb[1], argb[2], argb[3], argb[0]]);
+                }),
+                format::RGBA4444 => (2, |s, d| d.copy_from_slice(&nibbles(s))),
+                format::RGB565 => (2, |s, d| {
+                    let v = u16::from_le_bytes([s[0], s[1]]);
+                    d.copy_from_slice(&[
+                        widen(v >> 11, 31),
+                        widen((v >> 5) & 63, 63),
+                        widen(v & 31, 31),
+                        255,
+                    ]);
+                }),
                 _ => (4, |s, d| d.copy_from_slice(&[s[2], s[1], s[0], s[3]])), // BGRA32
             };
             // Stored row y becomes output row h - 1 - y.
@@ -103,6 +123,17 @@ pub fn decode(format: i32, width: u32, height: u32, data: &[u8]) -> Result<Vec<u
         }
     }
     Ok(out)
+}
+
+/// A little-endian 16-bit word's four nibbles, top first, each widened to a byte.
+fn nibbles(s: &[u8]) -> [u8; 4] {
+    let v = u16::from_le_bytes([s[0], s[1]]);
+    [v >> 12, v >> 8, v >> 4, v].map(|n| widen(n & 15, 15))
+}
+
+/// A channel of `max + 1` levels as a byte, rounding down as Pillow (and so `UnityPy`) does.
+const fn widen(value: u16, max: u16) -> u8 {
+    (value as u32 * 255 / max as u32) as u8
 }
 
 /// [`decode`], taking ownership of the pixels: RGBA32 data holding exactly the first mip is

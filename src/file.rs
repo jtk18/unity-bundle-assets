@@ -7,7 +7,7 @@
 //! be the one that was checked. On Windows and other platforms a file swapped in between check
 //! and open is not detected.
 
-use crate::{Error, Result};
+use crate::{quoted_path, Error, Result};
 
 use std::fs::{File, Metadata, OpenOptions};
 use std::path::Path;
@@ -44,8 +44,8 @@ fn not_regular(path: &Path, chosen: Chosen) -> Error {
             error: std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a regular file"),
         },
         Chosen::ByData => Error::Unsupported(format!(
-            "{:?} is not a regular file",
-            path.display().to_string()
+            "{} is not a regular file",
+            quoted_path(&path.display().to_string())
         )),
     }
 }
@@ -59,14 +59,14 @@ fn check_opened(path: &Path, chosen: Chosen, before: &Metadata, after: &Metadata
     }
     if !same_file(before, after) {
         return Err(Error::Unsupported(format!(
-            "{:?} changed while it was being opened",
-            path.display().to_string()
+            "{} changed while it was being opened",
+            quoted_path(&path.display().to_string())
         )));
     }
     if chosen == Chosen::ByData && links(after) > 1 {
         return Err(Error::Unsupported(format!(
-            "{:?} has other hard links",
-            path.display().to_string()
+            "{} has other hard links",
+            quoted_path(&path.display().to_string())
         )));
     }
     Ok(())
@@ -105,6 +105,13 @@ pub(crate) enum FileId {
     Name(String),
 }
 
+#[cfg_attr(
+    not(unix),
+    allow(
+        clippy::unnecessary_wraps,
+        reason = "fallible on Unix, which reads metadata"
+    )
+)]
 pub(crate) fn identity(file: &File, path: &Path) -> Result<FileId> {
     #[cfg(unix)]
     {
@@ -117,16 +124,17 @@ pub(crate) fn identity(file: &File, path: &Path) -> Result<FileId> {
         let _ = file;
         Ok(FileId::Name(
             path.file_name()
-                .map(|n| n.to_string_lossy().to_lowercase())
+                .map(|n| n.to_string_lossy().to_ascii_lowercase())
                 .unwrap_or_default(),
         ))
     }
 }
 
 /// `(O_NONBLOCK, O_NOFOLLOW, O_NOCTTY)` for this target, where the values are certain.
+#[cfg(unix)]
 #[allow(
     clippy::unnecessary_wraps,
-    reason = "always Some on some targets, always None on others"
+    reason = "always Some on some Unix targets, always None on others"
 )]
 const fn flags() -> Option<(i32, i32, i32)> {
     #[cfg(any(
@@ -207,7 +215,7 @@ const HEAD: u64 = 64 * 1024;
 /// Read a file the caller chose, under a size limit, refusing anything irregular. The first
 /// bytes are read and checked before the rest, so a large file that is not what its header
 /// claims (a sparse file, say) is refused before it is read; `check` says how many bytes to
-/// read in all. A file that grows past the limit while being read is refused too.
+/// read in all, never more than its length when opened.
 pub(crate) fn read_limited(path: &Path, limit: u64, check: HeadCheck) -> Result<Vec<u8>> {
     use std::io::Read;
     let (mut file, len) = open_regular(path, Chosen::ByCaller)?;
@@ -224,16 +232,11 @@ pub(crate) fn read_limited(path: &Path, limit: u64, check: HeadCheck) -> Result<
             .unwrap_or(usize::MAX)
             .saturating_sub(data.len()),
     )
-    .map_err(|_| Error::LimitExceeded {
-        kind: crate::LimitKind::FileSize,
-        value: want,
-        limit,
-    })?;
+    .map_err(|_| Error::OutOfMemory { bytes: want })?;
     let rest = want.saturating_sub(data.len() as u64);
-    file.take(rest.min(limit.saturating_add(1)))
+    file.take(rest)
         .read_to_end(&mut data)
         .map_err(Error::io(path))?;
-    Error::limit(crate::LimitKind::FileSize, data.len() as u64, limit)?;
     Ok(data)
 }
 

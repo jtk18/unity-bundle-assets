@@ -5,7 +5,7 @@
 //! The layout follows `UnityPy`'s `BundleFile` reader (MIT, see NOTICE).
 
 use crate::reader::Reader;
-use crate::{check_version_string, Error, LimitKind, Limits, Result, Shared, Version};
+use crate::{check_version_string, quoted, Error, LimitKind, Limits, Result, Shared, Version};
 
 use std::sync::Arc;
 
@@ -130,13 +130,16 @@ impl Bundle {
     ///
     /// As [`Bundle::parse`].
     pub fn parse_with(file: &[u8], limits: Limits) -> Result<Self> {
-        let mut r = Reader::new(file, true);
         let Header {
             format,
             unity_version,
             unity_revision,
             declared_size,
-        } = header(&mut r)?;
+        } = header(&mut Reader::new(file, true))?;
+        // The bundle is the declared size; anything after it is not part of it.
+        let file = &file[..declared_len(declared_size, file.len() as u64)? as usize];
+        let mut r = Reader::new(file, true);
+        header(&mut r)?;
         let info_compressed = r.u32()? as usize;
         let info_size = r.u32()? as usize;
         let flags = r.u32()?;
@@ -176,18 +179,24 @@ impl Bundle {
         let budget = limits.max_decompressed;
         Error::limit(LimitKind::Decompressed, info_size as u64, budget)?;
         let info_bytes = if flags & flags::BLOCKS_INFO_AT_END != 0 {
-            // The directory ends where the bundle does, which may be before the file does.
-            let end = usize::try_from(declared_size)
-                .ok()
-                .filter(|&n| n > 0 && n <= file.len())
-                .unwrap_or(file.len());
-            let start = end
+            // The directory ends where the bundle does.
+            let start = file
+                .len()
                 .checked_sub(info_compressed)
-                .ok_or(Error::Truncated(end))?;
-            &file[start..end]
+                .ok_or(Error::Truncated(file.len()))?;
+            &file[start..]
         } else {
             r.take(info_compressed)?
         };
+        if flags & flags::COMPRESSION_MASK == 1 {
+            // The directory's LZMA working memory, as for the data blocks below.
+            let (tables, dictionary) = lzma_memory(info_bytes, info_size)?;
+            Error::limit(
+                LimitKind::Decompressed,
+                info_size as u64 + tables + dictionary,
+                budget,
+            )?;
+        }
         let mut info = Vec::new();
         decompress_into(
             &mut info,
@@ -231,14 +240,18 @@ impl Bundle {
             charged += 3 * path.len() as u64;
             Error::limit(LimitKind::Decompressed, charged, budget)?;
             let (Ok(offset), Ok(size)) = (usize::try_from(offset), usize::try_from(size)) else {
-                return Err(Error::Invalid(format!("entry {path:?} at {offset}+{size}")));
+                return Err(Error::Invalid(format!(
+                    "entry {path} at {offset}+{size}",
+                    path = quoted(&path)
+                )));
             };
             if offset
                 .checked_add(size)
                 .is_none_or(|end| end as u64 > total)
             {
                 return Err(Error::Invalid(format!(
-                    "entry {path:?} runs past the bundle"
+                    "entry {path} runs past the bundle",
+                    path = quoted(&path)
                 )));
             }
             entries.push(Entry {
@@ -268,11 +281,7 @@ impl Bundle {
         // `total` is within the limit; reserve it once rather than grow by doubling.
         let mut data = Vec::new();
         data.try_reserve_exact(usize::try_from(total).unwrap_or(usize::MAX))
-            .map_err(|_| Error::LimitExceeded {
-                kind: LimitKind::Decompressed,
-                value: total,
-                limit: budget,
-            })?;
+            .map_err(|_| Error::OutOfMemory { bytes: total })?;
         for (size, compressed, block_flags) in blocks {
             let block = r.take(compressed)?;
             if block_flags & flags::COMPRESSION_MASK == 1 {
@@ -450,10 +459,20 @@ fn header(r: &mut Reader<'_>) -> Result<Header> {
 /// after that is not the bundle's).
 pub(crate) fn check_head(head: &[u8], len: u64) -> Result<u64> {
     let Header { declared_size, .. } = header(&mut Reader::new(head, true))?;
-    Ok(u64::try_from(declared_size)
+    declared_len(declared_size, len)
+}
+
+/// The bundle's length from its header's declared size: more than nothing, and no more than
+/// the `len` bytes there are. Unity writes the file's own size here.
+fn declared_len(declared_size: i64, len: u64) -> Result<u64> {
+    u64::try_from(declared_size)
         .ok()
         .filter(|&n| n > 0 && n <= len)
-        .unwrap_or(len))
+        .ok_or_else(|| {
+            Error::Invalid(format!(
+                "bundle header declares {declared_size} bytes; the data holds {len}"
+            ))
+        })
 }
 
 /// The working memory an LZMA block needs, `(tables, dictionary)` in bytes, from its
@@ -475,7 +494,8 @@ fn lzma_memory(block: &[u8], size: usize) -> Result<(u64, u64)> {
         header[1..5].try_into().unwrap_or([0; 4]),
     ));
     let tables = 2 * (0x300u64 << (lc + lp)) + 4096;
-    Ok((tables, 2 * dictionary.min(size as u64)))
+    // lzma-rs raises a dictionary under 4 KiB to 4 KiB.
+    Ok((tables, 2 * dictionary.max(4096).min(size.max(4096) as u64)))
 }
 
 /// Unity's LZMA: the 5-byte properties header, then the raw stream, with no size field. The
@@ -623,8 +643,9 @@ mod tests {
 
     #[test]
     fn test_lz4_refuses_offset_zero_and_earlier_blocks() {
-        assert!(lz4(&[0x10, b'a', 0, 0, 0x00], 5).is_err()); // offset 0
-                                                             // Offset 2 would reach the earlier block's bytes; this block has only one.
+        // Offset 0 is no offset at all.
+        assert!(lz4(&[0x10, b'a', 0, 0, 0x00], 5).is_err());
+        // Offset 2 would reach the earlier block's bytes; this block has only one.
         assert!(lz4(&[0x10, b'a', 2, 0, 0x00], 5).is_err());
     }
 

@@ -5,7 +5,7 @@
 
 use crate::reader::Reader;
 use crate::serialized::{class, ObjectInfo, SerializedFile};
-use crate::{check_release, Error, LimitKind, Result, Version};
+use crate::{check_release, quoted, Error, LimitKind, Result, Version};
 
 use std::collections::HashMap;
 
@@ -188,7 +188,8 @@ impl std::fmt::Debug for Sprite {
 }
 
 impl Sprite {
-    /// Read a `Sprite` object, Unity 2019.1 through 6000.4 (final and beta builds).
+    /// Read a `Sprite` object, Unity 2019.1 through 6000.4: final, patch, China and beta
+    /// builds (6000.4 finals are read with its betas' layout, which is all that was checked).
     ///
     /// # Errors
     ///
@@ -225,9 +226,9 @@ struct Budget {
 fn layout_error(e: Error, what: &str, object: &ObjectInfo, file: &SerializedFile) -> Error {
     match e {
         Error::Truncated(_) | Error::BadLength { .. } => Error::Invalid(format!(
-            "{what} {} from Unity {:?} does not fit the layout this crate knows ({e})",
+            "{what} {} from Unity {} does not fit the layout this crate knows ({e})",
             object.path_id(),
-            file.unity_version()
+            quoted(file.unity_version())
         )),
         e => e,
     }
@@ -293,12 +294,7 @@ fn read_sprite(
         let n = r.len(12)?;
         r.skip(n * 12)?; // m_ScriptableObjects
     }
-    if r.remaining() != 0 {
-        return Err(Error::Invalid(format!(
-            "sprite {name:?} has {} bytes after its last field; the layout is probably misread",
-            r.remaining()
-        )));
-    }
+    r.check_end(|| format!("sprite {}", quoted(&name)))?;
 
     Ok(Sprite {
         path_id,
@@ -407,27 +403,30 @@ fn read_mesh(
     };
     // Stream layout: each stream's stride is the sum of its channels; streams follow one
     // another, each padded to 16 bytes.
-    let mut stream_offset = 0usize;
-    let mut stride = 0usize;
-    for s in 0..=pos_stream {
-        let mut s_stride = 0usize;
-        for &(stream, _, format, d) in &channels {
-            if stream == s && d > 0 {
-                let Some(size) = component_size(format) else {
-                    return Ok(None);
-                };
-                s_stride += size * d as usize;
-            }
-        }
-        if s == pos_stream {
-            stride = s_stride;
-        } else {
-            stream_offset = stream_offset
-                .saturating_add(vertex_count.saturating_mul(s_stride))
-                .checked_next_multiple_of(16)
-                .unwrap_or(usize::MAX);
+    // One pass over the channels for every stream's stride; a channel whose format has no
+    // known size spoils its stream.
+    let mut strides = [Some(0usize); 256];
+    for &(stream, _, format, d) in &channels {
+        if d > 0 {
+            let slot = &mut strides[usize::from(stream)];
+            *slot = slot
+                .zip(component_size(format))
+                .map(|(s, size)| s + size * d as usize);
         }
     }
+    let mut stream_offset = 0usize;
+    for s in 0..pos_stream {
+        let Some(s_stride) = strides[usize::from(s)] else {
+            return Ok(None);
+        };
+        stream_offset = stream_offset
+            .saturating_add(vertex_count.saturating_mul(s_stride))
+            .checked_next_multiple_of(16)
+            .unwrap_or(usize::MAX);
+    }
+    let Some(stride) = strides[usize::from(pos_stream)] else {
+        return Ok(None);
+    };
     let f32_at = |b: &[u8]| {
         let b: [u8; 4] = b.try_into().unwrap();
         if big_endian {
@@ -488,7 +487,8 @@ impl std::fmt::Debug for SpriteAtlas {
 }
 
 impl SpriteAtlas {
-    /// Read a `SpriteAtlas` object, Unity 2019.1 through 6000.4 (final and beta builds).
+    /// Read a `SpriteAtlas` object, Unity 2019.1 through 6000.4: final, patch, China and beta
+    /// builds (6000.4 finals are read with its betas' layout, which is all that was checked).
     ///
     /// # Errors
     ///
@@ -559,13 +559,7 @@ fn read_atlas(r: &mut Reader, v: [u32; 3]) -> Result<SpriteAtlas> {
     r.bool()?; // m_IsVariant
     r.align(4);
     // The last field ends the object. Bytes left over mean the layout was misread.
-    if r.remaining() != 0 {
-        return Err(Error::Invalid(format!(
-            "sprite atlas {name:?} has {} bytes after its last field; the layout is probably \
-             misread",
-            r.remaining()
-        )));
-    }
+    r.check_end(|| format!("sprite atlas {}", quoted(&name)))?;
     Ok(SpriteAtlas {
         name,
         entries,

@@ -9,12 +9,15 @@
 mod common;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut args = std::env::args().skip(1);
+    let mut args = std::env::args_os().skip(1);
     let path = args
         .next()
         .ok_or("usage: textures <file-or-bundle> <out-dir> [name-prefix...]")?;
     let out = std::path::PathBuf::from(args.next().ok_or("out dir")?);
-    let prefixes: Vec<String> = args.collect();
+    let mut prefixes = Vec::new();
+    while let Some(prefix) = common::text_arg(&mut args, "a name prefix")? {
+        prefixes.push(prefix);
+    }
     std::fs::create_dir_all(&out)?;
     let assets = unity_bundle_assets::Assets::open(&path)?;
     let (mut ok, mut failed) = (0, 0);
@@ -34,13 +37,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(()) => ok += 1,
             Err(e) => {
                 failed += 1;
-                let line = format!(
-                    "{} ({}): {}",
-                    common::printable(name),
-                    texture.path_id,
-                    common::printable(&e)
-                );
-                common::report(&mut printed, &line);
+                common::report(&mut printed, || {
+                    format!(
+                        "{} ({}): {}",
+                        common::printable(name),
+                        texture.path_id,
+                        common::printable(&e)
+                    )
+                });
             }
         }
     }

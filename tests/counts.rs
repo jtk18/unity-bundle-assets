@@ -235,7 +235,7 @@ fn object_and_bundle_counts() {
     );
 
     // Name, packed sprites, their names and one name, entries (with, from 2020.2, their
-    // secondary textures), tag.
+    // secondary textures and those textures' names), tag.
     for (unity, secondary, entry) in [("2020.1.17f1", false, 104), ("2022.3.62f1", true, 108)] {
         let build = |pad: usize| {
             let a = atlas_full(
@@ -253,7 +253,7 @@ fn object_and_bundle_counts() {
         };
         let mut sizes = vec![1, 12, 4, 1, entry];
         if secondary {
-            sizes.push(16);
+            sizes.extend([16, 1, 1]); // the list, and each of its two names
         }
         sizes.push(1);
         assert_sizes(

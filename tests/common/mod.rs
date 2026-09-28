@@ -11,6 +11,9 @@
 /// wrong constant there cannot agree with itself.
 pub mod format {
     pub const ALPHA8: i32 = 1;
+    pub const ARGB4444: i32 = 2;
+    pub const RGB565: i32 = 7;
+    pub const RGBA4444: i32 = 13;
     pub const RGB24: i32 = 3;
     pub const RGBA32: i32 = 4;
     pub const ARGB32: i32 = 5;
@@ -577,6 +580,9 @@ pub fn atlas_with(
     atlas_full(big, secondary, "atlas", &[], entries)
 }
 
+/// Secondary textures on every atlas entry from 2020.2, as Unity writes for normal maps.
+const ENTRY_SECONDARY: &[(i64, &str)] = &[(40, "_NormalMap"), (41, "_MaskTex")];
+
 /// [`atlas_with`] with a name and its packed sprites, `(path ID, name)`.
 pub fn atlas_full(
     big: bool,
@@ -605,7 +611,10 @@ pub fn atlas_full(
         o.f32(downscale);
         o.u32(settings);
         if secondary {
-            o.i32(0); // secondaryTextures
+            o.i32(ENTRY_SECONDARY.len() as i32); // secondaryTextures
+            for &(texture, name) in ENTRY_SECONDARY {
+                o.pptr(0, texture).string(name);
+            }
         }
     }
     o.string("tag"); // m_Tag
@@ -910,7 +919,8 @@ pub fn bundle(opts: &BundleOpts, entries: &[(&str, &[u8], u32)]) -> Vec<u8> {
     out.extend(b"5.x.x\0");
     out.extend(opts.revision.as_bytes());
     out.push(0);
-    out.extend(0i64.to_be_bytes());
+    let size_at = out.len();
+    out.extend(0i64.to_be_bytes()); // the bundle's size, filled in at the end
     out.extend((info_c.len() as u32).to_be_bytes());
     out.extend((info.len() as u32).to_be_bytes());
     out.extend(flags.to_be_bytes());
@@ -929,7 +939,18 @@ pub fn bundle(opts: &BundleOpts, entries: &[(&str, &[u8], u32)]) -> Vec<u8> {
     if opts.info_at_end {
         out.extend(&info_c);
     }
+    let size = out.len() as i64;
+    out[size_at..size_at + 8].copy_from_slice(&size.to_be_bytes());
     out
+}
+
+/// Set a bundle's declared size to its length, after a test has changed the length.
+pub fn fix_bundle_size(bundle: &mut [u8]) {
+    let at = bundle[8..].iter().position(|&b| b == 0).unwrap() + 8 + 1 + 4; // signature, format
+    let at = at + bundle[at..].iter().position(|&b| b == 0).unwrap() + 1; // player version
+    let at = at + bundle[at..].iter().position(|&b| b == 0).unwrap() + 1; // engine version
+    let size = bundle.len() as i64;
+    bundle[at..at + 8].copy_from_slice(&size.to_be_bytes());
 }
 
 /// A 4x4 RGBA32 image with every byte distinct, as stored (bottom row first).

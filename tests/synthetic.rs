@@ -631,7 +631,7 @@ fn unsupported_formats_name_the_texture() {
     let (_d, assets) = open_file("fmt", &file);
     match assets.unwrap().decode_texture(7) {
         Err(Error::UnsupportedTextureFormat {
-            texture,
+            name: texture,
             format: 25,
             ..
         }) => {

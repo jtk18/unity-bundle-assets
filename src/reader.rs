@@ -8,6 +8,23 @@ use crate::{Error, Result};
 /// says.
 pub const MAX_STRING: usize = 4096;
 
+/// Bytes from a file as text, never longer than the bytes themselves: invalid UTF-8 becomes
+/// U+FFFD, three bytes for one, and the result is cut back to the byte count (at a character
+/// boundary), so a string held or quoted costs no more than the file spent on it.
+fn text(bytes: &[u8]) -> String {
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        return s.to_owned();
+    }
+    let mut s = String::from_utf8_lossy(bytes).into_owned();
+    let mut cut = bytes.len().min(s.len());
+    while !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    s.truncate(cut);
+    s.shrink_to_fit();
+    s
+}
+
 #[derive(Clone)]
 pub struct Reader<'a> {
     data: &'a [u8],
@@ -46,6 +63,28 @@ impl<'a> Reader<'a> {
     /// The bytes after the cursor.
     pub fn rest(&self) -> &'a [u8] {
         &self.data[self.pos.min(self.data.len())..]
+    }
+
+    /// Refuse an object that does not end exactly where its last field (and the alignment
+    /// after it) does: bytes left over, or an alignment that stepped past the end, mean the
+    /// layout was misread. `what` names the object, for the message only.
+    pub fn check_end(&self, what: impl FnOnce() -> String) -> Result<()> {
+        let len = self.data.len();
+        if self.pos == len {
+            return Ok(());
+        }
+        let how = if self.pos < len {
+            format!("has {} bytes after its last field", len - self.pos)
+        } else {
+            format!(
+                "ends {} bytes short of its last field's alignment",
+                self.pos - len
+            )
+        };
+        Err(Error::Invalid(format!(
+            "{} {how}; the layout is probably misread",
+            what()
+        )))
     }
 
     /// Bytes left after the cursor.
@@ -110,7 +149,7 @@ impl<'a> Reader<'a> {
                     Error::Truncated(self.pos)
                 }
             })?;
-        let s = String::from_utf8_lossy(&rest[..len]).into_owned();
+        let s = text(&rest[..len]);
         self.pos += len + 1;
         Ok(s)
     }
@@ -138,7 +177,7 @@ impl<'a> Reader<'a> {
         if n > MAX_STRING {
             return Err(Error::BadLength { at, len: n as i64 });
         }
-        let s = String::from_utf8_lossy(self.take(n)?).into_owned();
+        let s = text(self.take(n)?);
         self.align(4);
         Ok(s)
     }
@@ -155,6 +194,37 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_check_end_says_which_way_it_missed() {
+        let data = [0u8; 10];
+        let mut r = Reader::new(&data, false);
+        r.skip(7).unwrap();
+        let err = r.check_end(|| "texture".into()).unwrap_err().to_string();
+        assert!(
+            err.contains("texture has 3 bytes after its last field"),
+            "{err}"
+        );
+        r.skip(3).unwrap();
+        assert!(r.check_end(|| unreachable!()).is_ok());
+        r.skip(0).unwrap();
+        r.align(4); // 10 -> 12, past the end
+        let err = r.check_end(|| "atlas".into()).unwrap_err().to_string();
+        assert!(err.contains("atlas ends 2 bytes short"), "{err}");
+        assert_eq!(r.remaining(), 0);
+    }
+
+    #[test]
+    fn test_text_is_never_longer_than_its_bytes() {
+        assert_eq!(text(b"Icon_1"), "Icon_1");
+        assert_eq!(text("é".as_bytes()), "é");
+        let bad = text(&[0xff; 4096]);
+        assert!(bad.len() <= 4096 && bad.capacity() <= 4096, "{}", bad.len());
+        assert!(bad.chars().all(|c| c == '\u{fffd}'));
+        // "a", U+FFFD, "b" is five bytes from three: cut back to three, at a boundary.
+        assert_eq!(text(&[b'a', 0xff, b'b']), "a");
+        assert_eq!(text(&[0xff]), "");
+    }
 
     #[test]
     fn test_strings_stop_at_4_kib() {

@@ -31,6 +31,16 @@ pub fn file_name(name: &str) -> String {
     safe
 }
 
+/// The next argument as text, or an error naming it.
+pub fn text_arg(
+    args: &mut impl Iterator<Item = std::ffi::OsString>,
+    what: &str,
+) -> Result<Option<String>, String> {
+    args.next()
+        .map(|a| a.into_string().map_err(|_| format!("{what} is not UTF-8")))
+        .transpose()
+}
+
 /// Output names already used in this run, compared as a case-insensitive file system would.
 #[derive(Default)]
 pub struct Names(HashSet<String>);
@@ -95,10 +105,18 @@ pub fn save_png(
 /// broken objects cannot flood the terminal.
 pub const MAX_REPORTED: usize = 50;
 
-/// Print one error line, or count it once [`MAX_REPORTED`] have been printed.
-pub fn report(printed: &mut usize, line: &str) {
+/// Longest error line printed, in characters; the rest is cut.
+pub const MAX_LINE: usize = 300;
+
+/// Print one error line (built only if it will be printed, and cut to [`MAX_LINE`]), or count
+/// it once [`MAX_REPORTED`] have been printed.
+pub fn report(printed: &mut usize, line: impl FnOnce() -> String) {
     if *printed < MAX_REPORTED {
-        eprintln!("{line}");
+        let line = line();
+        match line.char_indices().nth(MAX_LINE) {
+            Some((cut, _)) => eprintln!("{}...", &line[..cut]),
+            None => eprintln!("{line}"),
+        }
     } else if *printed == MAX_REPORTED {
         eprintln!("(further errors are counted, not printed)");
     }

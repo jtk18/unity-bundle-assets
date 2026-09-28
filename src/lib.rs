@@ -37,16 +37,17 @@
 //! Files are treated as hostile:
 //!
 //! - Counts and lengths are checked against the bytes present before they size an
-//!   allocation, and every string read is at most 4 KiB. Objects in a file, entries in a
-//!   bundle, a sprite's sub-meshes, and the stream ranges textures read may not overlap, so one
-//!   blob cannot be decoded many times over; stream ranges are compared by the bytes they
-//!   reach, however the path to them is spelled.
+//!   allocation, and every string read is at most 4 KiB of the file and no longer as text.
+//!   Objects in a file, entries in a bundle, a sprite's sub-meshes, and the stream ranges
+//!   textures read may not overlap, so one blob cannot be decoded many times over; stream
+//!   ranges are compared by the bytes they reach (on Unix; by lower-cased ASCII name
+//!   elsewhere), however the path to them is spelled.
 //! - Sizes the data alone cannot bound are held to [`Limits`]: file size, decompressed bundle
 //!   size (the parsed directory and LZMA's working memory included), object count, decoded
 //!   pixels, sprite meshes, and the total work spent decoding, cutting and masking, shared by
 //!   everything opened from one file or bundle. Work is reserved before it starts and kept once
-//!   started. The limits bound work, not peak memory: at the default 16384 x 16384, one decoded
-//!   texture can hold 1 to 2 GiB and a sprite exported from it up to 3 GiB.
+//!   started. The limits bound work, not peak memory: at the default 16384 x 16384, up to
+//!   about 2 GiB to decode one texture of that size, and 3.25 GiB to export a sprite from it.
 //! - Streamed pixels are read only from the same bundle, or from a `.resS` / `.resource` file
 //!   directly beside the asset file that is a regular file, not a symbolic link, not a Windows
 //!   device name, and (on Unix) has no other hard links.
@@ -55,8 +56,11 @@
 //!   returned as found; escape them before printing.
 //!
 //! [`Assets`] enforces every limit. Used directly, [`Bundle`] and [`SerializedFile`] apply
-//! their own, [`Texture2D`] refuses data too short for its size, and [`decode::decode`]
-//! applies none; none of them tracks total work.
+//! their own, [`Texture2D`] refuses data too short for its size but claims no ranges, and
+//! [`decode::decode`] applies none; none of them tracks total work.
+//!
+//! An error [`Assets::export`] or an atlas passes on wraps its cause; [`Error::root`] unwraps
+//! it.
 //!
 //! Malformed data is meant to give an [`Error`] rather than a panic. `tests/fuzz.rs` checks
 //! that over mutated files; it is evidence, not proof.
@@ -88,8 +92,9 @@ pub struct ReadmeDoctests;
 
 /// Everything that can go wrong reading a file.
 ///
-/// Strings that came from a file are quoted (`{:?}`) when displayed. Each message is complete: an underlying cause is part of it rather
-/// than a separate [`std::error::Error::source`].
+/// Strings that came from a file are quoted (`{:?}`) when displayed, and cut to 64
+/// characters. Each message is complete: an underlying cause is part of it rather than a
+/// separate [`std::error::Error::source`] (see [`Error::root`] for the wrapped ones).
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
@@ -115,11 +120,11 @@ pub enum Error {
     #[error("unsupported: {0}")]
     Unsupported(String),
     /// A texture in a pixel format this crate does not decode.
-    #[error("{}unsupported texture format {format}", texture_label(texture.as_deref()))]
+    #[error("{}unsupported texture format {format}", texture_label(name.as_deref()))]
     #[non_exhaustive]
     UnsupportedTextureFormat {
         /// The texture's name, when known.
-        texture: Option<String>,
+        name: Option<String>,
         /// Unity's `TextureFormat` value.
         format: i32,
     },
@@ -152,30 +157,37 @@ pub enum Error {
         expected: i32,
     },
     /// A sprite atlas that could not be read, which spoils the sprites packed into it.
-    #[error("sprite atlas {atlas} could not be read: {error}")]
+    #[error("sprite atlas {path_id} could not be read: {error}")]
     #[non_exhaustive]
     AtlasUnreadable {
         /// The atlas's path ID.
-        atlas: i64,
+        path_id: i64,
         /// Why; shared by every sprite in the atlas.
         error: Arc<Self>,
     },
     /// A texture [`Assets::export`] could not decode, which spoils the sprites cut from it.
-    #[error("texture {texture} could not be decoded: {error}")]
+    #[error("texture {path_id} could not be decoded: {error}")]
     #[non_exhaustive]
     TextureUnreadable {
         /// The texture's path ID.
-        texture: i64,
+        path_id: i64,
         /// Why; shared by every sprite exported from the texture.
         error: Arc<Self>,
     },
     /// A texture stored with no pixels, as dynamic font textures are; it is filled at run
     /// time.
-    #[error("texture {0:?} is empty (0x0)")]
+    #[error("texture {} is empty (0x0)", quoted(.0))]
     EmptyTexture(String),
     /// Data that contradicts itself, or a layout this crate misread.
     #[error("invalid file: {0}")]
     Invalid(String),
+    /// Memory for data within the limits could not be had.
+    #[error("out of memory allocating {bytes} bytes")]
+    #[non_exhaustive]
+    OutOfMemory {
+        /// The allocation asked for.
+        bytes: u64,
+    },
     /// Reading a file from disk failed.
     #[error("{:?}: {error}", path.display().to_string())]
     #[non_exhaustive]
@@ -188,16 +200,30 @@ pub enum Error {
 }
 
 fn texture_label(name: Option<&str>) -> String {
-    name.map_or_else(String::new, |n| format!("texture {n:?}: "))
+    name.map_or_else(String::new, |n| format!("texture {n}: ", n = quoted(n)))
 }
 
 impl Error {
-    /// The I/O error inside, if this is [`Error::Io`], for testing its kind (a missing
-    /// stream file is [`std::io::ErrorKind::NotFound`]). Errors carry no
+    /// The error behind this one: through [`Error::AtlasUnreadable`] and
+    /// [`Error::TextureUnreadable`], which wrap the reason an atlas or texture could not be
+    /// read, to that reason. Match on this to handle, say, an unsupported texture format
+    /// the same whether [`Assets::decode_texture`] or [`Assets::export`] reported it.
+    #[must_use]
+    pub fn root(&self) -> &Self {
+        match self {
+            Self::AtlasUnreadable { error, .. } | Self::TextureUnreadable { error, .. } => {
+                error.root()
+            }
+            e => e,
+        }
+    }
+
+    /// The I/O error behind this one, if any (see [`Error::root`]), for testing its kind: a
+    /// missing stream file is [`std::io::ErrorKind::NotFound`]. Errors carry no
     /// [`std::error::Error::source`]: each message is complete on its own.
     #[must_use]
-    pub const fn io_error(&self) -> Option<&std::io::Error> {
-        match self {
+    pub fn io_error(&self) -> Option<&std::io::Error> {
+        match self.root() {
             Self::Io { error, .. } => Some(error),
             _ => None,
         }
@@ -274,10 +300,12 @@ pub struct Limits {
     /// Largest decompressed size of a bundle in bytes, counting the parsed directory at its
     /// in-memory size. Default 1 GiB.
     pub max_decompressed: u64,
-    /// Most objects in one serialized file. Default 4,194,304.
+    /// Most objects in one serialized file, and across the files opened from one bundle.
+    /// Default 4,194,304.
     pub max_objects: u64,
     /// Most pixels in one texture this crate will decode. Default 16384 x 16384, Unity's
-    /// own maximum. Decoding one that size peaks at 1-2 GiB, exporting a sprite from it at 2-3.
+    /// own maximum: up to about 2 GiB to decode one texture that size, and 3.25 GiB to export
+    /// a sprite from it.
     pub max_texture_pixels: u64,
     /// Most triangles in one sprite's mesh. Default 65,536.
     pub max_sprite_triangles: u64,
@@ -373,6 +401,9 @@ impl Default for Limits {
 #[derive(Debug, Default)]
 pub(crate) struct Shared {
     work: AtomicU64,
+    /// Objects in the serialized files opened from a bundle, held to
+    /// [`Limits::max_objects`] across all of them.
+    objects: AtomicU64,
     /// Stream ranges already read, by the bytes they name (not by how a texture spelled the
     /// path to them): start -> the claim.
     streams: Mutex<HashMap<StreamKey, BTreeMap<u64, Claim>>>,
@@ -442,21 +473,43 @@ impl Shared {
         self.work.load(Ordering::Relaxed)
     }
 
-    /// Record that texture `texture` of `owner` reads `start..end` of `stream`, refusing a
-    /// range another texture already read any part of: one blob decoded many times over.
-    /// `Ok(true)` when the claim is new, `Ok(false)` when this texture already held it.
+    /// Objects counted so far.
+    pub fn objects(&self) -> u64 {
+        self.objects.load(Ordering::Relaxed)
+    }
+
+    /// Count `n` more objects against `limit`, or refuse without counting them.
+    pub fn count_objects(&self, n: u64, limit: u64) -> Result<()> {
+        self.objects
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
+                c.checked_add(n).filter(|&t| t <= limit)
+            })
+            .map(|_| ())
+            .map_err(|c| Error::LimitExceeded {
+                kind: LimitKind::Objects,
+                value: c.saturating_add(n),
+                limit,
+            })
+    }
+
+    /// Record that texture `texture` of `owner` reads `start..end` of `stream`, and reserve
+    /// its work with `reserve`, as one step under the claims lock: a range another texture
+    /// already read any part of is refused (one blob decoded many times over), and a claim is
+    /// recorded only once its work is reserved, so no texture is ever refused for a range
+    /// whose owner was itself refused. The same texture reading its own range again is fine.
     #[expect(
         clippy::significant_drop_tightening,
-        reason = "the check and the insert are one step"
+        reason = "the check, the reservation and the insert are one step"
     )]
-    pub fn claim_stream(
+    pub fn claim_stream<R>(
         &self,
         stream: StreamKey,
         start: u64,
         end: u64,
         owner: &Arc<str>,
         texture: i64,
-    ) -> Result<bool> {
+        reserve: impl FnOnce() -> Result<R>,
+    ) -> Result<R> {
         let mut streams = self
             .streams
             .lock()
@@ -468,16 +521,18 @@ impl Shared {
                 && earlier.texture == texture
                 && earlier.owner == *owner;
             if same {
-                return Ok(false);
+                return reserve();
             }
             if earlier.end > start {
                 return Err(Error::Invalid(format!(
-                    "texture {texture} of {owner:?} streams bytes that texture {} of {:?} \
-                     already read",
-                    earlier.texture, earlier.owner
+                    "texture {texture} of {} streams bytes that texture {} of {} already read",
+                    quoted_path(owner),
+                    earlier.texture,
+                    quoted_path(&earlier.owner)
                 )));
             }
         }
+        let reserved = reserve()?;
         ranges.insert(
             start,
             Claim {
@@ -486,19 +541,41 @@ impl Shared {
                 texture,
             },
         );
-        Ok(true)
+        Ok(reserved)
     }
+}
 
-    /// Withdraw a claim [`Shared::claim_stream`] just made, whose texture was then refused.
-    pub fn release_stream(&self, stream: &StreamKey, start: u64) {
-        let mut streams = self
-            .streams
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(ranges) = streams.get_mut(stream) {
-            ranges.remove(&start);
-        }
+/// `len` zero bytes, or [`Error::OutOfMemory`] rather than an abort when they cannot be had.
+pub(crate) fn zeroed(len: usize) -> Result<Vec<u8>> {
+    let mut v = Vec::new();
+    v.try_reserve_exact(len)
+        .map_err(|_| Error::OutOfMemory { bytes: len as u64 })?;
+    v.resize(len, 0);
+    Ok(v)
+}
+
+/// A string from a file, for an error message: quoted with `{:?}`, so it cannot send control
+/// sequences to a terminal, and cut to its first 64 characters, so a message stays short
+/// whatever the file holds.
+pub(crate) fn quoted(s: &str) -> String {
+    const SHOWN: usize = 64;
+    let mut chars = s.char_indices();
+    match chars.nth(SHOWN) {
+        Some((cut, _)) => format!("{:?}... ({} bytes)", &s[..cut], s.len()),
+        None => format!("{s:?}"),
     }
+}
+
+/// A path for an error message: as [`quoted`], but keeping its last 64 characters, where the
+/// file's name is.
+pub(crate) fn quoted_path(s: &str) -> String {
+    const SHOWN: usize = 64;
+    let count = s.chars().count();
+    if count <= SHOWN {
+        return format!("{s:?}");
+    }
+    let cut = s.char_indices().nth(count - SHOWN).map_or(0, |(i, _)| i);
+    format!("({} bytes) ...{:?}", s.len(), &s[cut..])
 }
 
 /// Longest engine version string accepted; real ones are under 20 bytes.
@@ -625,6 +702,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_quoted_keeps_the_start_and_quoted_path_the_end() {
+        assert_eq!(quoted("abc"), "\"abc\"");
+        let long: String = ('a'..='z').cycle().take(100).collect();
+        assert_eq!(quoted(&long), format!("{:?}... (100 bytes)", &long[..64]));
+        assert_eq!(quoted(&long[..64]), format!("{:?}", &long[..64]));
+        assert_eq!(
+            quoted(&long[..65]),
+            format!("{:?}... (65 bytes)", &long[..64])
+        );
+        assert_eq!(quoted_path(&long[..64]), format!("{:?}", &long[..64]));
+        assert_eq!(
+            quoted_path(&long),
+            format!("(100 bytes) ...{:?}", &long[36..])
+        );
+        assert_eq!(
+            quoted_path(&long[..65]),
+            format!("(65 bytes) ...{:?}", &long[1..65])
+        );
+        // Characters, not bytes.
+        let wide = "\u{e9}".repeat(70);
+        assert!(quoted(&wide).ends_with("... (140 bytes)"));
+        assert!(quoted_path(&wide).starts_with("(140 bytes) ..."));
+    }
+
+    #[test]
     fn test_version_parts_default_to_zero() {
         assert_eq!(Version::parse("2018.4").numbers, [2018, 4, 0]);
         assert_eq!(Version::parse("5").numbers, [5, 0, 0]);
@@ -733,7 +835,7 @@ mod tests {
     #[test]
     fn test_error_messages() {
         let e = Error::UnsupportedTextureFormat {
-            texture: Some("t".into()),
+            name: Some("t".into()),
             format: 25,
         };
         assert_eq!(
@@ -741,7 +843,7 @@ mod tests {
             "texture \"t\": unsupported texture format 25"
         );
         let e = Error::UnsupportedTextureFormat {
-            texture: None,
+            name: None,
             format: 25,
         };
         assert_eq!(e.to_string(), "unsupported texture format 25");

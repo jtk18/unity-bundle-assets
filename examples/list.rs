@@ -6,11 +6,13 @@ mod common;
 use std::collections::BTreeMap;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut args = std::env::args().skip(1);
+    let mut args = std::env::args_os().skip(1);
     let path = args
         .next()
         .ok_or("usage: list <file-or-bundle> [class-id]")?;
-    let filter: Option<i32> = args.next().map(|s| s.parse()).transpose()?;
+    let filter: Option<i32> = common::text_arg(&mut args, "the class id")?
+        .map(|s| s.parse())
+        .transpose()?;
     let assets = unity_bundle_assets::Assets::open(&path)?;
     let file = assets.file();
     println!(

@@ -5,7 +5,7 @@ use crate::bundle::Bundle;
 use crate::decode;
 use crate::reader::Reader;
 use crate::serialized::{class, ObjectInfo, SerializedFile};
-use crate::{check_release, Error, Result, StreamKey, Version};
+use crate::{check_release, quoted, quoted_path, Error, Result, StreamKey, Version};
 
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
@@ -76,7 +76,8 @@ impl std::fmt::Debug for Texture2D<'_> {
 }
 
 impl<'a> Texture2D<'a> {
-    /// Read a `Texture2D` object, Unity 5.5 through 6000.4 (final and beta builds).
+    /// Read a `Texture2D` object, Unity 5.5 through 6000.4: final, patch, China and beta
+    /// builds (6000.4 finals are read with its betas' layout, which is all that was checked).
     ///
     /// Fields are gated by engine release, checked against the per-release type trees that
     /// ship with `UnityPy` (see NOTICE). Where a boundary release's builds differ, the
@@ -90,9 +91,9 @@ impl<'a> Texture2D<'a> {
         let mut r = file.reader_for(object, class::TEXTURE_2D)?;
         read_fields(&mut r, Version::parse(file.unity_version())).map_err(|e| match e {
             Error::Truncated(_) | Error::BadLength { .. } => Error::Invalid(format!(
-                "Texture2D {} from Unity {:?} does not fit the layout this crate knows ({e})",
+                "Texture2D {} from Unity {} does not fit the layout this crate knows ({e})",
                 object.path_id(),
-                file.unity_version()
+                quoted(file.unity_version())
             )),
             e => e,
         })
@@ -103,14 +104,14 @@ impl<'a> Texture2D<'a> {
     fn wanted(&self, stored: usize) -> Result<usize> {
         let need = decode::mip0_size(self.format, self.width, self.height).ok_or_else(|| {
             Error::UnsupportedTextureFormat {
-                texture: Some(self.name.clone()),
+                name: Some(self.name.clone()),
                 format: self.format,
             }
         })?;
         if stored < need {
             return Err(Error::Invalid(format!(
-                "texture {:?} holds {stored} bytes of pixels; its first mip level needs {need}",
-                self.name
+                "texture {} holds {stored} bytes of pixels; its first mip level needs {need}",
+                quoted(&self.name)
             )));
         }
         Ok(need)
@@ -120,6 +121,9 @@ impl<'a> Texture2D<'a> {
     /// the serialized file, and only from a `.resS` or `.resource` file directly inside it: a
     /// regular file, not a symbolic link, with no other hard links (checked on Unix only), and
     /// not named like a Windows device or an alternate data stream.
+    ///
+    /// This does no bookkeeping across textures: two textures naming the same bytes both read
+    /// them. [`crate::Assets::decode_texture`] refuses that and counts the work.
     ///
     /// # Errors
     ///
@@ -139,21 +143,24 @@ impl<'a> Texture2D<'a> {
         };
         if stream.path.starts_with("archive:") {
             return Err(Error::Unsupported(format!(
-                "texture {:?} streams from an asset bundle ({:?}); use Texture2D::data_in",
-                self.name, stream.path
+                "texture {} streams from an asset bundle ({}); use Texture2D::data_in",
+                quoted(&self.name),
+                quoted(&stream.path)
             )));
         }
         let want = self.wanted(stream.size as usize)?;
         let path = stream_file(dir, &stream.path)?;
+        // Stream files are read by range, not whole, so `max_file_size` does not apply: real
+        // ones pass 2 GiB (a 2022.3 build's `sharedassets0.assets.resS` is 2.4 GB).
         let (mut file, len) = crate::file::open_regular(&path, crate::file::Chosen::ByData)?;
         let end = stream.offset.checked_add(u64::from(stream.size));
         let Some(end) = end.filter(|&end| end <= len) else {
             return Err(Error::Invalid(format!(
-                "texture {:?} streams {} bytes at {} from {:?}, which holds {len}",
-                self.name,
+                "texture {} streams {} bytes at {} from {}, which holds {len}",
+                quoted(&self.name),
                 stream.size,
                 stream.offset,
-                path.display().to_string()
+                quoted_path(&path.display().to_string())
             )));
         };
         let id = crate::file::identity(&file, &path)?;
@@ -166,9 +173,9 @@ impl<'a> Texture2D<'a> {
             .map_err(Error::io(&path))?;
         if data.len() != want {
             return Err(Error::Invalid(format!(
-                "{:?} ended while texture {:?} was being read",
-                path.display().to_string(),
-                self.name
+                "{} ended while texture {} was being read",
+                quoted_path(&path.display().to_string()),
+                quoted(&self.name)
             )));
         }
         Ok(Cow::Owned(data))
@@ -205,15 +212,16 @@ impl<'a> Texture2D<'a> {
         let want = self.wanted(stream.size as usize)?;
         let entry = bundle.entry(&stream.path).ok_or_else(|| {
             Error::NotFound(format!(
-                "stream {:?} of texture {:?} in this bundle",
-                stream.path, self.name
+                "stream {} of texture {} in this bundle",
+                quoted(&stream.path),
+                quoted(&self.name)
             ))
         })?;
         if entry.is_serialized() {
             return Err(Error::Invalid(format!(
-                "texture {:?} streams from {:?}, a serialized file",
-                self.name,
-                entry.path()
+                "texture {} streams from {}, a serialized file",
+                quoted(&self.name),
+                quoted(entry.path())
             )));
         }
         let bytes = bundle.bytes(entry).unwrap_or_default();
@@ -226,9 +234,9 @@ impl<'a> Texture2D<'a> {
             })
             .ok_or_else(|| {
                 Error::Invalid(format!(
-                    "texture {:?} streams past the end of {:?}",
-                    self.name,
-                    entry.path()
+                    "texture {} streams past the end of {}",
+                    quoted(&self.name),
+                    quoted(entry.path())
                 ))
             })?;
         // Claimed by position in the bundle's data, so every path that resolves to this entry
@@ -249,10 +257,14 @@ pub(crate) type Claim<'c> = &'c mut dyn FnMut(StreamKey, u64, u64) -> Result<()>
 fn stream_file(dir: &Path, name: &str) -> Result<PathBuf> {
     let refuse = || {
         Error::Unsupported(format!(
-            "stream path {name:?} is not a .resS or .resource file name beside the asset file"
+            "stream path {name} is not a .resS or .resource file name beside the asset file",
+            name = quoted(name)
         ))
     };
-    if name.contains(['/', '\\', ':', '\0']) {
+    // Unity writes these names in ASCII (`CAB-<hash>.resS`, `sharedassets0.assets.resS`).
+    // Anything else could name one file two ways on a system that folds case beyond ASCII,
+    // which the claims (by lower-cased name there) would not see.
+    if !name.is_ascii() || name.contains(['/', '\\', ':', '\0']) {
         return Err(refuse());
     }
     let (stem, ext) = name.rsplit_once('.').ok_or_else(refuse)?;
@@ -276,11 +288,11 @@ fn is_windows_device(name: &str) -> bool {
     let mut chars = base.chars();
     let prefix: String = chars.by_ref().take(3).collect();
     let digit = chars.next();
+    // COM0 and LPT0 too: Windows' naming rules list them, whatever its device layer does.
+    // (Superscript digits, which Windows also matches, are refused as non-ASCII.)
     (prefix == "COM" || prefix == "LPT")
         && chars.next().is_none()
-        && digit.is_some_and(|d| {
-            ('1'..='9').contains(&d) || ['\u{b9}', '\u{b2}', '\u{b3}'].contains(&d)
-        })
+        && digit.is_some_and(|d| d.is_ascii_digit())
 }
 
 fn read_fields<'a>(r: &mut Reader<'a>, version: Version) -> Result<Texture2D<'a>> {
@@ -302,7 +314,8 @@ fn read_fields<'a>(r: &mut Reader<'a>, version: Version) -> Result<Texture2D<'a>
     if at_least(2020, 1, 0) && r.i32()? != 0 {
         // The stored pixels would start at a smaller mip than the width and height describe.
         return Err(Error::Unsupported(format!(
-            "texture {name:?} has stripped mip levels"
+            "texture {name} has stripped mip levels",
+            name = quoted(&name)
         )));
     }
     let format = r.i32()?;
@@ -349,23 +362,19 @@ fn read_fields<'a>(r: &mut Reader<'a>, version: Version) -> Result<Texture2D<'a>
     let stream =
         Some(StreamingInfo { offset, size, path }).filter(|s| image_data.is_empty() && s.size > 0);
     // The last field ends the object. Bytes left over mean the layout was misread.
-    if r.remaining() != 0 {
-        return Err(Error::Invalid(format!(
-            "texture {name:?} has {} bytes after its last field; the layout is probably \
-             misread",
-            r.remaining()
-        )));
-    }
+    r.check_end(|| format!("texture {}", quoted(&name)))?;
     let Ok(mip_count) = u32::try_from(mip_count) else {
         return Err(Error::Invalid(format!(
-            "texture {name:?} has {mip_count} mip levels"
+            "texture {name} has {mip_count} mip levels",
+            name = quoted(&name)
         )));
     };
     let empty = width == 0 && height == 0 && image_data.is_empty() && stream.is_none();
     let in_range = |d: i32| (1..=MAX_DIMENSION).contains(&d);
     if !(empty || in_range(width) && in_range(height)) {
         return Err(Error::Invalid(format!(
-            "texture {name:?} is {width}x{height}; the layout is probably misread"
+            "texture {name} is {width}x{height}; the layout is probably misread",
+            name = quoted(&name)
         )));
     }
     Ok(Texture2D {

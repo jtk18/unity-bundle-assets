@@ -3,7 +3,7 @@
 
 use crate::bundle::{Bundle, Entry};
 use crate::reader::Reader;
-use crate::{check_version_string, Error, LimitKind, Limits, Result, Version};
+use crate::{check_version_string, quoted, Error, LimitKind, Limits, Result, Version};
 
 use std::collections::HashMap;
 use std::ops::Range;
@@ -175,14 +175,19 @@ impl SerializedFile {
     /// Parse the serialized file in a bundle entry, sharing the bundle's bytes. A file whose
     /// engine version was stripped takes the bundle's.
     pub(crate) fn in_bundle(bundle: Arc<Bundle>, entry: &Entry) -> Result<Self> {
-        let bytes = bundle
-            .bytes(entry)
-            .ok_or_else(|| Error::NotFound(format!("entry {:?} in this bundle", entry.path())))?;
-        let mut parsed = parse(bytes, &bundle.limits())?;
+        let bytes = bundle.bytes(entry).ok_or_else(|| {
+            Error::NotFound(format!("entry {} in this bundle", quoted(entry.path())))
+        })?;
+        // One limit on objects for the whole bundle: what the files opened from it before this
+        // one left, checked before this one's table is built and counted after.
+        let limits = bundle.limits();
+        let shared = bundle.shared();
+        let left = limits.max_objects.saturating_sub(shared.objects());
+        let mut parsed = parse(bytes, &limits.with_max_objects(left))?;
+        shared.count_objects(parsed.objects.len() as u64, limits.max_objects)?;
         if Version::parse(&parsed.unity_version).stripped() {
             parsed.unity_version = bundle.unity_revision().to_string();
         }
-        let limits = bundle.limits();
         let range = Bundle::range_of(entry);
         Ok(Self::build(parsed, Bytes::InBundle(bundle, range), limits))
     }
@@ -324,6 +329,12 @@ struct Header {
 /// Read the header of a file of `len` bytes: a known format version, and a stated size that
 /// is the file's.
 fn header(r: &mut Reader<'_>, len: u64) -> Result<Header> {
+    if r.remaining() < 20 {
+        return Err(Error::NotUnity(format!(
+            "{} bytes, too short for a serialized-file header",
+            r.remaining()
+        )));
+    }
     let _metadata_size = r.u32()?;
     let mut file_size = u64::from(r.u32()?);
     let version = r.u32()?;

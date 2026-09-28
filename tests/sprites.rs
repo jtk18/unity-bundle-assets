@@ -435,8 +435,8 @@ fn a_bad_atlas_spoils_only_its_own_sprites() {
     assert!(a.decode_texture(TEX).is_ok());
     assert!(export_one(&mut a, "own").is_ok());
     match export_one(&mut a, "in") {
-        Err(Error::AtlasUnreadable { atlas, error, .. }) => {
-            assert_eq!(atlas, ATLAS);
+        Err(Error::AtlasUnreadable { path_id, error, .. }) => {
+            assert_eq!(path_id, ATLAS);
             assert!(matches!(*error, Error::Invalid(_)), "{error}");
         }
         other => panic!("{other:?}"),
