@@ -1,4 +1,4 @@
-unity-sprites is MIT licensed (see LICENSE). It contains work derived from the project below.
+unity-bundle-assets is MIT licensed (see LICENSE). It contains work derived from the project below.
 
 UnityPy (https://github.com/K0lb3/UnityPy)
   src/bundle.rs follows UnityPy's BundleFile reader: the UnityFS header, the flag sets and the

@@ -1,11 +1,11 @@
-# unity-sprites
+# unity-bundle-assets
 
 Read Unity serialized asset files (`*.assets`, `level*`) and asset bundles, and export their
 sprites and textures as RGBA images, in pure Rust. No .NET, no native libraries, no external
 tools.
 
 ```rust
-let mut assets = unity_sprites::Assets::open("Game_Data/sharedassets0.assets".as_ref())?;
+let mut assets = unity_bundle_assets::Assets::open("Game_Data/sharedassets0.assets".as_ref())?;
 for sprite in assets.sprites(|name| name.starts_with("Icon_"))? {
     let image = assets.export(&sprite)?; // RGBA8, top row first
     // hand image.rgba to the `image` crate, a GPU upload, ...
@@ -22,9 +22,9 @@ and `cut` for each sprite. Both take `&self`.
 Textures are listed and decoded directly:
 
 ```rust
-let assets = unity_sprites::Assets::open("assetbundles/characters".as_ref())?;
-for (path_id, name) in assets.textures(|_| true) {
-    let image = assets.decode_texture(path_id)?; // RGBA8, bottom row first, as Unity stores it
+let assets = unity_bundle_assets::Assets::open("assetbundles/characters".as_ref())?;
+for texture in assets.textures(|_| true) {
+    let image = assets.decode_texture(texture.path_id)?; // RGBA8, bottom row first, as stored
 }
 ```
 
@@ -68,6 +68,10 @@ sample of 171 bundles, 3,042 of 3,057 textures (DXT1, DXT5, RGBA32, RGB24, Alpha
 pixel-identical to UnityPy's output; the other 14 are the Alpha8 colour convention above, with
 identical alpha. Four of those bundles repacked as LZMA export byte-identical PNGs.
 
+`tests/synthetic.rs` builds serialized files and bundles byte by byte, in the `Texture2D`
+layouts of eight engine releases from 5.6 to 2022.3, and reads them back end to end; game
+files cannot ship with the crate.
+
 The examples (`list`, `dump`, `survey`, `export`, `textures`) are the tools used to work out and
 check the layouts:
 
@@ -78,6 +82,10 @@ cargo run --example survey -- <file>                     # sprites by texture fo
 cargo run --release --example export -- <file> <out-dir> [name-prefix...]
 cargo run --release --example textures -- <file-or-bundle> <out-dir> [name-prefix...]
 ```
+
+## Minimum Rust version
+
+1.82.
 
 ## License
 

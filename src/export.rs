@@ -13,12 +13,27 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-/// An RGBA8 image, top row first.
+/// An RGBA8 image. Row order depends on where it came from: [`Assets::export`] and
+/// [`Assets::cut`] give top row first, [`Assets::decode_texture`] bottom row first.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Image {
+    /// Width in pixels.
     pub width: u32,
+    /// Height in pixels.
     pub height: u32,
+    /// Four bytes per pixel, row after row.
     pub rgba: Vec<u8>,
+}
+
+/// A texture listed by [`Assets::textures`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct TextureInfo {
+    /// Its path ID, for [`Assets::decode_texture`] and [`Assets::texture`].
+    pub path_id: i64,
+    /// `m_Name`.
+    pub name: String,
 }
 
 /// One serialized file opened for sprite and texture export: a plain file (`*.assets`,
@@ -28,6 +43,7 @@ pub struct Image {
 /// group sprites by [`Assets::texture_id`], then per group [`Assets::decode_texture`] once and
 /// [`Assets::cut`] each sprite; both take `&self`.
 pub struct Assets {
+    /// The serialized file, for reading objects directly.
     pub file: SerializedFile,
     streams: Streams,
     atlases: HashMap<i64, SpriteAtlas>,
@@ -113,16 +129,30 @@ impl Assets {
         Ok(out)
     }
 
-    /// Every texture whose name passes `keep`, as (path ID, name), for
-    /// [`Assets::decode_texture`].
-    pub fn textures(&self, keep: impl Fn(&str) -> bool) -> Vec<(i64, String)> {
+    /// Every texture whose name passes `keep`, in file order.
+    pub fn textures(&self, keep: impl Fn(&str) -> bool) -> Vec<TextureInfo> {
         self.file
             .objects
             .iter()
             .filter(|o| o.class_id == class::TEXTURE_2D)
-            .filter_map(|o| Some((o.path_id, self.file.name(o)?)))
-            .filter(|(_, name)| keep(name))
+            .filter_map(|o| {
+                Some(TextureInfo {
+                    path_id: o.path_id,
+                    name: self.file.name(o)?,
+                })
+            })
+            .filter(|t| keep(&t.name))
             .collect()
+    }
+
+    /// A texture's metadata (size, format, where its pixels live) without decoding it.
+    pub fn texture(&self, path_id: i64) -> Result<Texture2D> {
+        let object = self
+            .file
+            .object(path_id)
+            .filter(|o| o.class_id == class::TEXTURE_2D)
+            .ok_or_else(|| Error::Invalid(format!("no texture object {path_id}")))?;
+        Texture2D::read(&self.file, object)
     }
 
     /// Where the sprite's pixels are: its atlas entry when it has one, its own render
@@ -139,16 +169,7 @@ impl Assets {
     /// `&self`, so textures can be decoded on several threads at once; pair it with
     /// [`Assets::cut`].
     pub fn decode_texture(&self, path_id: i64) -> Result<Image> {
-        let object = self
-            .file
-            .object(path_id)
-            .ok_or_else(|| Error::Invalid(format!("no texture object {path_id}")))?;
-        if object.class_id != class::TEXTURE_2D {
-            return Err(Error::Invalid(format!(
-                "object {path_id} is not a Texture2D"
-            )));
-        }
-        let texture = Texture2D::read(&self.file, object)?;
+        let texture = self.texture(path_id)?;
         let data = match &self.streams {
             Streams::Dir(dir) => texture.data(dir)?,
             Streams::Bundle(bundle) => texture.data_in(bundle)?,

@@ -6,7 +6,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let path = args.next().ok_or("usage: list <file> [class-id]")?;
     let filter: Option<i32> = args.next().map(|s| s.parse()).transpose()?;
-    let assets = unity_sprites::Assets::open(path.as_ref())?;
+    let assets = unity_bundle_assets::Assets::open(path.as_ref())?;
     let file = &assets.file;
     println!(
         "format {} unity {} platform {} type trees {} externals {:?}",

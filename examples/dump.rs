@@ -7,7 +7,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok_or("usage: dump <file> <path-id> [max-bytes]")?;
     let id: i64 = args.next().ok_or("path id")?.parse()?;
     let max: usize = args.next().map(|s| s.parse()).transpose()?.unwrap_or(512);
-    let file = unity_sprites::SerializedFile::open(path.as_ref())?;
+    let file = unity_bundle_assets::SerializedFile::open(path.as_ref())?;
     let object = file.object(id).ok_or("no such object")?;
     println!("class {} size {}", object.class_id, object.size);
     for (i, chunk) in file.bytes(object)[..object.size.min(max)]

@@ -2,7 +2,7 @@
 //! `cargo run --example survey -- <file>`.
 
 use std::collections::BTreeMap;
-use unity_sprites::{class, SerializedFile, Sprite, SpriteAtlas, Texture2D};
+use unity_bundle_assets::{class, SerializedFile, Sprite, SpriteAtlas, Texture2D};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let path = std::env::args().nth(1).ok_or("usage: survey <file>")?;
@@ -12,7 +12,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .iter()
         .filter(|o| o.class_id == class::SPRITE_ATLAS)
         .map(|o| Ok((o.path_id, SpriteAtlas::read(&file, o)?)))
-        .collect::<Result<_, unity_sprites::Error>>()?;
+        .collect::<Result<_, unity_bundle_assets::Error>>()?;
     let mut textures = BTreeMap::new();
     let (mut ok, mut failed) = (0, 0);
     let mut by = BTreeMap::new();

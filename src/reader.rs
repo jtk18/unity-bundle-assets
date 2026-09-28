@@ -33,14 +33,6 @@ impl<'a> Reader<'a> {
         }
     }
 
-    pub fn pos(&self) -> usize {
-        self.pos
-    }
-
-    pub fn seek(&mut self, pos: usize) {
-        self.pos = pos;
-    }
-
     pub fn set_big_endian(&mut self, big_endian: bool) {
         self.big_endian = big_endian;
     }

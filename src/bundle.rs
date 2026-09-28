@@ -26,25 +26,33 @@ mod flags {
 
 /// One file inside a bundle.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Entry {
+    /// The file's name in the bundle's directory, e.g. `CAB-<hash>` or `CAB-<hash>.resS`.
     pub path: String,
+    /// Directory flags; bit 2 marks a serialized file.
     pub flags: u32,
     offset: usize,
     size: usize,
 }
 
 impl Entry {
+    /// Whether this entry is a serialized file rather than a stream file.
     pub fn is_serialized(&self) -> bool {
         self.flags & flags::NODE_SERIALIZED != 0
     }
 }
 
 /// A parsed bundle. Holds the whole decompressed block stream.
+#[non_exhaustive]
 pub struct Bundle {
     /// Container format version (6 for Unity 5.x-2019.3, 7 from 2019.4, 8 from 2022).
     pub format: u32,
+    /// The player version string, e.g. `5.x.x`.
     pub unity_version: String,
+    /// The engine release that built the bundle, e.g. `2018.4.36f1`.
     pub unity_revision: String,
+    /// Every file in the bundle, in directory order.
     pub entries: Vec<Entry>,
     data: Vec<u8>,
 }
@@ -55,10 +63,12 @@ pub fn is_bundle(data: &[u8]) -> bool {
 }
 
 impl Bundle {
+    /// Read and parse the bundle at `path`.
     pub fn open(path: &std::path::Path) -> Result<Bundle> {
         Bundle::parse(&std::fs::read(path)?)
     }
 
+    /// Parse a bundle from its bytes, decompressing every block.
     pub fn parse(file: &[u8]) -> Result<Bundle> {
         let mut r = Reader::new(file, true);
         let signature = r.cstr()?;
@@ -166,6 +176,7 @@ impl Bundle {
         })
     }
 
+    /// One entry's bytes.
     pub fn bytes(&self, entry: &Entry) -> &[u8] {
         &self.data[entry.offset..entry.offset + entry.size]
     }
@@ -180,6 +191,7 @@ impl Bundle {
             .or_else(|| self.entries.iter().find(|e| e.path == name))
     }
 
+    /// The entries holding serialized files.
     pub fn serialized_files(&self) -> impl Iterator<Item = &Entry> {
         self.entries.iter().filter(|e| e.is_serialized())
     }

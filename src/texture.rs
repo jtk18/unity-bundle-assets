@@ -8,27 +8,42 @@ use crate::{Error, Result};
 
 use std::path::Path;
 
+/// Where a texture's pixels live when they are not stored in the object.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct StreamingInfo {
+    /// Byte offset in the stream file.
     pub offset: u64,
+    /// Byte count.
     pub size: u32,
+    /// The stream file: a `.resS` beside the serialized file, or an `archive:/` path into
+    /// the bundle holding it.
     pub path: String,
 }
 
+/// A `Texture2D` object: dimensions, pixel format, and where the pixels are.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Texture2D {
+    /// `m_Name`.
     pub name: String,
+    /// Width in pixels.
     pub width: u32,
+    /// Height in pixels.
     pub height: u32,
-    /// Unity's `TextureFormat` value; see [`crate::decode::Format`].
+    /// Unity's `TextureFormat` value; see [`crate::decode::format`].
     pub format: i32,
+    /// Number of mip levels stored.
     pub mip_count: i32,
     /// Pixels stored inside the object, when not streamed.
     pub image_data: Vec<u8>,
+    /// Where the pixels are, when streamed.
     pub stream: Option<StreamingInfo>,
 }
 
 impl Texture2D {
+    /// Read a `Texture2D` object. Unity 5.5 and later.
+    ///
     /// Field gates are by exact engine version, down to the patch where a field appeared;
     /// they were read off the type trees UnityPy ships for each release (see NOTICE).
     pub fn read(file: &SerializedFile, object: &ObjectInfo) -> Result<Texture2D> {

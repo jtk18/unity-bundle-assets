@@ -7,10 +7,12 @@ use crate::reader::Reader;
 use crate::serialized::{ObjectInfo, SerializedFile};
 use crate::{Error, Result};
 
+/// A reference to an object, possibly in another file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PPtr {
     /// 0 for this file, otherwise 1 + an index into [`SerializedFile::externals`].
     pub file_id: i32,
+    /// The object's [`crate::ObjectInfo::path_id`]; 0 means no object.
     pub path_id: i64,
 }
 
@@ -22,16 +24,22 @@ impl PPtr {
         })
     }
 
+    /// Whether this refers to no object.
     pub fn is_null(&self) -> bool {
         self.path_id == 0
     }
 }
 
+/// A rectangle in pixels, origin at the bottom left as Unity stores it.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Rect {
+    /// Left edge.
     pub x: f32,
+    /// Bottom edge.
     pub y: f32,
+    /// Width.
     pub width: f32,
+    /// Height.
     pub height: f32,
 }
 
@@ -50,16 +58,23 @@ impl Rect {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Settings(pub u32);
 
+/// How a packed sprite was turned to fit its texture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Rotation {
+    /// Stored as drawn.
     None,
+    /// Mirrored left to right.
     FlipHorizontal,
+    /// Mirrored top to bottom.
     FlipVertical,
+    /// Turned half a turn.
     Rotate180,
+    /// Turned a quarter turn.
     Rotate90,
 }
 
 impl Settings {
+    /// Whether the sprite was packed, so rotation applies.
     pub fn packed(self) -> bool {
         self.0 & 1 != 0
     }
@@ -70,6 +85,7 @@ impl Settings {
         (self.0 >> 1) & 1 == 0
     }
 
+    /// The packing rotation.
     pub fn rotation(self) -> Rotation {
         match (self.0 >> 2) & 0xf {
             1 => Rotation::FlipHorizontal,
@@ -83,20 +99,33 @@ impl Settings {
 
 /// Where a sprite's pixels are: the texture, the rectangle within it, and how they're packed.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct Placement {
+    /// The texture holding the pixels.
     pub texture: PPtr,
+    /// The sprite's pixels within that texture.
     pub texture_rect: Rect,
+    /// Offset of `texture_rect` within the sprite's full rect.
     pub texture_rect_offset: [f32; 2],
+    /// Packing flags.
     pub settings: Settings,
 }
 
+/// A `Sprite` object.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Sprite {
+    /// `m_Name`.
     pub name: String,
+    /// The sprite's full rectangle, before any transparent border was trimmed.
     pub rect: Rect,
+    /// Pixels per world unit.
     pub pixels_to_units: f32,
+    /// Pivot as a fraction of `rect`.
     pub pivot: [f32; 2],
+    /// The key its atlas files it under.
     pub render_data_key: ([u8; 16], i64),
+    /// The atlas holding it, or null.
     pub atlas: PPtr,
     /// The sprite's own render data. For an atlased sprite, the texture here is null and
     /// the atlas's entry is the one to use.
@@ -111,6 +140,7 @@ fn at_least(file: &SerializedFile, ma: u32, mi: u32) -> bool {
 }
 
 impl Sprite {
+    /// Read a `Sprite` object. Unity 2019.1 and later.
     pub fn read(file: &SerializedFile, object: &ObjectInfo) -> Result<Sprite> {
         if !at_least(file, 2019, 1) {
             return Err(Error::Unsupported(format!(
@@ -240,13 +270,18 @@ fn read_mesh(r: &mut Reader) -> Result<Vec<[[f32; 2]; 3]>> {
     Ok(triangles)
 }
 
+/// A `SpriteAtlas` object: where each of its sprites was packed.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct SpriteAtlas {
+    /// `m_Name`.
     pub name: String,
+    /// Placement by sprite render-data key.
     pub entries: Vec<(([u8; 16], i64), Placement)>,
 }
 
 impl SpriteAtlas {
+    /// Read a `SpriteAtlas` object.
     pub fn read(file: &SerializedFile, object: &ObjectInfo) -> Result<SpriteAtlas> {
         let mut r = file.reader(object);
         let name = r.aligned_string()?;
@@ -287,6 +322,7 @@ impl SpriteAtlas {
         Ok(SpriteAtlas { name, entries })
     }
 
+    /// The placement filed under a sprite's render-data key.
     pub fn placement(&self, key: &([u8; 16], i64)) -> Option<Placement> {
         self.entries.iter().find(|(k, _)| k == key).map(|(_, p)| *p)
     }

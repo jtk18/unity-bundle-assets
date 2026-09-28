@@ -9,48 +9,76 @@ pub const MIN_VERSION: u32 = 17;
 /// Newest format version this crate was written against (Unity 2022.2 and later).
 pub const MAX_VERSION: u32 = 22;
 
-/// Unity class IDs this crate cares about.
+/// Unity class IDs this crate cares about, as found in [`ObjectInfo::class_id`].
 pub mod class {
+    /// `Texture2D`.
     pub const TEXTURE_2D: i32 = 28;
+    /// `MonoBehaviour`: a script's data. Its type entries carry an extra script ID.
     pub const MONO_BEHAVIOUR: i32 = 114;
+    /// `Sprite`.
     pub const SPRITE: i32 = 213;
+    /// `SpriteAtlas`.
     pub const SPRITE_ATLAS: i32 = 687078895;
 }
 
+/// One entry of the file's type table.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct SerializedType {
+    /// The Unity class ID; see [`class`].
     pub class_id: i32,
+    /// For script types, an index into the file's script table; otherwise -1.
     pub script_type_index: i16,
 }
 
+/// Where one object lives in the file, and what class it is.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ObjectInfo {
+    /// The object's ID within this file, used by references ([`crate::PPtr`]).
     pub path_id: i64,
     /// Absolute offset of the object's data in the file.
     pub offset: usize,
+    /// Size of the object's data in bytes.
     pub size: usize,
+    /// The Unity class ID; see [`class`].
     pub class_id: i32,
 }
 
+/// Another file this one references, as listed in its externals table.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct External {
+    /// The file's path as Unity wrote it, e.g. `archive:/CAB-.../CAB-...` or
+    /// `sharedassets1.assets`.
     pub path: String,
 }
 
 /// A parsed serialized file. Holds the whole file's bytes; objects are decoded on demand.
+#[non_exhaustive]
 pub struct SerializedFile {
+    /// Format version, 17 to 22.
     pub version: u32,
+    /// The engine release that wrote the file, e.g. `2022.3.62f3`.
     pub unity_version: String,
+    /// Unity's `BuildTarget` value.
     pub target_platform: i32,
+    /// Whether object data is big-endian.
     pub big_endian: bool,
+    /// Whether the file carries type trees. Layouts here are hard-coded either way.
     pub has_type_trees: bool,
+    /// The type table.
     pub types: Vec<SerializedType>,
+    /// Every object in the file, in file order.
     pub objects: Vec<ObjectInfo>,
+    /// Other files this one references.
     pub externals: Vec<External>,
     data: Vec<u8>,
 }
 
 impl SerializedFile {
+    /// Parse a serialized file from its bytes. An asset bundle is refused with a message
+    /// saying so; open those with [`crate::Assets::open`] or [`crate::Bundle::parse`].
     pub fn parse(data: Vec<u8>) -> Result<SerializedFile> {
         if crate::bundle::is_bundle(&data) {
             return Err(Error::Unsupported(
@@ -156,6 +184,7 @@ impl SerializedFile {
         })
     }
 
+    /// Read and parse the file at `path`.
     pub fn open(path: &std::path::Path) -> Result<SerializedFile> {
         SerializedFile::parse(std::fs::read(path)?)
     }
@@ -173,18 +202,20 @@ impl SerializedFile {
         out
     }
 
+    /// The object with this path ID.
     pub fn object(&self, path_id: i64) -> Option<&ObjectInfo> {
         self.objects.iter().find(|o| o.path_id == path_id)
     }
 
     /// A reader over one object's bytes.
-    pub fn reader(&self, object: &ObjectInfo) -> Reader<'_> {
+    pub(crate) fn reader(&self, object: &ObjectInfo) -> Reader<'_> {
         Reader::new(
             &self.data[object.offset..object.offset + object.size],
             self.big_endian,
         )
     }
 
+    /// One object's raw bytes.
     pub fn bytes(&self, object: &ObjectInfo) -> &[u8] {
         &self.data[object.offset..object.offset + object.size]
     }

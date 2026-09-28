@@ -9,11 +9,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let out = std::path::PathBuf::from(args.next().ok_or("out dir")?);
     let prefixes: Vec<String> = args.collect();
     std::fs::create_dir_all(&out)?;
-    let assets = unity_sprites::Assets::open(path.as_ref())?;
+    let assets = unity_bundle_assets::Assets::open(path.as_ref())?;
     let (mut ok, mut failed) = (0, 0);
-    for (path_id, name) in
+    for texture in
         assets.textures(|n| prefixes.is_empty() || prefixes.iter().any(|p| n.starts_with(p)))
     {
+        let (path_id, name) = (texture.path_id, texture.name);
         match assets.decode_texture(path_id) {
             Ok(img) => {
                 // Names come from the file: keep them to one safe path component.

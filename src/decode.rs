@@ -4,16 +4,23 @@ use crate::{Error, Result};
 
 /// The `TextureFormat` values this crate decodes.
 pub mod format {
+    /// Alpha only, one byte. Decodes to white with that alpha.
     pub const ALPHA8: i32 = 1;
+    /// Red, green, blue, one byte each.
     pub const RGB24: i32 = 3;
+    /// Red, green, blue, alpha, one byte each.
     pub const RGBA32: i32 = 4;
+    /// Alpha, red, green, blue, one byte each.
     pub const ARGB32: i32 = 5;
+    /// Blue, green, red, alpha, one byte each.
     pub const BGRA32: i32 = 14;
+    /// BC1: 4x4 blocks of 8 bytes, one bit of alpha.
     pub const DXT1: i32 = 10;
+    /// BC3: 4x4 blocks of 16 bytes, interpolated alpha.
     pub const DXT5: i32 = 12;
 }
 
-/// Bytes in the first mip level.
+/// Bytes in the first mip level, or `None` for a format this crate does not decode.
 pub fn mip0_size(format: i32, width: u32, height: u32) -> Option<usize> {
     let (w, h) = (width as usize, height as usize);
     let blocks = w.div_ceil(4) * h.div_ceil(4);
@@ -27,7 +34,8 @@ pub fn mip0_size(format: i32, width: u32, height: u32) -> Option<usize> {
     })
 }
 
-/// Decode the first mip level to RGBA8, bottom row first.
+/// Decode the first mip level to RGBA8, rows in the order stored (bottom first, for Unity).
+/// Extra bytes (further mip levels) are ignored.
 pub fn decode(format: i32, width: u32, height: u32, data: &[u8]) -> Result<Vec<u8>> {
     let size = mip0_size(format, width, height)
         .ok_or_else(|| Error::Unsupported(format!("texture format {format}")))?;
