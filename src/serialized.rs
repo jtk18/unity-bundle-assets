@@ -182,9 +182,25 @@ impl SerializedFile {
         // one left, checked before this one's table is built and counted after.
         let limits = bundle.limits();
         let shared = bundle.shared();
-        let left = limits.max_objects.saturating_sub(shared.objects());
-        let mut parsed = parse(bytes, &limits.with_max_objects(left))?;
-        shared.count_objects(parsed.objects.len() as u64, limits.max_objects)?;
+        let left = shared.objects_left(entry.offset, limits.max_objects);
+        let mut parsed = parse(bytes, &limits.with_max_objects(left)).map_err(|e| match e {
+            // Say what the bundle would hold, against the limit set, not what was left.
+            Error::LimitExceeded {
+                kind: LimitKind::Objects,
+                value,
+                ..
+            } => Error::LimitExceeded {
+                kind: LimitKind::Objects,
+                value: value + (limits.max_objects - left),
+                limit: limits.max_objects,
+            },
+            e => e,
+        })?;
+        shared.count_objects(
+            entry.offset,
+            parsed.objects.len() as u64,
+            limits.max_objects,
+        )?;
         if Version::parse(&parsed.unity_version).stripped() {
             parsed.unity_version = bundle.unity_revision().to_string();
         }

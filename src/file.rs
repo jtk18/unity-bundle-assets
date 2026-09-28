@@ -295,6 +295,30 @@ mod tests {
     }
 
     #[test]
+    fn test_a_fifo_is_neither_waited_on_nor_read() {
+        let d = dir("fifo");
+        let p = d.join("x.resS");
+        let made = std::process::Command::new("mkfifo").arg(&p).status();
+        if !made.is_ok_and(|s| s.success()) {
+            return; // no mkfifo here
+        }
+        // Opened without blocking (a blocking open would wait for a writer forever), then
+        // refused as not a regular file. In a thread with a timeout, so a regression fails
+        // the test instead of hanging it.
+        for chosen in [Chosen::ByData, Chosen::ByCaller] {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let path = p.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(open_flagged(&path, chosen).is_ok());
+            });
+            let opened = rx.recv_timeout(std::time::Duration::from_secs(3));
+            assert!(opened.is_ok(), "opening a FIFO blocked");
+            assert!(open_regular(&p, chosen).is_err());
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
     fn test_a_read_only_file_opens() {
         use std::os::unix::fs::PermissionsExt;
         let d = dir("readonly");

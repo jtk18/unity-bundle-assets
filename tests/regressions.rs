@@ -213,7 +213,7 @@ fn object_count_is_limited() {
 }
 
 #[test]
-fn refused_and_failed_work_is_not_charged() {
+fn work_refused_or_failing_before_reading_is_not_charged() {
     let dir = TempDir::new("charge");
     let file = file_2018(&[
         (
@@ -314,11 +314,17 @@ fn mask_and_copy_work_are_charged() {
     // Decoding 16 pixels, masking, copying 16. The triangle (0,0) (4,0) (0,4) crosses rows
     // 0 to 3; each row's span, from where its sample lines (y + 0.25, y + 0.75) meet the
     // triangle widened a column each side and cut to the 4 columns, holds 4, 4, 3 and 2
-    // columns. A step for each row and a test for each column: 17. In all, 49.
-    let (_d, mut a, s) = one_sprite(tight(&TRIANGLE, 0), Limits::DEFAULT.with_max_total_work(49));
+    // columns. Sixteen for each row's step and one for each column: 77. In all, 109.
+    let (_d, mut a, s) = one_sprite(
+        tight(&TRIANGLE, 0),
+        Limits::DEFAULT.with_max_total_work(109),
+    );
     assert!(a.export(&s).is_ok());
-    assert_eq!(a.work_done(), 49);
-    let (_d, mut a, s) = one_sprite(tight(&TRIANGLE, 0), Limits::DEFAULT.with_max_total_work(48));
+    assert_eq!(a.work_done(), 109);
+    let (_d, mut a, s) = one_sprite(
+        tight(&TRIANGLE, 0),
+        Limits::DEFAULT.with_max_total_work(108),
+    );
     assert!(matches!(
         a.export(&s),
         Err(Error::LimitExceeded {
@@ -1071,9 +1077,12 @@ fn export_tries_a_failing_texture_once() {
 
 #[test]
 fn a_mask_refused_for_the_total_is_never_built() {
-    // A tight 4x4 sprite: decode 16, mask 17, copy 16. At a total of 48 the mask and copy
+    // A tight 4x4 sprite: decode 16, mask 77, copy 16. At a total of 108 the mask and copy
     // are refused together, before either starts, and nothing is charged for them.
-    let (_d, mut a, s) = one_sprite(tight(&TRIANGLE, 0), Limits::DEFAULT.with_max_total_work(48));
+    let (_d, mut a, s) = one_sprite(
+        tight(&TRIANGLE, 0),
+        Limits::DEFAULT.with_max_total_work(108),
+    );
     for _ in 0..3 {
         assert!(matches!(
             a.export(&s),
@@ -1879,8 +1888,8 @@ fn mask_work_is_each_rows_span_and_nothing_for_a_flat_triangle() {
     // A triangle (1,2) (5,2) (1,7), and a flat one along a diagonal, which has no area and
     // costs nothing. The triangle crosses rows 2 to 6; its long edge is x = 5 - 0.8 (y - 2),
     // so each row's span (its sample lines' crossings, a column wider each side, cut to the
-    // box's columns 1 to 4) holds 4, 4, 3, 3 and 2 columns: with a step a row, 21. Decode 64,
-    // mask 21, copy 64.
+    // box's columns 1 to 4) holds 4, 4, 3, 3 and 2 columns: 16 with sixteen for each row's
+    // step, 96. Decode 64, mask 96, copy 64.
     let triangle = Mesh {
         vertices: &[
             [1.0, 2.0],
@@ -1900,10 +1909,10 @@ fn mask_work_is_each_rows_span_and_nothing_for_a_flat_triangle() {
     for mesh in [&triangle, &with_flat] {
         let (_d, mut a, s) = tight_8x8(mesh, Limits::default());
         a.export(&s).unwrap();
-        assert_eq!(a.work_done(), 64 + 21 + 64);
+        assert_eq!(a.work_done(), 64 + 96 + 64);
     }
     // The span is the whole charge: one less and it is refused.
-    let (_d, mut a, s) = tight_8x8(&with_flat, Limits::DEFAULT.with_max_mask_work(20));
+    let (_d, mut a, s) = tight_8x8(&with_flat, Limits::DEFAULT.with_max_mask_work(95));
     assert!(matches!(
         a.export(&s),
         Err(Error::LimitExceeded {
@@ -1959,7 +1968,7 @@ fn a_thin_triangle_costs_its_height_not_its_box() {
     let s = a.sprites(|_| true).sprites.remove(0);
     a.export(&s).unwrap();
     let mask = a.work_done() - 2 * 64 * 64;
-    assert!(mask < 4096 * 33 * 6, "{mask}");
+    assert!(mask < 4096 * 33 * (16 + 6), "{mask}");
 }
 
 #[test]
@@ -2583,6 +2592,9 @@ fn a_bundles_declared_size_rules_open_and_parse_alike() {
         (len, 0, true),
         (len, 100, true), // what follows the declared size is not the bundle's
         (0, 0, false),
+        (1, 0, false), // shorter than the header that states it
+        (7, 0, false),
+        (40, 0, false),
         (-1, 0, false),
         (100, 0, false),
         (len + 1, 0, false),
@@ -3144,4 +3156,522 @@ fn masks_match_a_whole_image_test_of_every_pixel() {
             Err(e) => panic!("round {round}: {e}"),
         }
     }
+}
+
+/// A sprite over a 1 x 16384 texture whose mesh is `copies` triangles the full height.
+fn tall_mask(copies: usize, limits: Limits) -> (TempDir, Assets, Sprite) {
+    tall_mask_of(&[[0.0, 0.0], [1.0, 0.0], [0.0, 16384.0]], copies, limits)
+}
+
+/// A sprite over a 1 x 16384 texture whose mesh is `copies` of the triangle `vertices`.
+fn tall_mask_of(vertices: &[[f32; 2]], copies: usize, limits: Limits) -> (TempDir, Assets, Sprite) {
+    let dir = TempDir::new("tall");
+    let indices: Vec<u16> = std::iter::repeat_n([0u16, 1, 2], copies)
+        .flatten()
+        .collect();
+    let mesh = Mesh {
+        vertices,
+        indices: &indices,
+        ..Mesh::BASE
+    };
+    let tex = texture(
+        Layout::U2022_3,
+        false,
+        "t",
+        1,
+        16384,
+        format::ALPHA8,
+        &Pixels::Inline(&[200; 16384]),
+        &[],
+    );
+    let r = [0.0, 0.0, 1.0, 16384.0];
+    let s = sprite(
+        false,
+        false,
+        "s",
+        r,
+        [0.0, 0.0],
+        1,
+        0,
+        TEX,
+        0,
+        r,
+        0,
+        1.0,
+        &mesh,
+    );
+    let file = serialized(
+        22,
+        "2022.3.62f1",
+        false,
+        19,
+        &[(TEX, TEXTURE_2D, tex), (1, SPRITE, s)],
+    );
+    let a = Assets::open_with(dir.file("t.assets", &file), limits).unwrap();
+    let s = a.sprites(|_| true).sprites.remove(0);
+    (dir, a, s)
+}
+
+#[test]
+fn a_mask_over_its_limit_is_refused_before_its_rows_are_walked() {
+    // 65,536 triangles 16,384 rows tall: 2^30 rows, refused from the row count alone.
+    let (_d, mut a, s) = tall_mask(65_536, Limits::default());
+    let started = std::time::Instant::now();
+    assert!(matches!(
+        a.export(&s),
+        Err(Error::LimitExceeded {
+            kind: LimitKind::MaskWork,
+            ..
+        })
+    ));
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(a.work_done(), 16384, "the decode only: no row was walked");
+}
+
+#[test]
+fn a_mask_refused_partway_is_charged_what_it_cost() {
+    // Rows alone fit a limit set just above them; with the columns they do not. The rows and
+    // columns counted before the refusal are charged, so asking again runs out the total.
+    let rows = 16384 * 16;
+    let limits = Limits::DEFAULT
+        .with_max_mask_work(rows + 10)
+        .with_max_total_work(16384 + 3 * (rows + 11));
+    let (_d, mut a, s) = tall_mask(1, limits);
+    assert!(matches!(
+        a.export(&s),
+        Err(Error::LimitExceeded {
+            kind: LimitKind::MaskWork,
+            ..
+        })
+    ));
+    let charged = a.work_done() - 16384;
+    assert!(charged > rows / 16, "{charged}");
+    let mut refusals = 0;
+    while !matches!(
+        a.export(&s),
+        Err(Error::LimitExceeded {
+            kind: LimitKind::TotalWork,
+            ..
+        })
+    ) {
+        refusals += 1;
+        assert!(refusals < 10, "the refusals never used up the total");
+    }
+    assert!(a.work_done() <= 16384 + 3 * (rows + 11));
+}
+
+#[test]
+fn mesh_vertices_far_outside_the_image_are_refused() {
+    for far in [65_537.0f32, -1e6, 1e30] {
+        let mesh = Mesh {
+            vertices: &[[0.0, 0.0], [4.0, 0.0], [far, 4.0]],
+            indices: &[0, 1, 2],
+            ..Mesh::BASE
+        };
+        let (_d, mut a, s) = one_sprite(tight(&mesh, 0), Limits::default());
+        match a.export(&s) {
+            Err(Error::Invalid(msg)) => assert!(msg.contains("within 65536"), "{far}: {msg}"),
+            other => panic!("{far}: {other:?}"),
+        }
+    }
+    let near = Mesh {
+        vertices: &[[0.0, 0.0], [4.0, 0.0], [65_536.0, 4.0]],
+        indices: &[0, 1, 2],
+        ..Mesh::BASE
+    };
+    let (_d, mut a, s) = one_sprite(tight(&near, 0), Limits::default());
+    assert!(a.export(&s).is_ok());
+}
+
+#[test]
+fn reopening_a_file_in_a_bundle_counts_its_objects_once() {
+    let tex = || rgba_texture(Layout::U2018_4, "t", 4, 4, &Pixels::Inline(&rgba_4x4()));
+    let a = file_2018(&[(1, TEXTURE_2D, tex()), (2, TEXTURE_2D, tex())]);
+    let b = file_2018(&[
+        (1, TEXTURE_2D, tex()),
+        (2, TEXTURE_2D, tex()),
+        (3, TEXTURE_2D, tex()),
+    ]);
+    let bytes = bundle(
+        &BundleOpts::new(6, "2018.4.36f1"),
+        &[("CAB-a", &a, 4), ("CAB-b", &b, 4)],
+    );
+    let bundle = Arc::new(Bundle::parse_with(&bytes, Limits::DEFAULT.with_max_objects(4)).unwrap());
+    for _ in 0..10 {
+        assert!(Assets::from_bundle(bundle.clone(), "CAB-a").is_ok());
+    }
+    // Two and three are five: over four, said as the bundle's count against the limit set.
+    match Assets::from_bundle(bundle, "CAB-b") {
+        Err(Error::LimitExceeded {
+            kind: LimitKind::Objects,
+            value,
+            limit,
+            ..
+        }) => {
+            assert_eq!((value, limit), (5, 4));
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+// Round 7.
+
+/// A tight sprite of `w` x `h` (its texture the same size, pixel i's red being i * 4 mod 256)
+/// with the mesh in sprite units, mapped by `ppu`, `pivot` and `offset` as Unity does.
+fn tight_sprite(
+    w: i32,
+    h: i32,
+    mesh: &Mesh,
+    ppu: f32,
+    pivot: [f32; 2],
+    offset: [f32; 2],
+) -> (TempDir, Assets, Sprite) {
+    let dir = TempDir::new("tightw");
+    let px: Vec<u8> = (0..w * h)
+        .flat_map(|i| [(i * 4) as u8, 0, 0, 255])
+        .collect();
+    let tex = rgba_texture(Layout::U2022_3, "t", w, h, &Pixels::Inline(&px));
+    let rect = [0.0, 0.0, w as f32, h as f32];
+    let s = sprite_full(
+        false, false, "s", rect, pivot, 1, 0, TEX, 0, rect, 0, 1.0, mesh, ppu, offset,
+    );
+    let file = serialized(
+        22,
+        "2022.3.62f1",
+        false,
+        19,
+        &[(TEX, TEXTURE_2D, tex), (1, SPRITE, s)],
+    );
+    let a = Assets::open(dir.file("t.assets", &file)).unwrap();
+    let s = a.sprites(|_| true).sprites.remove(0);
+    (dir, a, s)
+}
+
+/// The documented rule, pixel by pixel over the whole image, from vertices in pixels: kept
+/// when any quarter point lies on or inside a triangle with area. Exact enough in f64 for
+/// f32 vertices, which is what the mesh holds.
+fn reference_mask_f64(triangles: &[[[f64; 2]; 3]], w: u32, h: u32) -> Vec<bool> {
+    let mut out = Vec::new();
+    for y in (0..h).rev() {
+        for x in 0..w {
+            let hit = triangles.iter().any(|t| {
+                let area = (t[1][0] - t[0][0]) * (t[2][1] - t[0][1])
+                    - (t[1][1] - t[0][1]) * (t[2][0] - t[0][0]);
+                area.abs() >= 1e-9
+                    && [0.25, 0.75].iter().any(|&u| {
+                        [0.25, 0.75].iter().any(|&v| {
+                            let (px, py) = (f64::from(x) + u, f64::from(y) + v);
+                            let side = |p: [f64; 2], q: [f64; 2]| {
+                                (q[0] - p[0]) * (py - p[1]) - (q[1] - p[1]) * (px - p[0])
+                            };
+                            let d = [side(t[0], t[1]), side(t[1], t[2]), side(t[2], t[0])];
+                            !(d.iter().any(|&v| v < 0.0) && d.iter().any(|&v| v > 0.0))
+                        })
+                    })
+            });
+            out.push(hit);
+        }
+    }
+    out
+}
+
+#[test]
+fn masks_match_the_rule_through_the_mapping_and_at_the_far_limit() {
+    let mut seed = 0x0bad_c0de_1234_5678u64;
+    let mut rnd = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    for round in 0..300 {
+        // Sizes from a pixel square to a tall strip; mappings from Unity's usual 100 pixels
+        // a unit with a centred pivot to odd ones; some vertices far out (within the 65,536
+        // allowed).
+        let (width, height) = [(8, 8), (5, 7), (3, 64), (16, 2)][(rnd() % 4) as usize];
+        let ppu = [1.0f32, 100.0, 0.5, 3.0][(rnd() % 4) as usize];
+        let pivot = [[0.0f32, 0.0], [0.5, 0.5], [0.25, 1.0]][(rnd() % 3) as usize];
+        let offset = [[0.0f32, 0.0], [1.0, 0.5]][(rnd() % 2) as usize];
+        let (dx, dy) = (
+            width as f32 * pivot[0] - offset[0],
+            height as f32 * pivot[1] - offset[1],
+        );
+        let pixel = |rnd: &mut dyn FnMut() -> u64| -> [f32; 2] {
+            match rnd() % 5 {
+                0 => [
+                    (rnd() % 60_000) as f32 - 30_000.0,
+                    (rnd() % 60_000) as f32 - 30_000.0,
+                ],
+                _ => [
+                    (rnd() % (4 * width as u64 + 9)) as f32 * 0.25 - 1.0,
+                    (rnd() % (4 * height as u64 + 9)) as f32 * 0.25 - 1.0,
+                ],
+            }
+        };
+        let mut verts = Vec::new();
+        let mut in_pixels = Vec::new();
+        for _ in 0..=(rnd() % 2) {
+            let t = [pixel(&mut rnd), pixel(&mut rnd), pixel(&mut rnd)];
+            // To sprite units, then back as the crate maps them (in f32, as it does).
+            let units = t.map(|[x, y]| [(x - dx) / ppu, (y - dy) / ppu]);
+            verts.extend(units);
+            in_pixels.push(units.map(|[x, y]| [f64::from(x * ppu + dx), f64::from(y * ppu + dy)]));
+        }
+        let indices: Vec<u16> = (0..verts.len() as u16).collect();
+        let mesh = Mesh {
+            vertices: &verts,
+            indices: &indices,
+            ..Mesh::BASE
+        };
+        let (_d, mut a, s) = tight_sprite(width, height, &mesh, ppu, pivot, offset);
+        let want = reference_mask_f64(&in_pixels, width as u32, height as u32);
+        match a.export(&s) {
+            Ok(img) => {
+                let got: Vec<bool> = img.rgba.chunks(4).map(|p| p[3] != 0).collect();
+                assert_eq!(got, want, "round {round}: {in_pixels:?}");
+            }
+            Err(Error::Invalid(_)) => assert!(want.iter().all(|&k| !k), "round {round}"),
+            Err(e) => panic!("round {round}: {e}"),
+        }
+    }
+}
+
+#[test]
+fn triangles_outside_the_image_cost_nothing() {
+    let full: [[f32; 2]; 3] = [[0.0, 0.0], [8.0, 0.0], [0.0, 8.0]];
+    let work = |extra: Option<[[f32; 2]; 3]>| {
+        let mut verts = full.to_vec();
+        verts.extend(extra.iter().flatten());
+        let indices: Vec<u16> = (0..verts.len() as u16).collect();
+        let mesh = Mesh {
+            vertices: &verts,
+            indices: &indices,
+            ..Mesh::BASE
+        };
+        let (_d, mut a, s) = tight_8x8(&mesh, Limits::default());
+        a.export(&s).unwrap();
+        a.work_done()
+    };
+    let alone = work(None);
+    for outside in [
+        [[-9.0, 1.0], [-2.0, 1.0], [-5.0, 6.0]], // left
+        [[10.0, 1.0], [17.0, 1.0], [13.0, 6.0]], // right
+        [[1.0, -9.0], [6.0, -9.0], [3.0, -2.0]], // below
+        [[1.0, 10.0], [6.0, 10.0], [3.0, 17.0]], // above
+    ] {
+        assert_eq!(work(Some(outside)), alone, "{outside:?}");
+    }
+}
+
+#[test]
+fn snapping_allows_a_thousandth_of_a_pixel_and_no_more_at_1500() {
+    // At 1500 the relative tolerance (4 units in the last place) is under a thousandth, so
+    // a thousandth rules: 1500.0012 is not 1500.
+    for (right, ok) in [(1_500.000_5_f32, true), (1_500.001_2, false)] {
+        let tex = rgba_texture(
+            Layout::U2022_3,
+            "t",
+            1500,
+            1,
+            &Pixels::Inline(&vec![7; 6000]),
+        );
+        let r = [0.0, 0.0, right, 1.0];
+        let s = sprite(
+            false,
+            false,
+            "s",
+            r,
+            [0.0, 0.0],
+            1,
+            0,
+            TEX,
+            0,
+            r,
+            RECT,
+            1.0,
+            &Mesh::BASE,
+        );
+        let file = serialized(
+            22,
+            "2022.3.62f1",
+            false,
+            19,
+            &[(TEX, TEXTURE_2D, tex), (1, SPRITE, s)],
+        );
+        let mut a = Assets::from_serialized(SerializedFile::parse(file).unwrap(), "").unwrap();
+        let list = a.sprites(|_| true);
+        assert_eq!(a.export(&list.sprites[0]).is_ok(), ok, "{right}");
+    }
+}
+
+#[test]
+fn an_unused_channel_of_any_format_takes_no_bytes() {
+    let base = {
+        let (_d, mut a, s) = one_sprite(tight(&TRIANGLE, 0), Limits::default());
+        kept(&a.export(&s).unwrap())
+    };
+    let mesh = Mesh {
+        extra_channel: Some((12, 0)),
+        ..TRIANGLE
+    };
+    let (_d, mut a, s) = one_sprite(tight(&mesh, 0), Limits::default());
+    assert_eq!(kept(&a.export(&s).unwrap()), base);
+}
+
+#[test]
+fn lzma_blocks_with_other_lc_and_lp_fail_cleanly() {
+    let data: Vec<u8> = (0..3000u32).map(|i| (i % 13) as u8).collect();
+    let mut o = BundleOpts::new(6, "2018.4.36f1");
+    o.blocks = vec![1];
+    let good = bundle(&o, &[("a.resS", &data, 0)]);
+    let at = good
+        .windows(5)
+        .position(|w| w == [0x5d, 0, 0, 0x80, 0])
+        .unwrap();
+    // lc 0 lp 1, lc 4 lp 0, lc 1 lp 3: allowed, so decoded (as garbage) and refused on the
+    // result, never a panic.
+    for props in [9u8, 4, 1 + 3 * 9] {
+        let mut b = good.clone();
+        b[at] = props;
+        let r = std::panic::catch_unwind(|| Bundle::parse(&b).map(|_| ()));
+        assert!(r.is_ok(), "props {props} panicked");
+    }
+}
+
+#[test]
+fn public_accessors_say_what_they_read() {
+    let file = one_texture_file();
+    let mut opts = BundleOpts::new(7, "2019.4.40f1");
+    opts.blocks = vec![0];
+    let parsed = Bundle::parse(&bundle(
+        &opts,
+        &[("CAB-a", &file, 4), ("CAB-a.resS", &[1; 9], 0)],
+    ))
+    .unwrap();
+    assert_eq!(
+        (
+            parsed.format(),
+            parsed.unity_version(),
+            parsed.unity_revision()
+        ),
+        (7, "5.x.x", "2019.4.40f1")
+    );
+    let stream = &parsed.entries()[1];
+    assert_eq!(
+        (
+            stream.path(),
+            stream.flags(),
+            stream.size(),
+            stream.is_serialized()
+        ),
+        ("CAB-a.resS", 0, 9, false)
+    );
+    let serialized_entry = &parsed.entries()[0];
+    assert_eq!(
+        (
+            serialized_entry.flags(),
+            serialized_entry.size(),
+            serialized_entry.is_serialized()
+        ),
+        (4, file.len(), true)
+    );
+    let extras = Extras {
+        type_trees: true,
+        ..Extras::default()
+    };
+    let f = SerializedFile::parse(serialized_with(
+        21,
+        "2020.3.48f1",
+        false,
+        19,
+        &[(7, TEXTURE_2D, vec![1, 2, 3])],
+        &extras,
+    ))
+    .unwrap();
+    assert_eq!(
+        (
+            f.version(),
+            f.has_type_trees(),
+            f.unity_version(),
+            f.target_platform()
+        ),
+        (21, true, "2020.3.48f1", 19)
+    );
+    let object = &f.objects()[0];
+    assert_eq!(
+        (object.path_id(), object.class_id(), object.size()),
+        (7, TEXTURE_2D, 3)
+    );
+}
+
+#[test]
+fn a_masks_row_count_is_its_height_times_the_row_step() {
+    // The top half only: rows 8192 to 16384, refused from the row count with that count.
+    let upper: &[[f32; 2]] = &[[0.0, 8192.0], [1.0, 8192.0], [0.0, 16384.0]];
+    let (_d, mut a, s) = tall_mask_of(upper, 1, Limits::DEFAULT.with_max_mask_work(1));
+    match a.export(&s) {
+        Err(Error::LimitExceeded {
+            kind: LimitKind::MaskWork,
+            value,
+            ..
+        }) => assert_eq!(value, 8192 * 16),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(a.work_done(), 16384, "refused before any row was walked");
+}
+
+#[test]
+fn a_mask_that_costs_exactly_its_limit_is_allowed() {
+    let upper: &[[f32; 2]] = &[[0.0, 8192.0], [1.0, 8192.0], [0.0, 16384.0]];
+    let (_d, mut a, s) = tall_mask_of(upper, 1, Limits::default());
+    a.export(&s).unwrap();
+    // Less the decode and the pixels written: a row step and one column for each row.
+    let cost = a.work_done() - 2 * 16384;
+    assert_eq!(cost, 8192 * (16 + 1));
+    let (_d, mut a, s) = tall_mask_of(upper, 1, Limits::DEFAULT.with_max_mask_work(cost));
+    a.export(&s).unwrap();
+    let (_d, mut a, s) = tall_mask_of(upper, 1, Limits::DEFAULT.with_max_mask_work(cost - 1));
+    match a.export(&s) {
+        Err(Error::LimitExceeded {
+            kind: LimitKind::MaskWork,
+            value,
+            limit,
+            ..
+        }) => assert_eq!((value, limit), (cost, cost - 1)),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn a_sub_mesh_counts_two_bytes_an_index() {
+    // Nine indices need 18 bytes; the buffer holds six indices, 12 bytes.
+    let mesh = Mesh {
+        vertices: &[[0.0, 0.0], [4.0, 0.0], [0.0, 4.0], [4.0, 4.0]],
+        indices: &[0, 1, 2, 1, 3, 2],
+        index_count: Some(9),
+        ..Mesh::BASE
+    };
+    let tex = rgba_texture(Layout::U2022_3, "t", 4, 4, &Pixels::Inline(&rgba_4x4()));
+    let file = serialized(
+        22,
+        "2022.3.62f1",
+        false,
+        19,
+        &[(TEX, TEXTURE_2D, tex), (1, SPRITE, tight(&mesh, 0))],
+    );
+    let a = Assets::from_serialized(SerializedFile::parse(file).unwrap(), "").unwrap();
+    let skipped = a.sprites(|_| true).skipped;
+    assert_eq!(skipped.len(), 1);
+    assert!(
+        skipped[0]
+            .error
+            .to_string()
+            .contains("0+9 run past the 12-byte"),
+        "{}",
+        skipped[0].error
+    );
 }

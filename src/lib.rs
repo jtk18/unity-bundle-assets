@@ -37,7 +37,8 @@
 //! Files are treated as hostile:
 //!
 //! - Counts and lengths are checked against the bytes present before they size an
-//!   allocation, and every string read is at most 4 KiB of the file and no longer as text.
+//!   allocation, and every string read is at most 4 KiB of the file (names at most three
+//!   times that as text, invalid UTF-8 shown as U+FFFD; versions and paths must be UTF-8).
 //!   Objects in a file, entries in a bundle, a sprite's sub-meshes, and the stream ranges
 //!   textures read may not overlap, so one blob cannot be decoded many times over; stream
 //!   ranges are compared by the bytes they reach (on Unix; by lower-cased ASCII name
@@ -46,8 +47,9 @@
 //!   size (the parsed directory and LZMA's working memory included), object count, decoded
 //!   pixels, sprite meshes, and the total work spent decoding, cutting and masking, shared by
 //!   everything opened from one file or bundle. Work is reserved before it starts and kept once
-//!   started. The limits bound work, not peak memory: at the default 16384 x 16384, up to
-//!   about 2 GiB to decode one texture of that size, and 3.25 GiB to export a sprite from it.
+//!   started. The limits bound work, not peak memory: at the default 16384 x 16384, beyond
+//!   the open file, about 1 GiB more to decode one texture of that size and 2.25 GiB more to
+//!   export a sprite from it.
 //! - Streamed pixels are read only from the same bundle, or from a `.resS` / `.resource` file
 //!   directly beside the asset file that is a regular file, not a symbolic link, not a Windows
 //!   device name, and (on Unix) has no other hard links.
@@ -80,10 +82,10 @@ pub use serialized::{class, External, ObjectInfo, SerializedFile, SerializedType
 pub use sprite::{PPtr, Placement, Rect, RenderDataKey, Rotation, Settings, Sprite, SpriteAtlas};
 pub use texture::{is_console_platform, StreamingInfo, Texture2D};
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 
 /// The README's examples, compiled as doc tests.
 #[cfg(doctest)]
@@ -102,8 +104,8 @@ pub enum Error {
     /// structure being read (an object, a header, a block table), not the file.
     #[error("unexpected end of data at byte {0}")]
     Truncated(usize),
-    /// A length or count that cannot fit in the bytes that follow it. The offset counts as
-    /// for [`Error::Truncated`].
+    /// A length or count that cannot fit in the bytes that follow it, or a string longer
+    /// than the 4 KiB this crate reads. The offset counts as for [`Error::Truncated`].
     #[error("bad length {len} at byte {at}")]
     #[non_exhaustive]
     BadLength {
@@ -189,7 +191,7 @@ pub enum Error {
         bytes: u64,
     },
     /// Reading a file from disk failed.
-    #[error("{:?}: {error}", path.display().to_string())]
+    #[error("{}: {error}", quoted_path(&path.display().to_string()))]
     #[non_exhaustive]
     Io {
         /// The file.
@@ -304,8 +306,8 @@ pub struct Limits {
     /// Default 4,194,304.
     pub max_objects: u64,
     /// Most pixels in one texture this crate will decode. Default 16384 x 16384, Unity's
-    /// own maximum: up to about 2 GiB to decode one texture that size, and 3.25 GiB to export
-    /// a sprite from it.
+    /// own maximum: beyond the open file, about 1 GiB more to decode one texture of that
+    /// size and 2.25 GiB more to export a sprite from it.
     pub max_texture_pixels: u64,
     /// Most triangles in one sprite's mesh. Default 65,536.
     pub max_sprite_triangles: u64,
@@ -402,8 +404,9 @@ impl Default for Limits {
 pub(crate) struct Shared {
     work: AtomicU64,
     /// Objects in the serialized files opened from a bundle, held to
-    /// [`Limits::max_objects`] across all of them.
-    objects: AtomicU64,
+    /// [`Limits::max_objects`] across all of them, and the entries (by offset) already
+    /// counted: opening one again counts nothing more.
+    objects: Mutex<(u64, HashSet<usize>)>,
     /// Stream ranges already read, by the bytes they name (not by how a texture spelled the
     /// path to them): start -> the claim.
     streams: Mutex<HashMap<StreamKey, BTreeMap<u64, Claim>>>,
@@ -427,32 +430,10 @@ struct Claim {
     texture: i64,
 }
 
-/// Work reserved against [`Limits::max_total_work`], given back when dropped unless kept:
-/// a request refused before its work starts costs nothing. Work that has started is kept.
-#[must_use = "dropping a reservation gives the work back"]
-pub(crate) struct Reservation<'a> {
-    shared: &'a Shared,
-    amount: u64,
-    keep: bool,
-}
-
-impl Reservation<'_> {
-    pub fn keep(mut self) {
-        self.keep = true;
-    }
-}
-
-impl Drop for Reservation<'_> {
-    fn drop(&mut self) {
-        if !self.keep {
-            self.shared.work.fetch_sub(self.amount, Ordering::Relaxed);
-        }
-    }
-}
-
 impl Shared {
-    /// Reserve `amount` of work, or refuse without taking any.
-    pub fn reserve(&self, amount: u64, limit: u64) -> Result<Reservation<'_>> {
+    /// Take `amount` of work from the total before doing it, or refuse without taking any.
+    /// Work taken is never given back: it is taken only when the work is about to start.
+    pub fn reserve(&self, amount: u64, limit: u64) -> Result<()> {
         self.work
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |w| {
                 w.checked_add(amount).filter(|&t| t <= limit)
@@ -462,34 +443,51 @@ impl Shared {
                 value: w.saturating_add(amount),
                 limit,
             })?;
-        Ok(Reservation {
-            shared: self,
-            amount,
-            keep: false,
-        })
+        Ok(())
     }
 
     pub fn work(&self) -> u64 {
         self.work.load(Ordering::Relaxed)
     }
 
-    /// Objects counted so far.
-    pub fn objects(&self) -> u64 {
-        self.objects.load(Ordering::Relaxed)
+    /// Charge `amount` of work that was done although its request was refused, as far as
+    /// `limit` allows: the total never passes the limit, but repeating the refused request
+    /// uses it up.
+    pub fn spend(&self, amount: u64, limit: u64) {
+        let _ = self
+            .work
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |w| {
+                Some(w.saturating_add(amount).min(limit.max(w)))
+            });
     }
 
-    /// Count `n` more objects against `limit`, or refuse without counting them.
-    pub fn count_objects(&self, n: u64, limit: u64) -> Result<()> {
-        self.objects
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
-                c.checked_add(n).filter(|&t| t <= limit)
-            })
-            .map(|_| ())
-            .map_err(|c| Error::LimitExceeded {
-                kind: LimitKind::Objects,
-                value: c.saturating_add(n),
-                limit,
-            })
+    /// How many more objects the entry at `entry` may hold under `limit`: all of it for an
+    /// entry already counted, what the others left otherwise.
+    pub fn objects_left(&self, entry: usize, limit: u64) -> u64 {
+        let counted = self.objects.lock().unwrap_or_else(PoisonError::into_inner);
+        if counted.1.contains(&entry) {
+            limit
+        } else {
+            limit.saturating_sub(counted.0)
+        }
+    }
+
+    /// Count the `n` objects of the entry at `entry` against `limit`, once per entry, or
+    /// refuse without counting them. The error gives the bundle's total and the limit.
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "the check and the count are one step"
+    )]
+    pub fn count_objects(&self, entry: usize, n: u64, limit: u64) -> Result<()> {
+        let mut counted = self.objects.lock().unwrap_or_else(PoisonError::into_inner);
+        if counted.1.contains(&entry) {
+            return Ok(());
+        }
+        let total = counted.0.saturating_add(n);
+        Error::limit(LimitKind::Objects, total, limit)?;
+        counted.0 = total;
+        counted.1.insert(entry);
+        Ok(())
     }
 
     /// Record that texture `texture` of `owner` reads `start..end` of `stream`, and reserve

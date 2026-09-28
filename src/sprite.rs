@@ -112,10 +112,16 @@ impl Settings {
         (self.0 >> 1) & 1 == 0
     }
 
+    /// The packing rotation's four bits as stored.
+    #[must_use]
+    pub const fn rotation_bits(self) -> u32 {
+        (self.0 >> 2) & 0xf
+    }
+
     /// The packing rotation, or `None` for a value Unity does not define.
     #[must_use]
     pub const fn rotation(self) -> Option<Rotation> {
-        Some(match (self.0 >> 2) & 0xf {
+        Some(match self.rotation_bits() {
             0 => Rotation::Unrotated,
             1 => Rotation::FlipHorizontal,
             2 => Rotation::FlipVertical,

@@ -7,7 +7,7 @@ use crate::decode;
 use crate::serialized::{class, SerializedFile};
 use crate::sprite::{Placement, Rotation, Sprite, SpriteAtlas};
 use crate::texture::{is_console_platform, Texture2D};
-use crate::{quoted, Error, LimitKind, Limits, Reservation, Result, Shared, StreamKey};
+use crate::{quoted, Error, LimitKind, Limits, Result, Shared, StreamKey};
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -126,8 +126,12 @@ pub struct SkippedSprite {
 /// group sprites by [`Assets::texture_id`], then per group [`Assets::decode_texture`] once and
 /// [`Assets::cut`] each sprite; both take `&self`, and `Assets` is `Send + Sync`. Each thread
 /// then holds a decoded texture and the sprite cut from it, with its mask: at the default
-/// 16384 x 16384, up to about 2 GiB to decode one texture that size, and 3.25 GiB to export
-/// a sprite from it. Lower [`Limits::max_texture_pixels`] to bound it.
+/// 16384 x 16384, beyond the open file, about 1 GiB more to decode one texture of that size
+/// and 2.25 GiB more to export a sprite from it. Lower [`Limits::max_texture_pixels`] to bound
+/// it.
+///
+/// The work limit is spent and never given back: a long-running program that decodes the
+/// same textures again and again should raise [`Limits::max_total_work`].
 ///
 /// One `Assets` has one [`Limits::max_total_work`], shared with every `Assets` opened from the
 /// same [`Bundle`]. Under that limit, which of several threads is refused depends on timing.
@@ -316,13 +320,13 @@ impl Assets {
         self.shared.work()
     }
 
-    fn reserve(&self, amount: u64) -> Result<Reservation<'_>> {
+    fn reserve(&self, amount: u64) -> Result<()> {
         self.shared
             .reserve(amount, self.file.limits().max_total_work)
     }
 
     /// The atlas with this path ID, read on first use; `None` when this file has no atlas
-    /// object with that ID. Two threads asking at once may both read it; one result is kept.
+    /// object with that ID. Two threads asking at once: one reads it, the other waits.
     fn atlas(&self, id: i64) -> Option<AtlasResult> {
         use std::sync::PoisonError;
         let known = self
@@ -505,15 +509,16 @@ impl Assets {
                 self.file.target_platform()
             )));
         }
-        let pixels = u64::from(texture.width) * u64::from(texture.height);
-        let limit = self.file.limits().max_texture_pixels;
-        Error::limit(LimitKind::TexturePixels, pixels, limit)?;
+        // A format this crate cannot decode is the reason, whatever the size.
         if !decode::is_supported(texture.format) {
             return Err(Error::UnsupportedTextureFormat {
                 name: Some(texture.name),
                 format: texture.format,
             });
         }
+        let pixels = u64::from(texture.width) * u64::from(texture.height);
+        let limit = self.file.limits().max_texture_pixels;
+        Error::limit(LimitKind::TexturePixels, pixels, limit)?;
         // A streamed texture claims its range and reserves its work in one step, before any
         // of it is read: a texture refused its range takes no budget, and a range is claimed
         // only by a texture whose work was reserved. Once reserved, the work is kept: reading
@@ -523,8 +528,7 @@ impl Assets {
             self.shared
                 .claim_stream(stream, start, end, &self.owner, path_id, || {
                     self.reserve(pixels)
-                })?
-                .keep();
+                })?;
             claimed = true;
             Ok(())
         };
@@ -534,7 +538,7 @@ impl Assets {
         };
         // Inline pixels claim nothing; they reserve here, with nothing done yet.
         if !claimed {
-            self.reserve(pixels)?.keep();
+            self.reserve(pixels)?;
         }
         let (format, width, height) = (texture.format, texture.width, texture.height);
         let rgba = match data {
@@ -633,7 +637,7 @@ impl Assets {
             settings.rotation().ok_or_else(|| {
                 Error::Unsupported(format!(
                     "sprite {name} has packing rotation {}, which Unity does not define",
-                    (settings.0 >> 2) & 0xf,
+                    settings.rotation_bits(),
                     name = quoted(name)
                 ))
             })?
@@ -715,9 +719,8 @@ impl Assets {
             None => None,
         };
         let mask_work = mask.as_ref().map_or(0, |m| m.work);
-        self.reserve(mask_work + u64::from(sw) * u64::from(sh))?
-            .keep();
-        let coverage = mask.map(|m| m.fill(sw, sh));
+        self.reserve(mask_work + u64::from(sw) * u64::from(sh))?;
+        let coverage = mask.map(|m| m.fill(sw, sh)).transpose()?;
 
         // The texel under sprite-space pixel (sx, sy): undo the rotation to get the crop
         // pixel (cx, cy), counted from the rect's bottom left, then find it in the top-down
@@ -771,7 +774,7 @@ impl Assets {
     /// around the pivot. The work, a step for each row of each triangle and a test for each
     /// column of that row's span (see [`row_span`]), is counted here and held to
     /// [`Limits::max_mask_work`]; the caller reserves it before [`Mask::fill`].
-    #[allow(
+    #[expect(
         clippy::many_single_char_names,
         reason = "a triangle's corners a, b, c and its points p, as in the geometry"
     )]
@@ -790,12 +793,14 @@ impl Assets {
         let (wf, hf) = (w as f32, h as f32);
         // Triangles with area, mapped into pixels, with the pixel range each could touch.
         let mut boxes = Vec::with_capacity(triangles.len());
-        let mut work = 0u64;
+        let limit = self.file.limits().max_mask_work;
         for t in triangles {
             let p = t.map(|[x, y]| [x * scale + dx, y * scale + dy]);
-            if p.iter().flatten().any(|v| !v.is_finite()) {
+            // Far past any image (16384 pixels at most), f32 has no pixel precision left.
+            if p.iter().flatten().any(|v| !v.is_finite() || v.abs() > FAR) {
                 return Err(Error::Invalid(format!(
-                    "sprite {name} has a mesh vertex that is not a finite number",
+                    "sprite {name} has a mesh vertex that is not a finite number within {FAR} \
+                     pixels",
                     name = quoted(name)
                 )));
             }
@@ -812,11 +817,6 @@ impl Assets {
             let y_from = lo(1).floor().clamp(0.0, hf) as u32;
             let y_to = hi(1).ceil().clamp(0.0, hf) as u32;
             if x_from < x_to && y_from < y_to {
-                // A row costs one step, plus a test for each column its span may cover.
-                for y in y_from..y_to {
-                    let span = row_span(&p, y, x_from..x_to);
-                    work += 1 + u64::from(span.end - span.start);
-                }
                 boxes.push((p, x_from..x_to, y_from..y_to));
             } else {
                 // Area, but none of it inside the image.
@@ -829,7 +829,34 @@ impl Assets {
                 name = quoted(name)
             )));
         }
-        Error::limit(LimitKind::MaskWork, work, self.file.limits().max_mask_work)?;
+        // The rows alone, counted in constant time a triangle, before any span is worked out:
+        // held to the mask limit and to what is left of the total.
+        let rows: u64 = boxes
+            .iter()
+            .map(|(_, _, ys)| u64::from(ys.end - ys.start) * ROW_STEP)
+            .sum();
+        Error::limit(LimitKind::MaskWork, rows, limit)?;
+        let total = self.file.limits().max_total_work;
+        let done = self.shared.work();
+        Error::limit(LimitKind::TotalWork, done.saturating_add(rows), total)?;
+        // Then each row's span, stopping as soon as the total passes the limit. The spans
+        // worked out by then are charged even when the mask is refused, so asking again does
+        // not get them free.
+        let mut work = 0u64;
+        for (p, xs, ys) in &boxes {
+            for y in ys.clone() {
+                let span = row_span(p, y, xs.clone());
+                work += ROW_STEP + u64::from(span.end - span.start);
+                if work > limit {
+                    self.shared.spend(work, self.file.limits().max_total_work);
+                    return Err(Error::LimitExceeded {
+                        kind: LimitKind::MaskWork,
+                        value: work,
+                        limit,
+                    });
+                }
+            }
+        }
         Ok(Mask { boxes, work })
     }
 }
@@ -846,14 +873,27 @@ type TriangleBox = ([[f32; 2]; 3], std::ops::Range<u32>, std::ops::Range<u32>);
 impl Mask {
     /// Which pixels of the `w` x `h` image the mesh covers: a pixel is kept when any of four
     /// sample points in it (see [`SAMPLES`]) lies in a triangle.
-    fn fill(self, w: u32, h: u32) -> Vec<bool> {
+    #[expect(
+        clippy::many_single_char_names,
+        reason = "a triangle's corners a, b, c, as in the geometry"
+    )]
+    fn fill(self, w: u32, h: u32) -> Result<Vec<bool>> {
         #[cfg(test)]
         tests::MASKS_FILLED.with(|n| n.set(n.get() + 1));
-        let mut covered = vec![false; w as usize * h as usize];
+        let len = w as usize * h as usize;
+        let mut covered = Vec::new();
+        covered
+            .try_reserve_exact(len)
+            .map_err(|_| Error::OutOfMemory { bytes: len as u64 })?;
+        covered.resize(len, false);
         for ([a, b, c], xs, ys) in self.boxes {
             // On or inside all three edges, whichever way the triangle winds.
-            let inside = |px: f32, py: f32| {
-                let side = |p: [f32; 2], q: [f32; 2]| {
+            // In f64: an f32 edge test near a far vertex rounds by more than a sample's
+            // distance from the edge.
+            let triangle = [a, b, c];
+            let [a, b, c] = triangle.map(|[x, y]| [f64::from(x), f64::from(y)]);
+            let inside = |px: f64, py: f64| {
+                let side = |p: [f64; 2], q: [f64; 2]| {
                     (q[0] - p[0]) * (py - p[1]) - (q[1] - p[1]) * (px - p[0])
                 };
                 let (d1, d2, d3) = (side(a, b), side(b, c), side(c, a));
@@ -862,26 +902,30 @@ impl Mask {
                 !(neg && pos)
             };
             for y in ys {
-                for x in row_span(&[a, b, c], y, xs.clone()) {
-                    let (fx, fy) = (x as f32, y as f32);
+                for x in row_span(&triangle, y, xs.clone()) {
+                    let (fx, fy) = (f64::from(x), f64::from(y));
                     if SAMPLES.iter().any(|&(u, v)| inside(fx + u, fy + v)) {
                         covered[y as usize * w as usize + x as usize] = true;
                     }
                 }
             }
         }
-        covered
+        Ok(covered)
     }
 }
 
 /// The columns of row `y`, within `columns`, that may hold a sample inside triangle `t`:
 /// where the row's two sample lines (`y + 0.25`, `y + 0.75`) cross the triangle, widened by
 /// a column each side for rounding. Only these are tested, so a thin triangle costs its
-/// height, not its bounding box; every pixel with a sample inside is among them, so the mask
-/// is the same as testing the whole box.
+/// height, not its bounding box; every pixel with a sample inside is among them (for vertices
+/// within [`FAR`] of the image, which the mesh is held to), so the mask is the same as
+/// testing the whole box.
 fn row_span(t: &[[f32; 2]; 3], y: u32, columns: std::ops::Range<u32>) -> std::ops::Range<u32> {
-    let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
-    for py in [y as f32 + 0.25, y as f32 + 0.75] {
+    // In f64, as the inside test is: with vertices held within `FAR`, its rounding is far
+    // below the tolerance and the column of slack either side.
+    let t = t.map(|[x, y]| [f64::from(x), f64::from(y)]);
+    let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+    for py in [f64::from(y) + 0.25, f64::from(y) + 0.75] {
         for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
             let (y0, y1) = if a[1] <= b[1] {
                 (a[1], b[1])
@@ -889,27 +933,27 @@ fn row_span(t: &[[f32; 2]; 3], y: u32, columns: std::ops::Range<u32>) -> std::op
                 (b[1], a[1])
             };
             // A little past each end, so rounding never drops a crossing.
-            if py < y0 - 1e-3 || py > y1 + 1e-3 {
+            if py < y0 - 1e-6 || py > y1 + 1e-6 {
                 continue;
             }
             let span = b[1] - a[1];
-            let x = if span.abs() < 1e-6 {
+            if span.abs() < 1e-9 {
                 // A flat edge on the line: both its ends.
                 lo = lo.min(a[0].min(b[0]));
-                a[0].max(b[0])
+                hi = hi.max(a[0].max(b[0]));
             } else {
-                a[0] + (py - a[1]).clamp(y0 - a[1], y1 - a[1]) * (b[0] - a[0]) / span
-            };
-            lo = lo.min(x);
-            hi = hi.max(x);
+                let x = a[0] + (py - a[1]).clamp(y0 - a[1], y1 - a[1]) * (b[0] - a[0]) / span;
+                lo = lo.min(x);
+                hi = hi.max(x);
+            }
         }
     }
     if lo > hi {
         return 0..0;
     }
     // Column x samples at x + 0.25 and x + 0.75.
-    let from = ((lo - 0.75).floor() - 1.0).max(columns.start as f32);
-    let to = ((hi - 0.25).floor() + 2.0).min(columns.end as f32);
+    let from = ((lo - 0.75).floor() - 1.0).max(f64::from(columns.start));
+    let to = ((hi - 0.25).floor() + 2.0).min(f64::from(columns.end));
     if from < to {
         from as u32..to as u32
     } else {
@@ -917,11 +961,21 @@ fn row_span(t: &[[f32; 2]; 3], y: u32, columns: std::ops::Range<u32>) -> std::op
     }
 }
 
+/// Mask work for one row of one triangle, besides a unit for each column tested: working out
+/// its span, which is done twice (to count the work, then to fill), costs about as much as
+/// sixteen column tests.
+const ROW_STEP: u64 = 16;
+
+/// Farthest a mesh vertex may lie from the image's corner, in pixels: four times the largest
+/// texture. Much farther out, f32 rounding moves an edge by more than the column of slack
+/// each row's span allows (measured from about a million pixels); no real sprite comes near.
+const FAR: f32 = 65536.0;
+
 /// Where a pixel is sampled for the mask: at the quarter points. Of the rules measured
 /// against `UnityPy`'s polygon fill on real sprites (pixel centre only, any overlap, these four,
 /// two of five), keeping a pixel when any of these four is covered disagreed on the fewest
 /// pixels.
-const SAMPLES: [(f32, f32); 4] = [(0.25, 0.25), (0.75, 0.25), (0.25, 0.75), (0.75, 0.75)];
+const SAMPLES: [(f64, f64); 4] = [(0.25, 0.25), (0.75, 0.25), (0.25, 0.75), (0.75, 0.75)];
 
 fn texture_id_of(sprite: &Sprite, placement: &Placement) -> Result<i64> {
     if placement.texture.is_null() {
@@ -950,7 +1004,7 @@ mod tests {
     #[test]
     fn test_a_mask_refused_for_the_total_is_never_built() {
         use crate::test_common::*;
-        // A tight 4x4 sprite: decode 16, mask 17 (see the regression tests), copy 16.
+        // A tight 4x4 sprite: decode 16, mask 77 (see the regression tests), copy 16.
         let tri = Mesh {
             vertices: &[[0.0, 0.0], [4.0, 0.0], [0.0, 4.0]],
             indices: &[0, 1, 2],
@@ -989,7 +1043,7 @@ mod tests {
             19,
             &[(10, TEXTURE_2D, tex), (1, SPRITE, s)],
         );
-        for (limit, masks) in [(48, 0), (49, 1)] {
+        for (limit, masks) in [(108, 0), (109, 1)] {
             let file = SerializedFile::parse_with(
                 file.clone(),
                 Limits::DEFAULT.with_max_total_work(limit),
@@ -1005,6 +1059,72 @@ mod tests {
                 "limit {limit}"
             );
         }
+    }
+
+    /// The documented rule for one sample, in f64 as the crate tests it.
+    #[expect(
+        clippy::many_single_char_names,
+        reason = "a triangle's corners a, b, c, as in the geometry"
+    )]
+    fn sample_inside(t: &[[f32; 2]; 3], px: f64, py: f64) -> bool {
+        let [a, b, c] = t.map(|[x, y]| [f64::from(x), f64::from(y)]);
+        let side =
+            |p: [f64; 2], q: [f64; 2]| (q[0] - p[0]) * (py - p[1]) - (q[1] - p[1]) * (px - p[0]);
+        let d = [side(a, b), side(b, c), side(c, a)];
+        !(d.iter().any(|&v| v < 0.0) && d.iter().any(|&v| v > 0.0))
+    }
+
+    #[test]
+    fn test_row_spans_hold_every_sample_inside_at_16k() {
+        // The round-6 review's case: an apex a few units in the last place from a sample line,
+        // 16k pixels up, with the other corners far below. In f32 the inside test itself
+        // rounded, so samples just outside counted as inside and their spans missed them;
+        // in f64 a sample just above the apex is outside and one just below is inside, and
+        // the span must hold every one that is.
+        let mut seed = 0x1234_9876_5555_aaaau64;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut tried = 0;
+        for _ in 0..300_000 {
+            let y = 8192 + (rnd() % 8000) as u32;
+            let x = (rnd() % 16000) as u32 + 100;
+            let sx = x as f32 + if rnd() % 2 == 0 { 0.25 } else { 0.75 };
+            let sy = y as f32 + 0.25;
+            let ulps = 1 + (rnd() % 6) as u32;
+            let ay = f32::from_bits(if rnd() % 2 == 0 {
+                sy.to_bits() - ulps
+            } else {
+                sy.to_bits() + ulps
+            });
+            let ax = f32::from_bits((i64::from(sx.to_bits()) + (rnd() % 7) as i64 - 3) as u32);
+            let corner = |rnd: &mut dyn FnMut() -> u64| {
+                [
+                    (rnd() % 16384) as f32 + (rnd() % 1000) as f32 * 1e-3,
+                    (rnd() % 64) as f32,
+                ]
+            };
+            let t = [[ax, ay], corner(&mut rnd), corner(&mut rnd)];
+            if !sample_inside(&t, f64::from(sx), f64::from(sy)) {
+                continue;
+            }
+            tried += 1;
+            let lo = t.iter().map(|q| q[0]).fold(f32::INFINITY, f32::min).floor() as u32;
+            let hi = t
+                .iter()
+                .map(|q| q[0])
+                .fold(f32::NEG_INFINITY, f32::max)
+                .ceil() as u32;
+            let span = row_span(&t, y, lo..hi.min(16384));
+            assert!(
+                span.contains(&x),
+                "pixel ({x},{y}) missed by {span:?}: {t:?}"
+            );
+        }
+        assert!(tried > 1000, "{tried}");
     }
 
     #[test]

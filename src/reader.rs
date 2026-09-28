@@ -8,19 +8,10 @@ use crate::{Error, Result};
 /// says.
 pub const MAX_STRING: usize = 4096;
 
-/// Bytes from a file as text, never longer than the bytes themselves: invalid UTF-8 becomes
-/// U+FFFD, three bytes for one, and the result is cut back to the byte count (at a character
-/// boundary), so a string held or quoted costs no more than the file spent on it.
+/// A name from a file as text: invalid UTF-8 becomes U+FFFD, so a name costs at most three
+/// times its bytes (12 KiB at [`MAX_STRING`]), held exactly.
 fn text(bytes: &[u8]) -> String {
-    if let Ok(s) = std::str::from_utf8(bytes) {
-        return s.to_owned();
-    }
     let mut s = String::from_utf8_lossy(bytes).into_owned();
-    let mut cut = bytes.len().min(s.len());
-    while !s.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    s.truncate(cut);
     s.shrink_to_fit();
     s
 }
@@ -149,7 +140,11 @@ impl<'a> Reader<'a> {
                     Error::Truncated(self.pos)
                 }
             })?;
-        let s = text(&rest[..len]);
+        // Metadata strings (versions, paths) are ASCII as Unity writes them; anything that is
+        // not UTF-8 is not a file this crate reads.
+        let s = std::str::from_utf8(&rest[..len])
+            .map_err(|_| Error::Invalid(format!("string at byte {} is not UTF-8", self.pos)))?
+            .to_owned();
         self.pos += len + 1;
         Ok(s)
     }
@@ -215,17 +210,17 @@ mod tests {
     }
 
     #[test]
-    fn test_text_is_never_longer_than_its_bytes() {
+    fn test_names_decode_lossily_and_metadata_strictly() {
         assert_eq!(text(b"Icon_1"), "Icon_1");
-        assert_eq!(text("é".as_bytes()), "é");
+        assert_eq!(text("\u{e9}".as_bytes()), "\u{e9}");
+        // Every character but the bad byte is kept.
+        assert_eq!(text(b"Caf\xe9_Icon_Big"), "Caf\u{fffd}_Icon_Big");
         let bad = text(&[0xff; 4096]);
-        assert!(bad.len() <= 4096 && bad.capacity() <= 4096, "{}", bad.len());
-        assert!(bad.chars().all(|c| c == '\u{fffd}'));
-        // "a", U+FFFD, "b" is five bytes from three: cut back to three, at a boundary.
-        assert_eq!(text(&[b'a', 0xff, b'b']), "a");
-        assert_eq!(text(&[0xff]), "");
+        assert_eq!((bad.len(), bad.capacity()), (3 * 4096, 3 * 4096));
+        let mut r = Reader::new(b"ok\0caf\xe9\0", false);
+        assert_eq!(r.cstr().unwrap(), "ok");
+        assert!(matches!(r.cstr(), Err(Error::Invalid(msg)) if msg.contains("not UTF-8")));
     }
-
     #[test]
     fn test_strings_stop_at_4_kib() {
         let at_most = |n: usize, nul: bool| {

@@ -8,7 +8,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .next()
         .ok_or("usage: dump <file> <path-id> [max-bytes]")?;
     let id: i64 = common::text_arg(&mut args, "the path id")?
-        .ok_or("path id")?
+        .ok_or("usage: dump <file> <path-id> [max-bytes]")?
         .parse()?;
     let max: usize = common::text_arg(&mut args, "the byte count")?
         .map(|s| s.parse())

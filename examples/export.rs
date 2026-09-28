@@ -3,8 +3,8 @@
 //!
 //! Files already in the output folder are never overwritten (each is reported instead), so
 //! export into an empty folder. The output is bounded only by the file's work limit: a small
-//! hostile file can ask for tens of gigabytes of PNG. Lower the limits, or watch the disk,
-//! when exporting files you did not make.
+//! hostile file can ask for tens of gigabytes of PNG. This example uses the default limits:
+//! watch the disk when exporting files you did not make.
 
 mod common;
 

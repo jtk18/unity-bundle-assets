@@ -93,9 +93,10 @@ Each of these gives an error naming it:
 Files are treated as hostile:
 
 - Counts and lengths are checked against the bytes present, at each record's real minimum
-  size, before they size an allocation. Every string read (names, paths, versions) is at most
-  4 KiB of the file, and never longer as text than those bytes (invalid UTF-8 becomes U+FFFD
-  and is cut back). Error messages quote at most 64 characters of any name or path.
+  size, before they size an allocation. Every string read is at most 4 KiB of the file.
+  Versions and paths must be UTF-8, as Unity writes them; a name that is not has its bad
+  bytes shown as U+FFFD (at most three times its bytes as text). Error messages quote at most
+  64 characters of any name or path (escaped, so a few hundred bytes at most).
 - One blob cannot be decoded many times over: objects may not overlap or share an ID, bundle
   entries and a sprite's sub-meshes may not overlap, and a range of stream data may be read by
   one texture only. Ranges are compared by the bytes they reach (on Unix, the file's device and
@@ -103,33 +104,42 @@ Files are treated as hostile:
   to them is spelled; a texture may not stream from a serialized file. Claims last as long as
   the `Assets` (or the `Bundle`), so separate `Assets::open` calls on files that share a
   stream file each claim its ranges afresh.
-- A file is checked by its header before the rest is read. A bundle must declare a size no
-  larger than its data, and is read only that far; a serialized file is read as far as its
-  header says it runs. Stream files are read by range and are not held to `max_file_size`
-  (real ones pass 2 GiB); what is decoded from them is held to the work limits.
+- A file is checked by its header before the rest is read. A bundle must declare a size
+  between its header's and its data's, and is read only that far; a serialized file is read
+  as far as its header says it runs. A file that states a large size and holds nothing (a
+  sparse file, say) is still read that far: up to `max_file_size`. Stream files are read by
+  range and are not held to `max_file_size` (real ones pass 2 GiB); what is decoded from them
+  is held to the work limits.
 - Sizes the data alone cannot bound are held to `Limits`, which a caller can lower: file size
   (2 GiB); decompressed bundle size (1 GiB), which also counts the parsed directory and LZMA's
   working memory (its tables for every block, directory included, and its dictionary);
   objects (4M, across all the files of a bundle); pixels per texture (16384 x 16384);
-  triangles per sprite (65,536) and per `sprites` call (4M); mask work per sprite (2^29: a
-  step for each row a triangle crosses and a test for each pixel of that row it might cover);
-  and total work (2^34): every pixel decoded and copied, and every mask step. At the
-  defaults that total is about a minute of CPU at worst. It is shared by every `Assets`
-  opened from one `Bundle` (two `Assets::open` calls on one path are two totals). Work is
-  reserved before it starts; a request refused then, or data refused before it is read,
-  costs nothing, and work once started is kept. Which of several threads' requests are
-  refused under the limit depends on their timing.
+  triangles per sprite (65,536) and per `sprites` call (4M); mask work per sprite (2^29:
+  sixteen for each row a triangle crosses, which is what working out the row costs, and one
+  for each pixel of that row it might cover; mesh vertices must lie within 65,536 pixels);
+  and total work (2^34): every pixel decoded and copied, and every unit of mask work. Each
+  unit costs about 2 ns on an Apple silicon Mac, so the total is under a minute of CPU. It
+  is shared by every `Assets` opened from one `Bundle` (two `Assets::open` calls on one path
+  are two totals), and it is never given back: a long-running program that decodes the
+  same textures again and again should raise it. Work is reserved before it starts; a
+  request refused then, or data refused before it is read, costs nothing, and work once
+  started is kept (a mask refused partway is charged what counting it cost). Which of
+  several threads' requests are refused under the limit depends on their timing.
 - `Assets` enforces all of that. Used directly, `Bundle` and `SerializedFile` apply their own
   limits, `Texture2D` refuses data too short for its size but claims no ranges (texture after
   texture may read the same bytes), and `decode::decode` applies none; a caller using them
   counts its own work.
-- The limits bound work, not peak memory. At the default 16384 x 16384, decoding one texture
-  holds up to about 2 GiB (the file's bytes and the RGBA result), and exporting a sprite from
-  it up to about 3.25 GiB (with the sprite and its mask); each thread decoding and cutting in
-  parallel holds about that much. LZMA can
-  expand a 150 KB file to the full 1 GiB of decompressed data. A bundle is decompressed whole
-  when it is opened, and one parsed from bytes briefly holds both the file and its
-  decompressed copy. Lower `max_texture_pixels` and `max_decompressed` where that matters.
+- The limits bound work, not peak memory. Opening a file holds the file (up to
+  `max_file_size`) or a bundle's decompressed data (up to `max_decompressed`); a bundle is
+  decompressed whole when opened, and one parsed from bytes briefly holds both copies. On
+  top of that, at the default 16384 x 16384, decoding one texture holds up to about 1 GiB
+  more (the RGBA result, and a streamed texture's stored pixels while they are decoded), and
+  exporting a sprite from it up to about 2.25 GiB more (with the sprite and its mask); each
+  thread decoding and cutting in parallel holds about that much. `Assets::sprites` keeps an
+  entry, some 90 bytes, for each sprite it could not read, up to `max_objects`. LZMA can
+  expand a 150 KB file to the full 1 GiB of decompressed data, and 40 KB of stream data can
+  make a 1 GiB texture. For files from strangers, lower `max_decompressed`,
+  `max_texture_pixels` and `max_total_work`.
 - Streamed pixels are read only from the same bundle, or from a `.resS` / `.resource` file
   directly beside the asset file: one plain file name, a regular file, not a symbolic link,
   and not named like a Windows device however spelled (`CON`, `nul .resS`, `COM1`, ...) or an

@@ -167,7 +167,9 @@ impl<'a> Texture2D<'a> {
         claim(StreamKey::File(id), stream.offset, end)?;
         file.seek(SeekFrom::Start(stream.offset))
             .map_err(Error::io(&path))?;
-        let mut data = Vec::with_capacity(want);
+        let mut data = Vec::new();
+        data.try_reserve_exact(want)
+            .map_err(|_| Error::OutOfMemory { bytes: want as u64 })?;
         file.take(want as u64)
             .read_to_end(&mut data)
             .map_err(Error::io(&path))?;

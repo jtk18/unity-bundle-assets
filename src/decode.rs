@@ -11,23 +11,25 @@ pub mod format {
     /// Alpha, red, green, blue, four bits each in a little-endian 16-bit word (alpha in the
     /// top bits).
     pub const ARGB4444: i32 = 2;
-    /// Red 5 bits, green 6, blue 5 in a little-endian 16-bit word (red in the top bits).
-    pub const RGB565: i32 = 7;
-    /// Red, green, blue, alpha, four bits each in a little-endian 16-bit word (red in the top
-    /// bits).
-    pub const RGBA4444: i32 = 13;
     /// Red, green, blue, one byte each.
     pub const RGB24: i32 = 3;
     /// Red, green, blue, alpha, one byte each.
     pub const RGBA32: i32 = 4;
     /// Alpha, red, green, blue, one byte each.
     pub const ARGB32: i32 = 5;
-    /// Blue, green, red, alpha, one byte each.
-    pub const BGRA32: i32 = 14;
+    /// Red 5 bits, green 6, blue 5 in a little-endian 16-bit word (red in the top bits).
+    /// Widened as Pillow (and so `UnityPy`) does, rounding down, which can be a level darker
+    /// than a GPU shows.
+    pub const RGB565: i32 = 7;
     /// BC1: 4x4 blocks of 8 bytes, one bit of alpha.
     pub const DXT1: i32 = 10;
     /// BC3: 4x4 blocks of 16 bytes, interpolated alpha.
     pub const DXT5: i32 = 12;
+    /// Red, green, blue, alpha, four bits each in a little-endian 16-bit word (red in the top
+    /// bits).
+    pub const RGBA4444: i32 = 13;
+    /// Blue, green, red, alpha, one byte each.
+    pub const BGRA32: i32 = 14;
 }
 
 /// Bytes in the first mip level, or `None` for a format this crate does not decode or a size

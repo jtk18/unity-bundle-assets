@@ -22,14 +22,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for sprite in &list.sprites {
         let placement = assets.placement(sprite);
         let tex = match &placement {
-            Err(e) => format!("error: {}", common::printable(&e.to_string())),
+            // Grouped by kind, not by message: each sprite's message names the sprite.
+            Err(e) => format!("error: {}", kind(e)),
             Ok(p) if p.texture.file_id != 0 => format!("external {}", p.texture.file_id),
             Ok(p) => {
                 let t = formats.entry(p.texture.path_id).or_insert_with(|| {
                     assets
                         .texture(p.texture.path_id)
                         .map(|t| t.format)
-                        .map_err(|e| e.to_string())
+                        .map_err(|e| kind(&e))
                 });
                 format!("{t:?}")
             }
@@ -49,8 +50,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         list.sprites.len(),
         list.skipped.len()
     );
-    for (k, n) in by {
+    let groups = by.len();
+    for (k, n) in by.into_iter().take(common::MAX_REPORTED) {
         println!("{n:>6} {k:?}");
     }
+    if groups > common::MAX_REPORTED {
+        println!("({} more groups not shown)", groups - common::MAX_REPORTED);
+    }
     Ok(())
+}
+
+/// What kind of error this is, without the names in its message.
+fn kind(e: &unity_bundle_assets::Error) -> String {
+    let text = e.root().to_string();
+    text.split(':').next().unwrap_or_default().to_string()
 }

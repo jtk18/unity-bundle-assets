@@ -130,14 +130,16 @@ impl Bundle {
     ///
     /// As [`Bundle::parse`].
     pub fn parse_with(file: &[u8], limits: Limits) -> Result<Self> {
+        let mut head = Reader::new(file, true);
         let Header {
             format,
             unity_version,
             unity_revision,
             declared_size,
-        } = header(&mut Reader::new(file, true))?;
+        } = header(&mut head)?;
         // The bundle is the declared size; anything after it is not part of it.
-        let file = &file[..declared_len(declared_size, file.len() as u64)? as usize];
+        let size = declared_len(declared_size, head.pos(), file.len() as u64)?;
+        let file = &file[..size as usize];
         let mut r = Reader::new(file, true);
         header(&mut r)?;
         let info_compressed = r.u32()? as usize;
@@ -198,6 +200,10 @@ impl Bundle {
             )?;
         }
         let mut info = Vec::new();
+        info.try_reserve_exact(info_size)
+            .map_err(|_| Error::OutOfMemory {
+                bytes: info_size as u64,
+            })?;
         decompress_into(
             &mut info,
             info_bytes,
@@ -235,7 +241,7 @@ impl Bundle {
         for _ in 0..entry_count {
             let offset = ir.i64()?;
             let size = ir.i64()?;
-            let flags = ir.u32()?;
+            let entry_flags = ir.u32()?;
             let path = ir.cstr()?;
             charged += 3 * path.len() as u64;
             Error::limit(LimitKind::Decompressed, charged, budget)?;
@@ -256,7 +262,7 @@ impl Bundle {
             }
             entries.push(Entry {
                 path,
-                flags,
+                flags: entry_flags,
                 offset,
                 size,
             });
@@ -458,16 +464,17 @@ fn header(r: &mut Reader<'_>) -> Result<Header> {
 /// this crate reads; then the file is read up to the size the header declares (anything
 /// after that is not the bundle's).
 pub(crate) fn check_head(head: &[u8], len: u64) -> Result<u64> {
-    let Header { declared_size, .. } = header(&mut Reader::new(head, true))?;
-    declared_len(declared_size, len)
+    let mut r = Reader::new(head, true);
+    let Header { declared_size, .. } = header(&mut r)?;
+    declared_len(declared_size, r.pos(), len)
 }
 
-/// The bundle's length from its header's declared size: more than nothing, and no more than
-/// the `len` bytes there are. Unity writes the file's own size here.
-fn declared_len(declared_size: i64, len: u64) -> Result<u64> {
+/// The bundle's length from its header's declared size: at least the `header` bytes already
+/// read, and no more than the `len` bytes there are. Unity writes the file's own size here.
+fn declared_len(declared_size: i64, header: usize, len: u64) -> Result<u64> {
     u64::try_from(declared_size)
         .ok()
-        .filter(|&n| n > 0 && n <= len)
+        .filter(|&n| n >= header as u64 && n <= len)
         .ok_or_else(|| {
             Error::Invalid(format!(
                 "bundle header declares {declared_size} bytes; the data holds {len}"
@@ -530,7 +537,8 @@ fn lz4_into(out: &mut Vec<u8>, data: &[u8], size: usize) -> Result<()> {
     }
     let base = out.len();
     let end = base + size;
-    out.reserve(size);
+    out.try_reserve(size)
+        .map_err(|_| Error::OutOfMemory { bytes: size as u64 })?;
     let mut i = 0;
     let length = |i: &mut usize, mut n: usize| -> Result<usize> {
         if n == 15 {
