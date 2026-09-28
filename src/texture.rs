@@ -4,8 +4,8 @@
 use crate::bundle::Bundle;
 use crate::decode;
 use crate::reader::Reader;
-use crate::serialized::{ObjectInfo, SerializedFile};
-use crate::{check_release, Error, Result};
+use crate::serialized::{class, ObjectInfo, SerializedFile};
+use crate::{check_release, Error, Result, Version};
 
 use std::borrow::Cow;
 use std::path::{Component, Path, PathBuf};
@@ -87,8 +87,8 @@ impl<'a> Texture2D<'a> {
     /// For an engine release outside that range, or an object that does not fit the layout.
     pub fn read(file: &'a SerializedFile, object: &ObjectInfo) -> Result<Self> {
         check_release(file.unity_version(), "Texture2D", [5, 5, 0])?;
-        let mut r = file.reader(object)?;
-        read_fields(&mut r, file.unity_version_numbers()).map_err(|e| match e {
+        let mut r = file.reader_for(object, class::TEXTURE_2D)?;
+        read_fields(&mut r, Version::parse(file.unity_version())).map_err(|e| match e {
             Error::Truncated(_) | Error::BadLength { .. } => Error::Invalid(format!(
                 "Texture2D {} from Unity {:?} does not fit the layout this crate knows ({e})",
                 object.path_id(),
@@ -110,8 +110,9 @@ impl<'a> Texture2D<'a> {
     }
 
     /// The first mip level's pixel data. Streamed data is read from `dir`, the folder holding
-    /// the serialized file, and only from a `.resS` or `.resource` file directly inside it that
-    /// is a regular file and not a symbolic link.
+    /// the serialized file, and only from a `.resS` or `.resource` file directly inside it: a
+    /// regular file, not a symbolic link, with no other hard links, and not named like a
+    /// Windows device or an alternate data stream.
     ///
     /// # Errors
     ///
@@ -131,7 +132,7 @@ impl<'a> Texture2D<'a> {
         }
         let want = self.wanted(stream.size as usize)?;
         let path = stream_file(dir, &stream.path)?;
-        let (mut file, len) = crate::file::open_regular(&path, false)?;
+        let (mut file, len) = crate::file::open_regular(&path, crate::file::Chosen::ByData)?;
         let end = stream.offset.checked_add(u64::from(stream.size));
         if end.is_none_or(|end| end > len) {
             return Err(Error::Invalid(format!(
@@ -158,7 +159,10 @@ impl<'a> Texture2D<'a> {
     ///
     /// For a format this crate does not decode, a stream entry the bundle does not hold, or a
     /// stream running past the end of its entry.
-    pub fn data_in<'b>(&'b self, bundle: &'b Bundle) -> Result<Cow<'b, [u8]>> {
+    pub fn data_in<'b>(&self, bundle: &'b Bundle) -> Result<Cow<'b, [u8]>>
+    where
+        'a: 'b,
+    {
         let Some(stream) = &self.stream else {
             let want = self.wanted(self.image_data.len())?;
             return Ok(Cow::Borrowed(&self.image_data[..want]));
@@ -192,6 +196,17 @@ impl<'a> Texture2D<'a> {
 /// `name` as a stream file directly inside `dir`: one plain path component ending in `.resS`
 /// or `.resource`, the names Unity writes. Anything else is refused.
 fn stream_file(dir: &Path, name: &str) -> Result<PathBuf> {
+    // Windows reads `name:stream` as an alternate data stream and `CON.resS` as a device.
+    let stem = name.split('.').next().unwrap_or("").to_ascii_uppercase();
+    let device = ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"].contains(&stem.as_str())
+        || ((stem.starts_with("COM") || stem.starts_with("LPT"))
+            && stem.chars().count() == 4
+            && !stem.ends_with('0'));
+    if name.contains(':') || device {
+        return Err(Error::Unsupported(format!(
+            "stream path {name:?} is not a .resS or .resource file name beside the asset file"
+        )));
+    }
     let refuse = || {
         Error::Unsupported(format!(
             "stream path {name:?} is not a .resS or .resource file name beside the asset file"
@@ -211,7 +226,8 @@ fn stream_file(dir: &Path, name: &str) -> Result<PathBuf> {
     }
 }
 
-fn read_fields<'a>(r: &mut Reader<'a>, v: [u32; 3]) -> Result<Texture2D<'a>> {
+fn read_fields<'a>(r: &mut Reader<'a>, version: Version) -> Result<Texture2D<'a>> {
+    let v = version.numbers;
     let at_least = |ma: u32, mi: u32, pa: u32| v >= [ma, mi, pa];
     let name = r.aligned_string()?;
     // m_ForcedFallbackFormat and m_DownscaleFallback: 2017.3 up to 2023.2.
@@ -226,8 +242,11 @@ fn read_fields<'a>(r: &mut Reader<'a>, v: [u32; 3]) -> Result<Texture2D<'a>> {
     let width = r.i32()?;
     let height = r.i32()?;
     r.i32()?; // m_CompleteImageSize
-    if at_least(2020, 1, 0) {
-        r.i32()?; // m_MipsStripped
+    if at_least(2020, 1, 0) && r.i32()? != 0 {
+        // The stored pixels would start at a smaller mip than the width and height describe.
+        return Err(Error::Unsupported(format!(
+            "texture {name:?} has stripped mip levels"
+        )));
     }
     let format = r.i32()?;
     let mip_count = r.i32()?;
@@ -235,10 +254,11 @@ fn read_fields<'a>(r: &mut Reader<'a>, v: [u32; 3]) -> Result<Texture2D<'a>> {
     if at_least(2019, 4, 9) {
         r.bool()?; // m_IsPreProcessed
     }
-    if at_least(2019, 3, 0) {
+    if version.at_least([2019, 3, 0], 'f', 5) {
         r.bool()?; // m_IgnoreMasterTextureLimit / m_IgnoreMipmapLimit
     }
-    if at_least(2022, 2, 0) {
+    // The limit group name arrived in 2022.2.0b3; b1 and b2 lack it.
+    if version.at_least([2022, 2, 0], 'b', 3) {
         r.align(4);
         r.aligned_string()?; // m_MipmapLimitGroupName
     }
@@ -279,6 +299,11 @@ fn read_fields<'a>(r: &mut Reader<'a>, v: [u32; 3]) -> Result<Texture2D<'a>> {
             r.remaining()
         )));
     }
+    let Ok(mip_count) = u32::try_from(mip_count) else {
+        return Err(Error::Invalid(format!(
+            "texture {name:?} has {mip_count} mip levels"
+        )));
+    };
     let empty = width == 0 && height == 0 && image_data.is_empty() && stream.is_none();
     let in_range = |d: i32| (1..=MAX_DIMENSION).contains(&d);
     if !(empty || in_range(width) && in_range(height)) {
@@ -291,7 +316,7 @@ fn read_fields<'a>(r: &mut Reader<'a>, v: [u32; 3]) -> Result<Texture2D<'a>> {
         width: width.unsigned_abs(),
         height: height.unsigned_abs(),
         format,
-        mip_count: mip_count.unsigned_abs(),
+        mip_count,
         platform_blob,
         image_data,
         stream,

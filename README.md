@@ -58,8 +58,10 @@ and open each with `Assets::from_bundle`.
 Exports follow AssetStudio where references disagree: the sprite's texture rectangle, not
 padded out to its full rect; Alpha8 as white with the stored alpha (UnityPy gives black);
 `Rotate90` packing undone counter-clockwise (UnityPy turns the other way, and no real sample
-here settles it); masks from a pixel-centre test, which differs from UnityPy's polygon fill at
-some edges.
+here settles it). A tight sprite's mask keeps a pixel when the mesh covers any of four points
+at its quarter positions. Measured against UnityPy's polygon fill over two real files, that
+rule disagreed on 324 pixels; testing the pixel centre alone disagreed on 349, any overlap on
+344.
 
 ## What it doesn't handle (yet)
 
@@ -81,27 +83,44 @@ Each of these gives an error naming it:
 
 Files are treated as hostile:
 
-- Counts and lengths are checked against the bytes present before they size an allocation,
-  and objects may not overlap or share an ID, so one blob cannot be read many times over.
+- Counts and lengths are checked against the bytes present, at each record's real minimum
+  size, before they size an allocation. Objects may not overlap or share an ID, bundle entries
+  may not overlap, and a range of a stream file may be read by one texture only, so one blob
+  cannot be decoded many times over.
 - Sizes the data alone cannot bound are held to `Limits`, which a caller can lower: file size
-  (2 GiB), decompressed bundle size counting the parsed directory (1 GiB), pixels per texture
-  (16384 x 16384), triangles per sprite (65,536) and per `sprites` call (4M), mask work per
-  sprite, and total pixels one `Assets` decodes, cuts and masks (2^36).
+  (2 GiB), decompressed bundle size counting the parsed directory (1 GiB), objects per file
+  (4M), pixels per texture (16384 x 16384), triangles per sprite (65,536) and per `sprites`
+  call (4M), mask work per sprite (2^29), and total work (2^34): every pixel decoded, masked
+  and copied. The total is shared by every `Assets` opened from one `Bundle`, and work that
+  fails or is refused is not charged. The lower layers (`SerializedFile`, `Texture2D`,
+  `decode`) apply the per-item limits but keep no total; a caller using them directly counts
+  its own.
+- The limits bound work, not peak memory. At the default 16384 x 16384, decoding one texture
+  can hold 1 to 2 GiB (the stored pixels and the RGBA result), and exporting a sprite from it
+  2 to 3 GiB. Lower `max_texture_pixels` where that matters.
 - Streamed pixels are read only from the same bundle, or from a `.resS` / `.resource` file
-  directly beside the asset file that is a regular file and not a symbolic link.
+  directly beside the asset file: a regular file, not a symbolic link, with no other hard
+  links, and not named like a Windows device (`CON`, `NUL`, `COM1`, ...) or an alternate data
+  stream (`:`). Files are opened without blocking and without taking a controlling terminal,
+  and on Unix the file opened must be the one checked. On Windows a file swapped in between
+  the check and the open is not detected.
 - Strings from the file are quoted in error messages, so printing an error cannot send control
-  sequences to a terminal.
+  sequences to a terminal. Strings the API returns (names, paths) are the file's raw text:
+  escape them before printing.
 
 Malformed input is meant to give an error rather than a panic. `tests/fuzz.rs` checks that
 over mutated files (set `UBA_FUZZ_ITERS` to run longer); it is evidence, not proof.
 
 ## Tested against
 
-- A Unity 2022.3 macOS player build: all 9,436 sprites export, and 1,756 of its 1,795 textures
-  decode (the rest are 21 empty font textures and 18 BC7). Against UnityPy, 8,880 sprites are
-  pixel-identical, 555 differ only in the colour of fully transparent pixels (masking clears
-  it; UnityPy keeps the texel), and one differs in 8 pixels at a mask edge. Exporting every
-  sprite and decoding every texture of that 754 MB file takes 4.7 s and 1.0 GB of memory.
+- A Unity 2022.3 macOS player build: all 9,436 sprites of its 754 MB `sharedassets0.assets`
+  export, and 1,756 of its 1,795 textures decode (the rest are 27 empty font textures and 12
+  BC7). Against UnityPy, 8,878 sprites are pixel-identical, 557 differ only in the colour of
+  fully transparent pixels (masking clears it; UnityPy keeps the texel), and one differs in 2
+  pixels at a mask edge. Exporting every sprite and decoding every texture of that file takes
+  4.6 s and 0.96 GB of memory on an Apple silicon Mac. In its `resources.assets`, 174 of 176 sprites
+  export (two use a texture in another file); 164 match UnityPy up to transparent colour and
+  10 differ at mask edges, in 1 to 136 pixels each.
 - 737 asset bundles from a Unity 5.6.6, 5.6.7 and 2018.4 (.2, .11, .36) game and its mods: all
   open, and 15,193 textures export; the one failure is a dynamic font texture stored empty. On
   a sample of 171 bundles, 3,042 of the 3,056 textures UnityPy could decode are pixel-identical

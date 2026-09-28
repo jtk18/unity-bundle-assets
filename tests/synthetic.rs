@@ -458,7 +458,7 @@ fn bundle_tables_must_agree_with_the_data() {
     // A stored block whose compressed and uncompressed sizes disagree.
     let sizes = [(size as u32).to_be_bytes(), (size as u32).to_be_bytes()].concat();
     let at = good.windows(8).position(|w| w == sizes).unwrap();
-    let mut short = good.clone();
+    let mut short = good;
     short[at + 4..at + 8].copy_from_slice(&(size as u32 - 1).to_be_bytes());
     match Bundle::parse(&short) {
         Err(Error::Invalid(msg)) => assert!(msg.contains("stored block"), "{msg}"),
@@ -470,7 +470,7 @@ fn bundle_tables_must_agree_with_the_data() {
     o.info_at_end = true;
     let good = bundle(&o, &[("CAB-a", &file, 4)]);
     let at = good.windows(8).position(|w| w == sizes).unwrap();
-    let mut long = good.clone();
+    let mut long = good;
     long[at + 4..at + 8].copy_from_slice(&(size as u32 + 1).to_be_bytes());
     match Bundle::parse(&long) {
         Err(Error::Invalid(msg)) => assert!(msg.contains("stored block"), "{msg}"),

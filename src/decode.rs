@@ -1,7 +1,7 @@
 //! Pixel formats to RGBA8. Unity stores rows bottom first; decoding turns them the right way
 //! up, so output rows are top first, like every image this crate returns.
 
-use crate::{Error, LimitKind, Result};
+use crate::{Error, Result};
 
 /// The `TextureFormat` values this crate decodes.
 pub mod format {
@@ -67,11 +67,9 @@ pub fn decode(format: i32, width: u32, height: u32, data: &[u8]) -> Result<Vec<u
         .and_then(|p| p.checked_mul(4))
         .filter(|&n| isize::try_from(n).is_ok());
     let (Some(size), Some(out_len)) = (mip0_size(format, width, height), out_len) else {
-        return Err(Error::LimitExceeded {
-            kind: LimitKind::TexturePixels,
-            value: u64::from(width) * u64::from(height),
-            limit: isize::MAX as u64 / 4,
-        });
+        return Err(Error::Invalid(format!(
+            "a {width}x{height} texture is too large to decode"
+        )));
     };
     let data = data
         .get(..size)
@@ -105,6 +103,27 @@ pub fn decode(format: i32, width: u32, height: u32, data: &[u8]) -> Result<Vec<u
         }
     }
     Ok(out)
+}
+
+/// [`decode`], taking ownership of the pixels: RGBA32 data holding exactly the first mip is
+/// turned the right way up in place rather than copied.
+pub(crate) fn decode_owned(
+    format: i32,
+    width: u32,
+    height: u32,
+    mut data: Vec<u8>,
+) -> Result<Vec<u8>> {
+    let size = mip0_size(format, width, height);
+    if format != format::RGBA32 || size.is_none_or(|n| data.len() < n) {
+        return decode(format, width, height, &data);
+    }
+    data.truncate(size.unwrap_or(0));
+    let (h, row) = (height as usize, width as usize * 4);
+    for i in 0..h / 2 {
+        let (top, bottom) = data.split_at_mut((h - 1 - i) * row);
+        top[i * row..(i + 1) * row].swap_with_slice(&mut bottom[..row]);
+    }
+    Ok(data)
 }
 
 /// Turns one stored pixel into RGBA8.
@@ -286,6 +305,25 @@ mod tests {
     }
 
     #[test]
+    fn test_decode_owned_matches_decode() {
+        let data: Vec<u8> = (0..3 * 5 * 4).map(|i| i as u8).collect();
+        for (w, h) in [(3, 5), (3, 4), (1, 1)] {
+            let n = w as usize * h as usize * 4;
+            let mut with_mip = data[..n].to_vec();
+            with_mip.extend([7; 4]);
+            assert_eq!(
+                decode_owned(format::RGBA32, w, h, with_mip).unwrap(),
+                decode(format::RGBA32, w, h, &data[..n]).unwrap()
+            );
+        }
+        assert!(decode_owned(format::RGBA32, 3, 5, vec![0; 10]).is_err());
+        assert_eq!(
+            decode_owned(format::ALPHA8, 1, 2, vec![9, 10]).unwrap(),
+            decode(format::ALPHA8, 1, 2, &[9, 10]).unwrap()
+        );
+    }
+
+    #[test]
     fn test_partial_blocks_and_short_data() {
         // A 5x3 DXT1 texture needs 2x1 blocks.
         assert_eq!(mip0_size(format::DXT1, 5, 3), Some(16));
@@ -294,7 +332,10 @@ mod tests {
             5 * 3 * 4
         );
         assert!(decode(format::DXT1, 5, 3, &[0; 15]).is_err());
-        assert!(decode(9999, 4, 4, &[0; 64]).is_err());
+        assert!(matches!(
+            decode(9999, 4, 4, &[0; 64]),
+            Err(Error::UnsupportedTextureFormat { format: 9999, .. })
+        ));
     }
 
     #[test]

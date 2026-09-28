@@ -7,11 +7,22 @@
 
 #![allow(dead_code)]
 
-pub use unity_bundle_assets::decode::format;
+/// Unity's `TextureFormat` numbers, written out here rather than taken from the crate, so a
+/// wrong constant there cannot agree with itself.
+pub mod format {
+    pub const ALPHA8: i32 = 1;
+    pub const RGB24: i32 = 3;
+    pub const RGBA32: i32 = 4;
+    pub const ARGB32: i32 = 5;
+    pub const DXT1: i32 = 10;
+    pub const DXT5: i32 = 12;
+    pub const BGRA32: i32 = 14;
+    pub const BC7: i32 = 25;
+}
 
 pub const TEXTURE_2D: i32 = 28;
 pub const SPRITE: i32 = 213;
-pub const SPRITE_ATLAS: i32 = 687078895;
+pub const SPRITE_ATLAS: i32 = 687_078_895;
 
 /// Object data in either byte order, aligned relative to the object's start.
 pub struct W {
@@ -20,14 +31,14 @@ pub struct W {
 }
 
 impl W {
-    pub fn new(big: bool) -> W {
-        W {
+    pub const fn new(big: bool) -> Self {
+        Self {
             buf: Vec::new(),
             big,
         }
     }
-    pub fn le() -> W {
-        W::new(false)
+    pub const fn le() -> Self {
+        Self::new(false)
     }
     fn put<const N: usize>(&mut self, le: [u8; N], be: [u8; N]) -> &mut Self {
         self.buf.extend(if self.big { be } else { le });
@@ -96,13 +107,13 @@ pub enum Pixels<'a> {
 }
 
 impl Pixels<'_> {
-    fn inline(&self) -> &[u8] {
+    const fn inline(&self) -> &[u8] {
         match self {
             Pixels::Inline(b) => b,
             Pixels::Streamed { .. } => &[],
         }
     }
-    fn stream(&self) -> (u64, u32, &str) {
+    const fn stream(&self) -> (u64, u32, &str) {
         match *self {
             Pixels::Inline(_) => (0, 0, ""),
             Pixels::Streamed { path, offset, size } => (offset, size, path),
@@ -117,6 +128,8 @@ pub enum Layout {
     U5_6,
     /// 2017.1: 5.6's fields, three wrap modes.
     U2017_1,
+    /// 2017.3 to 2018.1: plus the fallback fields.
+    U2017_3,
     /// 2018.2 to 2019.3.0: fallback fields, streaming mipmaps.
     U2018_4,
     /// 2019.3.1 to 2019.4.8: plus m_IgnoreMasterTextureLimit.
@@ -150,7 +163,7 @@ pub fn texture(
     o.string(name);
     match layout {
         U5_6 | U2017_1 => {}
-        U2018_4 | U2019_3 | U2019_4 | U2020_1 => {
+        U2017_3 | U2018_4 | U2019_3 | U2019_4 | U2020_1 => {
             o.i32(0).bool(false).align();
         }
         U2021_3 | U2022_3 => {
@@ -166,7 +179,7 @@ pub fn texture(
     }
     o.i32(fmt).i32(1);
     match layout {
-        U5_6 | U2017_1 => {
+        U5_6 | U2017_1 | U2017_3 => {
             o.bool(false).align();
         }
         U2018_4 => {
@@ -222,7 +235,7 @@ pub struct Mesh<'a> {
 }
 
 impl Mesh<'static> {
-    pub const BASE: Mesh<'static> = Mesh {
+    pub const BASE: Self = Mesh {
         vertices: &[],
         indices: &[],
         pos_stream: 0,
@@ -249,11 +262,49 @@ pub fn sprite(
     downscale: f32,
     mesh: &Mesh,
 ) -> Vec<u8> {
+    sprite_full(
+        big,
+        unity_6000_5,
+        name,
+        rect,
+        pivot,
+        key,
+        atlas,
+        texture,
+        alpha_texture,
+        texture_rect,
+        settings,
+        downscale,
+        mesh,
+        1.0,
+        [0.0, 0.0],
+    )
+}
+
+/// [`sprite`] with pixels per unit and the texture rect's offset within the full rect.
+#[allow(clippy::too_many_arguments)]
+pub fn sprite_full(
+    big: bool,
+    unity_6000_5: bool,
+    name: &str,
+    rect: [f32; 4],
+    pivot: [f32; 2],
+    key: i64,
+    atlas: i64,
+    texture: i64,
+    alpha_texture: i64,
+    texture_rect: [f32; 4],
+    settings: u32,
+    downscale: f32,
+    mesh: &Mesh,
+    pixels_per_unit: f32,
+    rect_offset: [f32; 2],
+) -> Vec<u8> {
     let mut o = W::new(big);
     o.string(name);
     o.rect(rect[0], rect[1], rect[2], rect[3]);
     o.zeros(8 + 16); // m_Offset, m_Border
-    o.f32(1.0); // pixels per unit
+    o.f32(pixels_per_unit);
     o.f32(pivot[0]).f32(pivot[1]);
     o.u32(1); // m_Extrude
     if !unity_6000_5 {
@@ -354,7 +405,7 @@ pub fn sprite(
         texture_rect[2],
         texture_rect[3],
     );
-    o.f32(0.0).f32(0.0); // textureRectOffset
+    o.f32(rect_offset[0]).f32(rect_offset[1]); // textureRectOffset
     o.f32(0.0).f32(0.0); // atlasRectOffset
     o.u32(settings);
     o.zeros(16); // uvTransform
@@ -391,6 +442,8 @@ pub fn atlas_with(
             o.i32(0); // secondaryTextures
         }
     }
+    o.string("tag"); // m_Tag
+    o.bool(false).align(); // m_IsVariant
     o.buf
 }
 
@@ -534,6 +587,59 @@ pub fn lz4_literals(data: &[u8]) -> Vec<u8> {
     out
 }
 
+/// An LZ4 block with real matches (greedy, naive search), so readers see the match path.
+pub fn lz4_compress(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    let mut anchor = 0;
+    let push_len = |out: &mut Vec<u8>, mut n: usize| {
+        while n >= 255 {
+            out.push(255);
+            n -= 255;
+        }
+        out.push(n as u8);
+    };
+    // The last five bytes are always literals, as the format requires.
+    while i + 12 <= data.len() {
+        let mut best = (0, 0);
+        let lo = i.saturating_sub(65535);
+        for j in lo..i {
+            let mut n = 0;
+            while i + n + 5 < data.len() && data[j + n] == data[i + n] {
+                n += 1;
+            }
+            if n >= 4 && n > best.1 {
+                best = (i - j, n);
+            }
+        }
+        if best.1 < 4 {
+            i += 1;
+            continue;
+        }
+        let (offset, len) = best;
+        let lits = i - anchor;
+        let ml = len - 4;
+        out.push(((lits.min(15) as u8) << 4) | ml.min(15) as u8);
+        if lits >= 15 {
+            push_len(&mut out, lits - 15);
+        }
+        out.extend(&data[anchor..i]);
+        out.extend((offset as u16).to_le_bytes());
+        if ml >= 15 {
+            push_len(&mut out, ml - 15);
+        }
+        i += len;
+        anchor = i;
+    }
+    let lits = data.len() - anchor;
+    out.push((lits.min(15) as u8) << 4);
+    if lits >= 15 {
+        push_len(&mut out, lits - 15);
+    }
+    out.extend(&data[anchor..]);
+    out
+}
+
 /// Unity's LZMA framing: properties and dictionary size, then the stream, no length field.
 pub fn lzma(data: &[u8]) -> Vec<u8> {
     use lzma_rs::compress::{Options, UnpackedSize};
@@ -559,11 +665,13 @@ pub struct BundleOpts {
     /// Set flag 0x200 and pad before the blocks, as newer engines do.
     pub padding_flag: bool,
     pub extra_flags: u32,
+    /// Pad the header to 16 bytes even at format 6, as 2019.4.15 and later do.
+    pub align_header: bool,
 }
 
 impl BundleOpts {
-    pub fn new(format: u32, revision: &str) -> BundleOpts {
-        BundleOpts {
+    pub fn new(format: u32, revision: &str) -> Self {
+        Self {
             format,
             revision: revision.into(),
             blocks: vec![2, 1],
@@ -571,6 +679,7 @@ impl BundleOpts {
             info_at_end: false,
             padding_flag: false,
             extra_flags: 0,
+            align_header: false,
         }
     }
 }
@@ -579,6 +688,7 @@ fn compress(kind: u16, data: &[u8]) -> Vec<u8> {
     match kind {
         0 => data.to_vec(),
         1 => lzma(data),
+        4 => lz4_compress(data),
         _ => lz4_literals(data),
     }
 }
@@ -592,7 +702,12 @@ pub fn bundle(opts: &BundleOpts, entries: &[(&str, &[u8], u32)]) -> Vec<u8> {
     let mut blocks = Vec::new();
     for (i, part) in stream.chunks(chunk).enumerate() {
         let kind = opts.blocks[i.min(opts.blocks.len() - 1)];
-        blocks.push((part.len(), compress(kind, part), kind));
+        // Kind 4 is LZ4 with matches, written as the LZ4 flag.
+        blocks.push((
+            part.len(),
+            compress(kind, part),
+            if kind == 4 { 2 } else { kind },
+        ));
     }
     let mut info = vec![0u8; 16];
     info.extend((blocks.len() as i32).to_be_bytes());
@@ -629,7 +744,7 @@ pub fn bundle(opts: &BundleOpts, entries: &[(&str, &[u8], u32)]) -> Vec<u8> {
     out.extend((info_c.len() as u32).to_be_bytes());
     out.extend((info.len() as u32).to_be_bytes());
     out.extend(flags.to_be_bytes());
-    if opts.format >= 7 {
+    if opts.format >= 7 || opts.align_header {
         out.resize(out.len().div_ceil(16) * 16, 0);
     }
     if !opts.info_at_end {
@@ -661,7 +776,7 @@ pub fn flip(rgba: &[u8], width: usize) -> Vec<u8> {
 pub struct TempDir(pub std::path::PathBuf);
 
 impl TempDir {
-    pub fn new(tag: &str) -> TempDir {
+    pub fn new(tag: &str) -> Self {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static N: AtomicUsize = AtomicUsize::new(0);
         let dir = std::env::temp_dir().join(format!(
@@ -670,7 +785,7 @@ impl TempDir {
             N.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        TempDir(dir)
+        Self(dir)
     }
 
     pub fn file(&self, name: &str, bytes: &[u8]) -> std::path::PathBuf {

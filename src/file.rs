@@ -1,101 +1,173 @@
 //! Opening files: regular files only, and never a blocking open on a FIFO or device. Files
-//! named by untrusted data (stream files) also may not be symbolic links; a file the caller
-//! chose may be.
+//! named by untrusted data (stream files) also may not be symbolic links or carry other hard
+//! links; a file the caller chose may be a link.
+//!
+//! Where the platform's flag values are known, the open itself does not block, does not take
+//! a controlling terminal, and (for stream files) refuses links. On Unix the opened file must
+//! be the one that was checked. On Windows and other platforms a file swapped in between check
+//! and open is not detected.
 
 use crate::{Error, Result};
 
-use std::fs::{File, OpenOptions};
+use std::fs::{File, Metadata, OpenOptions};
 use std::path::Path;
 
-/// Open `path` for reading if it is a regular file, and, unless `follow_links`, not a
-/// symbolic link.
-///
-/// The check is made before the open; where the platform flags are known the open itself
-/// does not block (and, without `follow_links`, refuses links), and on Unix the opened file
-/// must be the one that was checked. Elsewhere a file swapped in between check and open is not
-/// detected.
-pub fn open_regular(path: &Path, follow_links: bool) -> Result<(File, u64)> {
-    let before = if follow_links {
-        std::fs::metadata(path)
-    } else {
-        std::fs::symlink_metadata(path)
+/// Who chose the file.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Chosen {
+    /// The caller: links are followed.
+    ByCaller,
+    /// The data: no symbolic links, no other hard links.
+    ByData,
+}
+
+/// Open `path` for reading if it is a regular file, following [`Chosen`]'s rules.
+pub(crate) fn open_regular(path: &Path, chosen: Chosen) -> Result<(File, u64)> {
+    let before = match chosen {
+        Chosen::ByCaller => std::fs::metadata(path),
+        Chosen::ByData => std::fs::symlink_metadata(path),
     }
     .map_err(Error::io(path))?;
     if !before.file_type().is_file() {
-        return Err(Error::Unsupported(format!(
+        return Err(not_regular(path, chosen));
+    }
+    let file = open_flagged(path, chosen)?;
+    let after = file.metadata().map_err(Error::io(path))?;
+    check_opened(path, chosen, &before, &after)?;
+    Ok((file, after.len()))
+}
+
+fn not_regular(path: &Path, chosen: Chosen) -> Error {
+    match chosen {
+        Chosen::ByCaller => Error::Io {
+            path: path.to_path_buf(),
+            error: std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a regular file"),
+        },
+        Chosen::ByData => Error::Unsupported(format!(
             "{:?} is not a regular file",
             path.display().to_string()
-        )));
+        )),
     }
-    let mut options = OpenOptions::new();
-    options.read(true);
-    open_flags(&mut options, follow_links);
-    let file = options.open(path).map_err(Error::io(path))?;
-    let after = file.metadata().map_err(Error::io(path))?;
-    if !after.is_file() || !same_file(&before, &after) {
+}
+
+/// The opened file must be a regular file, the one checked before opening, and, when the
+/// data chose it, have no other hard links (a hard link reaches outside the folder as surely
+/// as a symbolic one).
+fn check_opened(path: &Path, chosen: Chosen, before: &Metadata, after: &Metadata) -> Result<()> {
+    if !after.is_file() {
+        return Err(not_regular(path, chosen));
+    }
+    if !same_file(before, after) {
         return Err(Error::Unsupported(format!(
             "{:?} changed while it was being opened",
             path.display().to_string()
         )));
     }
-    Ok((file, after.len()))
+    if chosen == Chosen::ByData && links(after) > 1 {
+        return Err(Error::Unsupported(format!(
+            "{:?} has other hard links",
+            path.display().to_string()
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
-fn same_file(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
+fn same_file(a: &Metadata, b: &Metadata) -> bool {
     use std::os::unix::fs::MetadataExt;
     a.dev() == b.dev() && a.ino() == b.ino()
 }
 
 #[cfg(not(unix))]
-fn same_file(_: &std::fs::Metadata, _: &std::fs::Metadata) -> bool {
+const fn same_file(_: &Metadata, _: &Metadata) -> bool {
     true
 }
 
-/// `O_NONBLOCK`, and `O_NOFOLLOW` unless `follow_links`, where their values are certain.
-fn open_flags(options: &mut OpenOptions, follow_links: bool) {
-    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
-    const FLAGS: (i32, i32) = (0x0004, 0x0100);
-    #[cfg(all(
-        any(target_os = "linux", target_os = "android"),
-        any(target_arch = "x86_64", target_arch = "x86", target_arch = "riscv64")
-    ))]
-    const FLAGS: (i32, i32) = (0o4000, 0o400000);
-    #[cfg(all(
-        any(target_os = "linux", target_os = "android"),
-        any(target_arch = "aarch64", target_arch = "arm")
-    ))]
-    const FLAGS: (i32, i32) = (0o4000, 0o100000);
+#[cfg(unix)]
+fn links(m: &Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    m.nlink()
+}
+
+#[cfg(not(unix))]
+const fn links(_: &Metadata) -> u64 {
+    1
+}
+
+/// `(O_NONBLOCK, O_NOFOLLOW, O_NOCTTY)` for this target, where the values are certain.
+#[allow(clippy::unnecessary_wraps)]
+const fn flags() -> Option<(i32, i32, i32)> {
     #[cfg(any(
-        any(target_os = "macos", target_os = "ios", target_os = "freebsd"),
-        all(
-            any(target_os = "linux", target_os = "android"),
-            any(
-                target_arch = "x86_64",
-                target_arch = "x86",
-                target_arch = "riscv64",
-                target_arch = "aarch64",
-                target_arch = "arm"
-            )
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "visionos"
+    ))]
+    return Some((0x0004, 0x0100, 0x20000));
+    #[cfg(any(
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    ))]
+    return Some((0x0004, 0x0100, 0x8000));
+    #[cfg(target_os = "illumos")]
+    return Some((0x80, 0x20000, 0x800));
+    #[cfg(all(
+        any(target_os = "linux", target_os = "android"),
+        any(
+            target_arch = "x86_64",
+            target_arch = "x86",
+            target_arch = "riscv64",
+            target_arch = "loongarch64",
+            target_arch = "s390x"
         )
     ))]
-    {
+    return Some((0o4000, 0o400000, 0o400));
+    #[cfg(all(
+        any(target_os = "linux", target_os = "android"),
+        any(
+            target_arch = "aarch64",
+            target_arch = "arm",
+            target_arch = "powerpc",
+            target_arch = "powerpc64"
+        )
+    ))]
+    return Some((0o4000, 0o100000, 0o400));
+    #[cfg(all(target_os = "linux", any(target_arch = "mips", target_arch = "mips64")))]
+    return Some((0x80, 0x20000, 0x800));
+    #[cfg(all(target_os = "linux", target_arch = "sparc64"))]
+    return Some((0x4000, 0x20000, 0x8000));
+    #[allow(unreachable_code)]
+    None
+}
+
+/// Open with the flags above: never blocking, never a controlling terminal, and no links
+/// when the data chose the file.
+pub(crate) fn open_flagged(path: &Path, chosen: Chosen) -> Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    if let Some((nonblock, nofollow, noctty)) = flags() {
         use std::os::unix::fs::OpenOptionsExt;
-        let (nonblock, nofollow) = FLAGS;
-        options.custom_flags(if follow_links {
-            nonblock
+        let follow = if chosen == Chosen::ByData {
+            nofollow
         } else {
-            nonblock | nofollow
-        });
+            0
+        };
+        options.custom_flags(nonblock | noctty | follow);
     }
-    let _ = (options, follow_links);
+    #[cfg(not(unix))]
+    let _ = chosen;
+    options.open(path).map_err(Error::io(path))
 }
 
 /// Read a whole file the caller chose, under a size limit, refusing anything irregular. A
 /// file that grows past the limit while being read is refused too.
-pub fn read_limited(path: &Path, limit: u64) -> Result<Vec<u8>> {
+pub(crate) fn read_limited(path: &Path, limit: u64) -> Result<Vec<u8>> {
     use std::io::Read;
-    let (file, len) = open_regular(path, true)?;
+    let (file, len) = open_regular(path, Chosen::ByCaller)?;
     Error::limit(crate::LimitKind::FileSize, len, limit)?;
     let mut data = Vec::with_capacity(usize::try_from(len).unwrap_or(0));
     file.take(limit.saturating_add(1))
@@ -103,4 +175,51 @@ pub fn read_limited(path: &Path, limit: u64) -> Result<Vec<u8>> {
         .map_err(Error::io(path))?;
     Error::limit(crate::LimitKind::FileSize, data.len() as u64, limit)?;
     Ok(data)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    fn dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("uba-file-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn test_a_file_swapped_after_the_check_is_refused() {
+        let d = dir("swap");
+        let (a, b) = (d.join("a.resS"), d.join("b.resS"));
+        std::fs::write(&a, b"a").unwrap();
+        std::fs::write(&b, b"b").unwrap();
+        let before = std::fs::symlink_metadata(&a).unwrap();
+        let after = File::open(&b).unwrap().metadata().unwrap();
+        let err = check_opened(&b, Chosen::ByData, &before, &after).unwrap_err();
+        assert!(err.to_string().contains("changed"), "{err}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn test_the_open_itself_refuses_symbolic_links() {
+        assert!(flags().is_some(), "flags unknown for this target");
+        let d = dir("nofollow");
+        std::fs::write(d.join("real"), b"x").unwrap();
+        std::os::unix::fs::symlink(d.join("real"), d.join("link.resS")).unwrap();
+        // Skip the metadata check and open directly: the flags alone must refuse the link.
+        assert!(open_flagged(&d.join("link.resS"), Chosen::ByData).is_err());
+        assert!(open_flagged(&d.join("link.resS"), Chosen::ByCaller).is_ok());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn test_hard_links_are_refused_for_data_but_not_the_caller() {
+        let d = dir("hardlink");
+        std::fs::write(d.join("real"), b"x").unwrap();
+        std::fs::hard_link(d.join("real"), d.join("x.resS")).unwrap();
+        let err = open_regular(&d.join("x.resS"), Chosen::ByData).unwrap_err();
+        assert!(err.to_string().contains("hard links"), "{err}");
+        assert!(open_regular(&d.join("x.resS"), Chosen::ByCaller).is_ok());
+        let _ = std::fs::remove_dir_all(&d);
+    }
 }

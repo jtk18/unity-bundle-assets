@@ -16,3 +16,29 @@ thiserror = "2"
 
 [dev-dependencies]
 image = { version = "0.25", default-features = false, features = ["png"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+# Binary formats are all fixed-width integers and floats; each conversion is range-checked
+# where the value comes from the file, and these lints cannot see that.
+cast_possible_truncation = "allow"
+cast_possible_wrap = "allow"
+cast_sign_loss = "allow"
+cast_precision_loss = "allow"
+cast_lossless = "allow"
+float_cmp = "allow"
+many_single_char_names = "allow"
+module_name_repetitions = "allow"
+# Parsers read one field after another; splitting them hides the layout.
+too_many_lines = "allow"
+# `mul_add` rounds differently from the engine and from UnityPy, whose output is the reference.
+suboptimal_flops = "allow"
+# Conflicts with rustc's own `unreachable_pub`.
+redundant_pub_crate = "allow"
+# Names like UnityPy and SpriteAtlas are prose here, not code.
+doc_markdown = "allow"

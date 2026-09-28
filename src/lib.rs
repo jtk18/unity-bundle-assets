@@ -37,17 +37,26 @@
 //! Files are treated as hostile:
 //!
 //! - Counts and lengths are checked against the bytes present before they size an
-//!   allocation, and objects may not overlap, so one blob cannot be read many times over.
+//!   allocation. Objects in a file, entries in a bundle, and the stream ranges textures read
+//!   may not overlap, so one blob cannot be decoded many times over.
 //! - Sizes the data alone cannot bound are held to [`Limits`]: file size, decompressed bundle
-//!   size (the parsed directory included), decoded pixels, sprite meshes, and the total work
-//!   one [`Assets`] may spend decoding, cutting and masking.
+//!   size (the parsed directory included), object count, decoded pixels, sprite meshes, and
+//!   the total work spent decoding, cutting and masking, shared by everything opened from one
+//!   file or bundle. They bound work, not peak memory: at the default 16384 x 16384, one
+//!   decoded texture can hold 1 to 2 GiB and a sprite exported from it 2 to 3 GiB.
 //! - Streamed pixels are read only from the same bundle, or from a `.resS` / `.resource` file
-//!   directly beside the asset file that is a regular file and not a symbolic link.
+//!   directly beside the asset file that is a regular file, not a symbolic link, and has no
+//!   other hard links.
 //! - Strings from the file are quoted in error messages, so printing an error cannot send
-//!   control sequences to a terminal.
+//!   control sequences to a terminal. The strings themselves (names, paths, versions) are
+//!   returned as found; escape them before printing.
 //!
-//! Malformed data is meant to give an [`Error`] rather than a panic. `tests/fuzz.rs` mutates
-//! files and checks for that; it is evidence, not proof.
+//! [`Limits`] are enforced by [`Assets`] and by the parsers ([`Bundle::parse_with`],
+//! [`SerializedFile::parse_with`]). The object readers and [`decode::decode`], used directly,
+//! do not track total work.
+//!
+//! Malformed data is meant to give an [`Error`] rather than a panic. `tests/fuzz.rs` checks
+//! that over mutated files; it is evidence, not proof.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs, missing_debug_implementations)]
@@ -67,16 +76,20 @@ pub use serialized::{class, External, ObjectInfo, SerializedFile, SerializedType
 pub use sprite::{PPtr, Placement, Rect, RenderDataKey, Rotation, Settings, Sprite, SpriteAtlas};
 pub use texture::{is_console_platform, StreamingInfo, Texture2D};
 
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 /// The README's examples, compiled as doc tests.
 #[cfg(doctest)]
 #[doc = include_str!("../README.md")]
 pub struct ReadmeDoctests;
 
-/// Everything that can go wrong reading a file. Strings that came from a file are quoted
-/// (`{:?}`) when displayed.
+/// Everything that can go wrong reading a file.
+///
+/// Strings that came from a file are quoted (`{:?}`) when displayed. Each message is complete: an underlying cause is part of it rather
+/// than a separate [`std::error::Error::source`].
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
@@ -102,7 +115,7 @@ pub enum Error {
     #[error("unsupported: {0}")]
     Unsupported(String),
     /// A texture in a pixel format this crate does not decode.
-    #[error("texture {texture:?}: unsupported texture format {format}")]
+    #[error("{}unsupported texture format {format}", texture_label(texture.as_deref()))]
     #[non_exhaustive]
     UnsupportedTextureFormat {
         /// The texture's name, when known.
@@ -139,13 +152,13 @@ pub enum Error {
         expected: i32,
     },
     /// A sprite atlas that could not be read, which spoils the sprites packed into it.
-    #[error("sprite atlas {atlas} could not be read: {source}")]
+    #[error("sprite atlas {atlas} could not be read: {error}")]
     #[non_exhaustive]
     AtlasUnreadable {
         /// The atlas's path ID.
         atlas: i64,
-        /// Why.
-        source: Arc<Self>,
+        /// Why; shared by every sprite in the atlas.
+        error: Arc<Self>,
     },
     /// A texture stored with no pixels, as dynamic font textures are; it is filled at run
     /// time.
@@ -155,28 +168,25 @@ pub enum Error {
     #[error("invalid file: {0}")]
     Invalid(String),
     /// Reading a file from disk failed.
-    #[error("{}: {source}", io_label(path.as_ref()))]
+    #[error("{:?}: {error}", path.display().to_string())]
     #[non_exhaustive]
     Io {
-        /// The file, when there was one.
-        path: Option<PathBuf>,
-        /// The underlying error.
-        source: std::io::Error,
+        /// The file.
+        path: PathBuf,
+        /// What went wrong.
+        error: std::io::Error,
     },
 }
 
-fn io_label(path: Option<&PathBuf>) -> String {
-    path.map_or_else(
-        || "I/O".into(),
-        |p| format!("{:?}", p.display().to_string()),
-    )
+fn texture_label(name: Option<&str>) -> String {
+    name.map_or_else(String::new, |n| format!("texture {n:?}: "))
 }
 
 impl Error {
     pub(crate) fn io(path: &std::path::Path) -> impl FnOnce(std::io::Error) -> Self + '_ {
-        move |source| Self::Io {
-            path: Some(path.to_path_buf()),
-            source,
+        move |error| Self::Io {
+            path: path.to_path_buf(),
+            error,
         }
     }
 
@@ -196,6 +206,8 @@ pub enum LimitKind {
     FileSize,
     /// [`Limits::max_decompressed`].
     Decompressed,
+    /// [`Limits::max_objects`].
+    Objects,
     /// [`Limits::max_texture_pixels`].
     TexturePixels,
     /// [`Limits::max_sprite_triangles`].
@@ -213,6 +225,7 @@ impl std::fmt::Display for LimitKind {
         f.write_str(match self {
             Self::FileSize => "file size",
             Self::Decompressed => "decompressed bundle size",
+            Self::Objects => "object count",
             Self::TexturePixels => "texture pixels",
             Self::SpriteTriangles => "sprite mesh triangles",
             Self::TotalTriangles => "sprite mesh triangles in this list",
@@ -241,17 +254,21 @@ pub struct Limits {
     /// Largest decompressed size of a bundle in bytes, counting the parsed directory at its
     /// in-memory size. Default 1 GiB.
     pub max_decompressed: u64,
+    /// Most objects in one serialized file. Default 4,194,304.
+    pub max_objects: u64,
     /// Most pixels in one texture this crate will decode. Default 16384 x 16384, Unity's
-    /// own maximum; a decoded texture that size is 1 GiB.
+    /// own maximum. Decoding one that size peaks at 1-2 GiB, exporting a sprite from it at 2-3.
     pub max_texture_pixels: u64,
     /// Most triangles in one sprite's mesh. Default 65,536.
     pub max_sprite_triangles: u64,
     /// Most triangles across the sprites one [`Assets::sprites`] call returns. Default
     /// 4,194,304.
     pub max_total_triangles: u64,
-    /// Most pixel tests spent masking one tight-packed sprite. Default 2^28.
+    /// Most pixel tests spent masking one tight-packed sprite. Default 2^29, enough for a
+    /// two-triangle mesh over a 16384 x 16384 sprite.
     pub max_mask_work: u64,
-    /// Most pixels one [`Assets`] may decode, cut and mask, all told. Default 2^36.
+    /// Most pixels decoded, cut and masked, all told, across everything opened from one file
+    /// or bundle. Default 2^34.
     pub max_total_work: u64,
 }
 
@@ -260,11 +277,12 @@ impl Limits {
     pub const DEFAULT: Self = Self {
         max_file_size: 2 << 30,
         max_decompressed: 1 << 30,
+        max_objects: 1 << 22,
         max_texture_pixels: 16384 * 16384,
         max_sprite_triangles: 1 << 16,
         max_total_triangles: 1 << 22,
-        max_mask_work: 1 << 28,
-        max_total_work: 1 << 36,
+        max_mask_work: 1 << 29,
+        max_total_work: 1 << 34,
     };
 
     /// With [`Limits::max_file_size`] set.
@@ -278,6 +296,13 @@ impl Limits {
     #[must_use]
     pub const fn with_max_decompressed(mut self, v: u64) -> Self {
         self.max_decompressed = v;
+        self
+    }
+
+    /// With [`Limits::max_objects`] set.
+    #[must_use]
+    pub const fn with_max_objects(mut self, v: u64) -> Self {
+        self.max_objects = v;
         self
     }
 
@@ -323,13 +348,119 @@ impl Default for Limits {
     }
 }
 
-/// An engine version: `2022.3.62f3` is `[2022, 3, 62]` of release type `f`. Anything that
-/// does not parse is `[0, 0, 0]`.
+/// Work done and stream ranges read, shared by everything opened from one file or bundle, so
+/// opening a bundle's files one by one does not multiply the budget.
+#[derive(Debug, Default)]
+pub(crate) struct Shared {
+    work: AtomicU64,
+    /// Stream file or entry -> start -> (end, the texture that read it).
+    streams: Mutex<HashMap<String, Claims>>,
+}
+
+/// One stream's claimed ranges: start -> (end, owner). The ranges never overlap.
+type Claims = BTreeMap<u64, (u64, String)>;
+
+/// Work reserved against [`Limits::max_total_work`], given back when dropped unless kept:
+/// work that fails before it is done costs nothing.
+pub(crate) struct Reservation<'a> {
+    shared: &'a Shared,
+    amount: u64,
+    keep: bool,
+}
+
+impl Reservation<'_> {
+    pub fn keep(mut self) {
+        self.keep = true;
+    }
+}
+
+impl Drop for Reservation<'_> {
+    fn drop(&mut self) {
+        if !self.keep {
+            self.shared.work.fetch_sub(self.amount, Ordering::Relaxed);
+        }
+    }
+}
+
+impl Shared {
+    /// Reserve `amount` of work, or refuse without taking any.
+    pub fn reserve(&self, amount: u64, limit: u64) -> Result<Reservation<'_>> {
+        self.work
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |w| {
+                w.checked_add(amount).filter(|&t| t <= limit)
+            })
+            .map_err(|w| Error::LimitExceeded {
+                kind: LimitKind::TotalWork,
+                value: w.saturating_add(amount),
+                limit,
+            })?;
+        Ok(Reservation {
+            shared: self,
+            amount,
+            keep: false,
+        })
+    }
+
+    pub fn work(&self) -> u64 {
+        self.work.load(Ordering::Relaxed)
+    }
+
+    /// Record that `owner` reads `start..end` of `stream`, refusing a range another texture
+    /// already read any part of: one blob decoded many times over.
+    #[allow(clippy::significant_drop_tightening)] // the check and the insert are one step
+    pub fn claim_stream(&self, stream: &str, start: u64, end: u64, owner: &str) -> Result<()> {
+        let mut streams = self
+            .streams
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let ranges = streams.entry(stream.to_string()).or_default();
+        if let Some((&s, (e, who))) = ranges.range(..end).next_back() {
+            let same = s == start && *e == end && who == owner;
+            if *e > start && !same {
+                return Err(Error::Invalid(format!(
+                    "{owner} streams bytes {start}..{end} of {stream:?}, which {who} already \
+                     read ({s}..{e})"
+                )));
+            }
+            if same {
+                return Ok(());
+            }
+        }
+        ranges.insert(start, (end, owner.to_string()));
+        Ok(())
+    }
+}
+
+/// Longest engine version string accepted; real ones are under 20 bytes.
+const MAX_VERSION_LEN: usize = 32;
+
+/// Refuse an engine version string that is too long or holds anything but the letters,
+/// digits, dots and dashes versions are made of.
+pub(crate) fn check_version_string(version: &str, what: &str) -> Result<()> {
+    let plausible = version.len() <= MAX_VERSION_LEN
+        && version
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-');
+    if plausible {
+        Ok(())
+    } else {
+        Err(Error::NotUnity(format!(
+            "{what} engine version is not a version ({} bytes)",
+            version.len()
+        )))
+    }
+}
+
+/// An engine version: `2022.3.62f3` is `[2022, 3, 62]`, release type `f`, build 3. Anything
+/// that does not parse is `[0, 0, 0]`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Version {
     pub numbers: [u32; 3],
-    /// `a` alpha, `b` beta, `f` final, `p` patch, `c` China, `x` experimental; `\0` if none.
+    /// `a` alpha, `b` beta, `f` final, `p` patch, `c` China, `t` Tuanjie, `x` experimental;
+    /// `\0` if none.
     pub kind: char,
+    /// The number after the release type.
+    pub build: u32,
 }
 
 impl Version {
@@ -341,25 +472,46 @@ impl Version {
         for slot in &mut numbers {
             *slot = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
         }
-        let kind = version
-            .trim_start_matches(|c: char| c.is_ascii_digit() || c == '.')
+        let rest = version.trim_start_matches(|c: char| c.is_ascii_digit() || c == '.');
+        let kind = rest.chars().next().unwrap_or('\0');
+        let build = rest
+            .get(kind.len_utf8()..)
+            .unwrap_or("")
             .chars()
-            .next()
-            .unwrap_or('\0');
-        Self { numbers, kind }
+            .take_while(char::is_ascii_digit)
+            .collect::<String>()
+            .parse()
+            .unwrap_or(0);
+        Self {
+            numbers,
+            kind,
+            build,
+        }
     }
 
     pub fn stripped(&self) -> bool {
         self.numbers == [0, 0, 0]
     }
+
+    /// Whether this is at least `numbers` of type `kind` build `build`: alphas come before
+    /// betas, betas before every released build of the same numbers.
+    pub fn at_least(&self, numbers: [u32; 3], kind: char, build: u32) -> bool {
+        let rank = |k: char| match k {
+            'a' => 0,
+            'b' => 1,
+            _ => 2,
+        };
+        (self.numbers, rank(self.kind), self.build) >= (numbers, rank(kind), build)
+    }
 }
 
-/// The newest engine release whose layouts this crate was checked against, final builds
-/// included. Files from later releases are refused rather than guessed at.
+/// The newest engine release whose layouts this crate was checked against. Files from later
+/// releases are refused rather than guessed at.
 pub(crate) const NEWEST_KNOWN: [u32; 2] = [6000, 4];
 
 /// Refuse object layouts from releases outside `[oldest, NEWEST_KNOWN]`, alpha builds (whose
-/// layouts shift between builds), and files whose engine version was stripped.
+/// layouts shift between builds), engine variants whose layouts are unchecked, and files whose
+/// engine version was stripped.
 pub(crate) fn check_release(version: &str, what: &str, oldest: [u32; 3]) -> Result<()> {
     let v = Version::parse(version);
     if v.stripped() {
@@ -379,12 +531,15 @@ pub(crate) fn check_release(version: &str, what: &str, oldest: [u32; 3]) -> Resu
             NEWEST_KNOWN[0], NEWEST_KNOWN[1]
         )));
     }
-    if v.kind == 'a' {
-        return Err(Error::Unsupported(format!(
+    match v.kind {
+        'a' => Err(Error::Unsupported(format!(
             "{what} from Unity {version:?}, an alpha build; layouts change between alphas"
-        )));
+        ))),
+        't' | 'x' => Err(Error::Unsupported(format!(
+            "{what} from Unity {version:?}, an engine variant whose layouts are unchecked"
+        ))),
+        _ => Ok(()),
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -394,25 +549,91 @@ mod tests {
     #[test]
     fn test_version_parse() {
         let v = Version::parse("2022.3.62f3");
-        assert_eq!((v.numbers, v.kind), ([2022, 3, 62], 'f'));
+        assert_eq!((v.numbers, v.kind, v.build), ([2022, 3, 62], 'f', 3));
         let v = Version::parse("6000.5.0a5");
-        assert_eq!((v.numbers, v.kind), ([6000, 5, 0], 'a'));
+        assert_eq!((v.numbers, v.kind, v.build), ([6000, 5, 0], 'a', 5));
+        let v = Version::parse("2020.3.48f1c1");
+        assert_eq!((v.numbers, v.kind, v.build), ([2020, 3, 48], 'f', 1));
         assert!(Version::parse("0.0.0").stripped());
         assert!(Version::parse("").stripped());
+    }
+
+    #[test]
+    fn test_version_order() {
+        let at = |v: &str| Version::parse(v).at_least([2022, 2, 0], 'b', 3);
+        assert!(!at("2022.2.0b2"));
+        assert!(at("2022.2.0b3"));
+        assert!(at("2022.2.0f1"));
+        assert!(at("2022.2.1b1"));
+        assert!(!at("2022.1.24f1"));
+        assert!(!at("2022.2.0a18"));
     }
 
     #[test]
     fn test_check_release() {
         assert!(check_release("2022.3.62f3", "x", [5, 5, 0]).is_ok());
         assert!(check_release("2019.1.0b5", "x", [2019, 1, 0]).is_ok());
-        assert!(check_release("2023.2.0a17", "x", [5, 5, 0]).is_err());
-        assert!(check_release("6000.5.0f1", "x", [5, 5, 0]).is_err());
+        assert!(check_release("2020.3.48f1c1", "x", [5, 5, 0]).is_ok());
+        for refused in [
+            "2023.2.0a17",
+            "6000.5.0f1",
+            "5.4.0f1",
+            "2022.3.2t3",
+            "2022.3.0x1",
+        ] {
+            assert!(check_release(refused, "x", [5, 5, 0]).is_err(), "{refused}");
+        }
         assert!(check_release("6000.4.3f1", "x", [5, 5, 0]).is_ok());
-        assert!(check_release("5.4.0f1", "x", [5, 5, 0]).is_err());
         let stripped = check_release("0.0.0", "x", [5, 5, 0])
             .unwrap_err()
             .to_string();
         assert!(stripped.contains("stripped"), "{stripped}");
+    }
+
+    #[test]
+    fn test_version_strings() {
+        assert!(check_version_string("2022.3.62f3", "x").is_ok());
+        assert!(check_version_string("5.x.x", "x").is_ok());
+        assert!(check_version_string("", "x").is_ok());
+        assert!(check_version_string(&"1".repeat(33), "x").is_err());
+        assert!(check_version_string("2022.3\u{1}", "x").is_err());
+    }
+
+    #[test]
+    fn test_defaults_are_as_documented() {
+        let d = Limits::default();
+        assert_eq!(d, Limits::DEFAULT);
+        assert_eq!(d.max_file_size, 2 << 30);
+        assert_eq!(d.max_decompressed, 1 << 30);
+        assert_eq!(d.max_objects, 1 << 22);
+        assert_eq!(d.max_texture_pixels, 16384 * 16384);
+        assert_eq!(d.max_sprite_triangles, 1 << 16);
+        assert_eq!(d.max_total_triangles, 1 << 22);
+        assert_eq!(d.max_mask_work, 1 << 29);
+        assert_eq!(d.max_total_work, 1 << 34);
+    }
+
+    #[test]
+    fn test_error_messages() {
+        let e = Error::UnsupportedTextureFormat {
+            texture: Some("t".into()),
+            format: 25,
+        };
+        assert_eq!(
+            e.to_string(),
+            "texture \"t\": unsupported texture format 25"
+        );
+        let e = Error::UnsupportedTextureFormat {
+            texture: None,
+            format: 25,
+        };
+        assert_eq!(e.to_string(), "unsupported texture format 25");
+        let e = Error::Io {
+            path: "/x".into(),
+            error: std::io::Error::other("boom"),
+        };
+        assert_eq!(e.to_string(), "\"/x\": boom");
+        assert!(std::error::Error::source(&e).is_none());
     }
 
     #[test]

@@ -33,6 +33,11 @@ impl<'a> Reader<'a> {
         }
     }
 
+    /// The cursor's offset.
+    pub const fn pos(&self) -> usize {
+        self.pos
+    }
+
     /// Bytes left after the cursor.
     pub const fn remaining(&self) -> usize {
         self.data.len().saturating_sub(self.pos)

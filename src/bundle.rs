@@ -5,7 +5,9 @@
 //! The layout follows `UnityPy`'s `BundleFile` reader (MIT, see NOTICE).
 
 use crate::reader::Reader;
-use crate::{Error, LimitKind, Limits, Result, Version};
+use crate::{check_version_string, Error, LimitKind, Limits, Result, Shared, Version};
+
+use std::sync::Arc;
 
 use std::collections::HashMap;
 
@@ -66,10 +68,13 @@ pub struct Bundle {
     unity_version: String,
     unity_revision: String,
     entries: Vec<Entry>,
-    /// Entry index by path, and by `/` + the file name after the last `/`; first one wins.
+    /// Entry index by path, and by the file name after the last `/`; first one wins.
     by_path: HashMap<String, usize>,
+    by_name: HashMap<String, usize>,
     data: Vec<u8>,
     limits: Limits,
+    /// Work done and stream ranges read, shared by every [`crate::Assets`] opened from here.
+    shared: Arc<Shared>,
 }
 
 impl std::fmt::Debug for Bundle {
@@ -80,7 +85,7 @@ impl std::fmt::Debug for Bundle {
             .field("unity_revision", &self.unity_revision)
             .field("entries", &self.entries.len())
             .field("bytes", &self.data.len())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -136,8 +141,15 @@ impl Bundle {
         let mut r = Reader::new(file, true);
         r.cstr()?;
         let format = r.u32()?;
+        if !(6..=8).contains(&format) {
+            return Err(Error::Unsupported(format!(
+                "UnityFS container format {format} (supported: 6-8)"
+            )));
+        }
         let unity_version = r.cstr()?;
         let unity_revision = r.cstr()?;
+        check_version_string(&unity_version, "bundle player")?;
+        check_version_string(&unity_revision, "bundle")?;
         let declared_size = r.i64()?;
         let info_compressed = r.u32()? as usize;
         let info_size = r.u32()? as usize;
@@ -216,7 +228,10 @@ impl Bundle {
         charged += total;
         Error::limit(LimitKind::Decompressed, charged, budget)?;
         let entry_count = ir.len(21)?;
-        charged += entry_count as u64 * (std::mem::size_of::<Entry>() + 16) as u64;
+        // Each entry is held once and indexed twice (by path and by file name).
+        let per_entry =
+            std::mem::size_of::<Entry>() + 2 * (std::mem::size_of::<(String, usize)>() + 16);
+        charged += entry_count as u64 * per_entry as u64;
         Error::limit(LimitKind::Decompressed, charged, budget)?;
         let mut entries = Vec::with_capacity(entry_count);
         for _ in 0..entry_count {
@@ -224,7 +239,7 @@ impl Bundle {
             let size = ir.i64()?;
             let flags = ir.u32()?;
             let path = ir.cstr()?;
-            charged += path.len() as u64;
+            charged += 3 * path.len() as u64;
             Error::limit(LimitKind::Decompressed, charged, budget)?;
             let (Ok(offset), Ok(size)) = (usize::try_from(offset), usize::try_from(size)) else {
                 return Err(Error::Invalid(format!("entry {path:?} at {offset}+{size}")));
@@ -245,10 +260,30 @@ impl Bundle {
             });
         }
 
+        // Unity never writes two entries over the same bytes; allowing it would let a small
+        // bundle name one large file many times over.
+        let mut spans: Vec<(usize, usize)> = entries
+            .iter()
+            .filter(|e| e.size > 0)
+            .map(|e| (e.offset, e.offset + e.size))
+            .collect();
+        spans.sort_unstable();
+        if spans.windows(2).any(|w| w[1].0 < w[0].1) {
+            return Err(Error::Invalid("bundle entries overlap".into()));
+        }
+        drop(spans);
+
         if new_flags && flags & flags::BLOCK_INFO_NEEDS_PADDING != 0 {
             r.align(16);
         }
+        // `total` is within the limit; reserve it once rather than grow by doubling.
         let mut data = Vec::new();
+        data.try_reserve_exact(usize::try_from(total).unwrap_or(usize::MAX))
+            .map_err(|_| Error::LimitExceeded {
+                kind: LimitKind::Decompressed,
+                value: total,
+                limit: budget,
+            })?;
         for (size, compressed, block_flags) in blocks {
             let block = r.take(compressed)?;
             decompress_into(
@@ -259,13 +294,11 @@ impl Bundle {
             )?;
         }
 
-        let mut by_path = HashMap::with_capacity(entries.len() * 2);
+        let mut by_path = HashMap::with_capacity(entries.len());
+        let mut by_name = HashMap::with_capacity(entries.len());
         for (i, e) in entries.iter().enumerate() {
             by_path.entry(e.path.clone()).or_insert(i);
-        }
-        for (i, e) in entries.iter().enumerate() {
-            let name = e.path.rsplit('/').next().unwrap_or(&e.path);
-            by_path.entry(format!("/{name}")).or_insert(i);
+            by_name.entry(file_name(&e.path).to_string()).or_insert(i);
         }
         Ok(Self {
             format,
@@ -273,8 +306,10 @@ impl Bundle {
             unity_revision,
             entries,
             by_path,
+            by_name,
             data,
             limits,
+            shared: Arc::new(Shared::default()),
         })
     }
 
@@ -320,11 +355,14 @@ impl Bundle {
     /// like `archive:/CAB-.../CAB-....resS`; the directory lists `CAB-....resS`).
     #[must_use]
     pub fn entry(&self, path: &str) -> Option<&Entry> {
-        let name = path.rsplit('/').next().unwrap_or(path);
         self.by_path
             .get(path)
-            .or_else(|| self.by_path.get(&format!("/{name}")))
+            .or_else(|| self.by_name.get(file_name(path)))
             .map(|&i| &self.entries[i])
+    }
+
+    pub(crate) fn shared(&self) -> Arc<Shared> {
+        self.shared.clone()
     }
 
     pub(crate) fn data_ref(&self) -> &[u8] {
@@ -340,6 +378,11 @@ impl Bundle {
     pub fn serialized_files(&self) -> impl Iterator<Item = &Entry> {
         self.entries.iter().filter(|e| e.is_serialized())
     }
+}
+
+/// The part of a path after its last `/`.
+fn file_name(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
 }
 
 /// Append one block, decompressed, to `out`. The block must produce exactly `size` bytes.
@@ -514,8 +557,23 @@ mod tests {
     }
 
     #[test]
+    fn test_lz4_shortest_match_from_one_byte() {
+        // "a", then the shortest match (4) at offset 1: every copy pass has one byte to copy
+        // from at first.
+        assert_eq!(lz4(&[0x10, b'a', 1, 0, 0x00], 5).unwrap(), b"aaaaa");
+        assert!(lz4(&[0x10, b'a', 1, 0, 0x00], 4).is_err());
+        assert!(lz4(&[0x10, b'a', 1, 0, 0x00], 6).is_err());
+    }
+
+    #[test]
     fn test_lz4_refuses_impossible_ratio() {
         let err = lz4(&[0x00], 1 << 20).unwrap_err().to_string();
+        assert!(err.contains("more output than LZ4 can encode"), "{err}");
+        // At the bound the claim is allowed through (and then fails on the real length).
+        let at_bound = LZ4_MAX_RATIO + 16;
+        let err = lz4(&[0x00], at_bound).unwrap_err().to_string();
+        assert!(!err.contains("more output than LZ4 can encode"), "{err}");
+        let err = lz4(&[0x00], at_bound + 1).unwrap_err().to_string();
         assert!(err.contains("more output than LZ4 can encode"), "{err}");
     }
 

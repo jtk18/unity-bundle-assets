@@ -94,7 +94,7 @@ fn streams_must_be_regular_files_holding_the_bytes_claimed() {
     ));
     // A missing stream file names itself.
     match alpha8(&dir, "missing.resS") {
-        Err(Error::Io { path: Some(p), .. }) => assert!(p.ends_with("missing.resS")),
+        Err(Error::Io { path: p, .. }) => assert!(p.ends_with("missing.resS")),
         other => panic!("{other:?}"),
     }
 }
@@ -141,7 +141,7 @@ fn objects_may_not_overlap_or_share_an_id() {
         "2018.4.36f1",
         false,
         19,
-        &[(7, TEXTURE_2D, tex.clone()), (8, TEXTURE_2D, tex.clone())],
+        &[(7, TEXTURE_2D, tex.clone()), (8, TEXTURE_2D, tex)],
     );
     assert!(SerializedFile::parse(file.clone()).is_ok());
     // Point the second object at the first one's bytes.
@@ -225,7 +225,7 @@ fn decompression_is_held_to_the_limit() {
     ));
     assert!(Bundle::parse(&bomb).is_ok());
     // The directory's own claimed size counts too.
-    let mut b = bomb.clone();
+    let mut b = bomb;
     let at = b.windows(6).position(|w| w == b"36f1\0\0").unwrap() + 5 + 8 + 4;
     b[at..at + 4].copy_from_slice(&u32::MAX.to_be_bytes());
     assert!(matches!(
@@ -289,7 +289,7 @@ fn files_and_textures_over_the_limits_are_refused() {
     // A directory is not a file to open, and a missing file names itself.
     assert!(Assets::open(&dir.0).is_err());
     match Assets::open(dir.0.join("nope.assets")) {
-        Err(Error::Io { path: Some(p), .. }) => assert!(p.ends_with("nope.assets")),
+        Err(Error::Io { path: p, .. }) => assert!(p.ends_with("nope.assets")),
         other => panic!("{other:?}"),
     }
 }

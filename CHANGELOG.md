@@ -11,5 +11,8 @@ First release.
 - `Sprite` and `SpriteAtlas` from Unity 2019.1 through 6000.4: packing rotation, flips, tight
   packing.
 - `Assets` lists and exports sprites and textures, top row first; the lower layers are public.
-- `Limits` bounds file size, decompression, decoded pixels, sprite meshes, mask work and the
-  total work one `Assets` does.
+- `Limits` bounds file size, decompression, object count, decoded pixels, sprite meshes, mask
+  work and the total work done, shared by every `Assets` opened from one bundle.
+- Hostile input: records, bundle entries and streamed pixel ranges may not overlap; stream
+  files must be regular files beside the asset, with no links, device names or data streams,
+  opened without blocking.

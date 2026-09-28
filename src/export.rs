@@ -1,18 +1,18 @@
 //! Turning textures and sprites into images: find a sprite's placement (atlas or own
-//! texture), decode the texture, crop, undo packing rotation, and mask tight-packed sprites to
-//! their mesh. Every image comes out top row first.
+//! texture), decode the texture, then cut the sprite out in one pass: crop, undo packing
+//! rotation, and mask tight-packed sprites to their mesh. Every image comes out top row first.
 
-use crate::bundle::{self, Bundle};
+use crate::bundle::{self, Bundle, Entry};
 use crate::decode;
 use crate::serialized::{class, SerializedFile};
 use crate::sprite::{Placement, Rotation, Sprite, SpriteAtlas};
 use crate::texture::{is_console_platform, Texture2D};
-use crate::{Error, LimitKind, Limits, Result};
+use crate::{Error, LimitKind, Limits, Reservation, Result, Shared};
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 /// An RGBA8 image, top row first.
 #[derive(Clone, PartialEq, Eq)]
@@ -85,13 +85,22 @@ pub struct TextureInfo {
 }
 
 /// What [`Assets::sprites`] found: the sprites it read, and the ones it could not.
-#[derive(Debug, Default)]
+#[derive(Default)]
 #[non_exhaustive]
 pub struct SpriteList {
     /// Sprites read, ordered by the texture holding their pixels.
     pub sprites: Vec<Sprite>,
     /// Sprites that passed the filter (or whose name could not be read) but not the reader.
     pub skipped: Vec<SkippedSprite>,
+}
+
+impl std::fmt::Debug for SpriteList {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SpriteList")
+            .field("sprites", &self.sprites.len())
+            .field("skipped", &self.skipped.len())
+            .finish()
+    }
 }
 
 /// A sprite [`Assets::sprites`] could not read.
@@ -111,20 +120,22 @@ pub struct SkippedSprite {
 ///
 /// Single-threaded: call [`Assets::export`] on sprites from [`Assets::sprites`]. Parallel:
 /// group sprites by [`Assets::texture_id`], then per group [`Assets::decode_texture`] once and
-/// [`Assets::cut`] each sprite; both take `&self`, and `Assets` is `Send + Sync`.
+/// [`Assets::cut`] each sprite; both take `&self`, and `Assets` is `Send + Sync`. Each thread
+/// then holds a decoded texture, up to 1 GiB at the default limits.
 ///
-/// All the pixels one `Assets` decodes, cuts and masks count towards
-/// [`Limits::max_total_work`].
+/// Everything opened from one file or bundle shares one [`Limits::max_total_work`].
 pub struct Assets {
     file: SerializedFile,
     streams: Streams,
-    /// Atlases by path ID, read up front; one that fails to read is kept as its error, so it
-    /// spoils only the sprites packed into it.
-    atlases: HashMap<i64, std::result::Result<SpriteAtlas, Arc<Error>>>,
+    /// This file, as named in errors about stream ranges.
+    owner: String,
+    /// Atlases by path ID, read when first needed; one that fails to read is kept as its
+    /// error, so it spoils only the sprites packed into it.
+    atlases: HashMap<i64, OnceLock<std::result::Result<SpriteAtlas, Arc<Error>>>>,
     /// The most recently decoded texture. Sprites sharing an atlas decode it once when
     /// exported in texture order (see [`Assets::sprites`]).
     cache: Option<(i64, Image)>,
-    work: AtomicU64,
+    shared: Arc<Shared>,
 }
 
 impl std::fmt::Debug for Assets {
@@ -133,8 +144,8 @@ impl std::fmt::Debug for Assets {
             .field("file", &self.file)
             .field("atlases", &self.atlases.len())
             .field("cached_texture", &self.cache.as_ref().map(|(id, _)| id))
-            .field("work", &self.work.load(Ordering::Relaxed))
-            .finish()
+            .field("work_done", &self.shared.work())
+            .finish_non_exhaustive()
     }
 }
 
@@ -144,6 +155,14 @@ enum Streams {
     Dir(PathBuf),
     /// `.resS` entries in the same bundle.
     Bundle(Arc<Bundle>),
+}
+
+/// The folder holding `path`: its parent, or `.` for a bare file name.
+fn folder_of(path: &Path) -> &Path {
+    match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    }
 }
 
 impl Assets {
@@ -167,23 +186,41 @@ impl Assets {
     pub fn open_with(path: impl AsRef<Path>, limits: Limits) -> Result<Self> {
         let path = path.as_ref();
         let data = crate::file::read_limited(path, limits.max_file_size)?;
+        Self::from_bytes(data, folder_of(path), limits)
+    }
+
+    /// Open a serialized file or single-file bundle from its bytes. A serialized file's
+    /// streamed textures are read from `stream_dir`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Assets::open`].
+    pub fn from_bytes(data: Vec<u8>, stream_dir: impl AsRef<Path>, limits: Limits) -> Result<Self> {
         if !bundle::is_bundle(&data) {
             let file = SerializedFile::parse_with(data, limits)?;
-            return Self::from_serialized(file, path.parent().unwrap_or_else(|| Path::new(".")));
+            return Self::from_serialized(file, stream_dir);
         }
         let bundle = Arc::new(Bundle::parse_with(&data, limits)?);
         drop(data);
-        let entries: Vec<bundle::Entry> = bundle.serialized_files().cloned().collect();
-        let names: Vec<String> = entries.iter().map(|e| format!("{:?}", e.path())).collect();
-        match entries.as_slice() {
-            [] => Err(Error::Invalid("bundle holds no serialized file".into())),
-            [one] => Self::from_bundle(bundle, one.path()),
-            _ => Err(Error::Unsupported(format!(
-                "bundle holds {} serialized files ({}{}); open each with Assets::from_bundle",
-                names.len(),
-                names[..names.len().min(5)].join(", "),
-                if names.len() > 5 { ", ..." } else { "" }
-            ))),
+        let mut files = bundle.serialized_files();
+        let first: Option<Entry> = files.next().cloned();
+        let more = files.count();
+        match first {
+            None => Err(Error::Invalid("bundle holds no serialized file".into())),
+            Some(one) if more == 0 => Self::from_bundle(bundle, one.path()),
+            Some(_) => {
+                let names: Vec<String> = bundle
+                    .serialized_files()
+                    .take(5)
+                    .map(|e| format!("{:?}", e.path()))
+                    .collect();
+                Err(Error::Unsupported(format!(
+                    "bundle holds {} serialized files ({}{}); open each with Assets::from_bundle",
+                    more + 1,
+                    names.join(", "),
+                    if more + 1 > 5 { ", ..." } else { "" }
+                )))
+            }
         }
     }
 
@@ -199,33 +236,52 @@ impl Assets {
             .ok_or_else(|| Error::NotFound(format!("entry {path:?} in this bundle")))?
             .clone();
         let file = SerializedFile::in_bundle(bundle.clone(), &entry)?;
-        Ok(Self::new(file, Streams::Bundle(bundle)))
+        let shared = bundle.shared();
+        Ok(Self::new(
+            file,
+            Streams::Bundle(bundle),
+            entry.path().to_string(),
+            shared,
+        ))
     }
 
-    /// Wrap a parsed file whose streamed textures live in `stream_dir`.
+    /// Wrap a parsed file whose streamed textures live in `stream_dir` (`""` means the
+    /// current folder).
     ///
     /// # Errors
     ///
     /// When `stream_dir` cannot be made absolute.
     pub fn from_serialized(file: SerializedFile, stream_dir: impl AsRef<Path>) -> Result<Self> {
         let dir = stream_dir.as_ref();
+        let dir = if dir.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            dir
+        };
         let dir = std::path::absolute(dir).map_err(Error::io(dir))?;
-        Ok(Self::new(file, Streams::Dir(dir)))
+        let owner = dir.display().to_string();
+        Ok(Self::new(
+            file,
+            Streams::Dir(dir),
+            owner,
+            Arc::new(Shared::default()),
+        ))
     }
 
-    fn new(file: SerializedFile, streams: Streams) -> Self {
+    fn new(file: SerializedFile, streams: Streams, owner: String, shared: Arc<Shared>) -> Self {
         let atlases = file
             .objects()
             .iter()
             .filter(|o| o.class_id() == class::SPRITE_ATLAS)
-            .map(|o| (o.path_id(), SpriteAtlas::read(&file, o).map_err(Arc::new)))
+            .map(|o| (o.path_id(), OnceLock::new()))
             .collect();
         Self {
             file,
             streams,
+            owner,
             atlases,
             cache: None,
-            work: AtomicU64::new(0),
+            shared,
         }
     }
 
@@ -235,11 +291,29 @@ impl Assets {
         &self.file
     }
 
-    /// Charge `pixels` of work against [`Limits::max_total_work`].
-    fn charge(&self, pixels: u64) -> Result<()> {
-        let limit = self.file.limits().max_total_work;
-        let before = self.work.fetch_add(pixels, Ordering::Relaxed);
-        Error::limit(LimitKind::TotalWork, before.saturating_add(pixels), limit)
+    /// Pixels decoded, cut and masked so far, counted against [`Limits::max_total_work`] and
+    /// shared with everything else opened from the same bundle.
+    #[must_use]
+    pub fn work_done(&self) -> u64 {
+        self.shared.work()
+    }
+
+    fn reserve(&self, amount: u64) -> Result<Reservation<'_>> {
+        self.shared
+            .reserve(amount, self.file.limits().max_total_work)
+    }
+
+    /// The atlas with this path ID, read on first use.
+    fn atlas(&self, id: i64) -> Option<&std::result::Result<SpriteAtlas, Arc<Error>>> {
+        self.atlases.get(&id).map(|cell| {
+            cell.get_or_init(|| {
+                self.file
+                    .object(id)
+                    .ok_or_else(|| Error::NotFound(format!("atlas {id}")))
+                    .and_then(|o| SpriteAtlas::read(&self.file, o))
+                    .map_err(Arc::new)
+            })
+        })
     }
 
     /// Every sprite whose name passes `keep`, ordered by the texture holding its pixels so
@@ -278,9 +352,24 @@ impl Assets {
                 error,
             });
         }
-        list.sprites
-            .sort_by_cached_key(|s| self.placement(s).ok().map(|p| p.texture.path_id));
+        list.sprites.sort_by_cached_key(|s| self.texture_key(s));
         list
+    }
+
+    /// The path ID of the texture a sprite probably lives in, for ordering; `None` when that
+    /// cannot be told without an error.
+    fn texture_key(&self, sprite: &Sprite) -> Option<i64> {
+        let own = (!sprite.own.texture.is_null()).then_some(sprite.own.texture.path_id);
+        if sprite.atlas.is_null() || sprite.atlas.file_id != 0 {
+            return own;
+        }
+        match self.atlas(sprite.atlas.path_id) {
+            Some(Ok(atlas)) => atlas
+                .placement(&sprite.render_data_key)
+                .map(|p| p.texture.path_id)
+                .or(own),
+            _ => own,
+        }
     }
 
     /// Every texture whose name passes `keep` (given `""` when the name cannot be read), in
@@ -309,13 +398,6 @@ impl Assets {
             .file
             .object(path_id)
             .ok_or_else(|| Error::NotFound(format!("object {path_id}")))?;
-        if object.class_id() != class::TEXTURE_2D {
-            return Err(Error::WrongClass {
-                path_id,
-                found: object.class_id(),
-                expected: class::TEXTURE_2D,
-            });
-        }
         Texture2D::read(&self.file, object)
     }
 
@@ -341,7 +423,7 @@ impl Assets {
             };
         }
         let id = sprite.atlas.path_id;
-        match self.atlases.get(&id) {
+        match self.atlas(id) {
             Some(Ok(atlas)) => match atlas.placement(&sprite.render_data_key) {
                 Some(p) => Ok(p),
                 None if own_texture => Ok(sprite.own),
@@ -352,7 +434,7 @@ impl Assets {
             },
             Some(Err(e)) => Err(Error::AtlasUnreadable {
                 atlas: id,
-                source: e.clone(),
+                error: e.clone(),
             }),
             None if own_texture => Ok(sprite.own),
             None => Err(Error::NotFound(format!(
@@ -390,23 +472,30 @@ impl Assets {
                 format: texture.format,
             });
         }
-        self.charge(pixels)?;
+        let reservation = self.reserve(pixels)?;
+        if let Some(stream) = &texture.stream {
+            let owner = format!("texture {path_id} of {:?}", self.owner);
+            let end = stream.offset.saturating_add(u64::from(stream.size));
+            self.shared
+                .claim_stream(&stream.path, stream.offset, end, &owner)?;
+        }
         let data = match &self.streams {
             Streams::Dir(dir) => texture.data(dir)?,
             Streams::Bundle(bundle) => texture.data_in(bundle)?,
         };
-        let rgba =
-            decode::decode(texture.format, texture.width, texture.height, &data).map_err(|e| {
-                match e {
-                    Error::Invalid(what) => {
-                        Error::Invalid(format!("texture {:?}: {what}", texture.name))
-                    }
-                    e => e,
-                }
-            })?;
+        let (format, width, height) = (texture.format, texture.width, texture.height);
+        let rgba = match data {
+            Cow::Owned(v) => decode::decode_owned(format, width, height, v),
+            Cow::Borrowed(b) => decode::decode(format, width, height, b),
+        }
+        .map_err(|e| match e {
+            Error::Invalid(what) => Error::Invalid(format!("texture {:?}: {what}", texture.name)),
+            e => e,
+        })?;
+        reservation.keep();
         Ok(Image {
-            width: texture.width,
-            height: texture.height,
+            width,
+            height,
             rgba,
         })
     }
@@ -459,75 +548,223 @@ impl Assets {
 
     fn cut_at(&self, sprite: &Sprite, placement: &Placement, texture: &Image) -> Result<Image> {
         texture.check()?;
+        let name = &sprite.name;
         if !placement.alpha_texture.is_null() {
             return Err(Error::Unsupported(format!(
-                "sprite {:?} keeps its alpha in a separate texture",
-                sprite.name
+                "sprite {name:?} keeps its alpha in a separate texture"
             )));
         }
         if !(placement.downscale.is_finite() && (placement.downscale - 1.0).abs() <= 1e-4) {
             return Err(Error::Unsupported(format!(
-                "sprite {:?} is in an atlas scaled by {}",
-                sprite.name, placement.downscale
+                "sprite {name:?} is in an atlas scaled by {}",
+                placement.downscale
             )));
         }
-        let tight = placement.settings.tight();
-        if tight && sprite.triangles.is_none() {
-            return Err(Error::Unsupported(format!(
-                "sprite {:?} is tight-packed, and its mesh is not one this crate reads",
-                sprite.name
-            )));
-        }
+        let settings = placement.settings;
+        let rotation = if settings.packed() {
+            settings.rotation().ok_or_else(|| {
+                Error::Unsupported(format!(
+                    "sprite {name:?} has packing rotation {}, which Unity does not define",
+                    (settings.0 >> 2) & 0xf
+                ))
+            })?
+        } else {
+            Rotation::Unrotated
+        };
+        let triangles = match (settings.tight(), &sprite.triangles) {
+            (false, _) => None,
+            (true, None) => {
+                return Err(Error::Unsupported(format!(
+                    "sprite {name:?} is tight-packed, and its mesh is not one this crate reads"
+                )))
+            }
+            (true, Some(t)) if t.is_empty() => {
+                return Err(Error::Invalid(format!(
+                    "sprite {name:?} is tight-packed, and its mesh is empty"
+                )))
+            }
+            (true, Some(t)) => Some(t.as_slice()),
+        };
 
-        // Rects carry float noise (396.00003): snap values within 1/1000 of a whole pixel,
-        // then round outwards. The rect must then lie inside the texture and cover pixels.
+        // Rects carry float noise (396.00003): snap values within a thousandth of a pixel (or
+        // a few units in the last place, for large ones) to the whole pixel, then round
+        // outwards. The rect must then lie inside the texture and cover pixels.
         let snap = |v: f32| {
-            if (v - v.round()).abs() < 1e-3 {
+            let tolerance = 1e-3_f32.max(v.abs() * f32::EPSILON * 4.0);
+            if (v - v.round()).abs() <= tolerance {
                 v.round()
             } else {
                 v
             }
         };
         let r = placement.texture_rect;
-        let (x0, y0) = (snap(r.x).floor(), snap(r.y).floor());
-        let (x1, y1) = (snap(r.x + r.width).ceil(), snap(r.y + r.height).ceil());
-        let (tw, th) = (texture.width as f32, texture.height as f32);
-        let inside = [x0, y0, x1, y1].iter().all(|v| v.is_finite())
-            && x0 >= 0.0
-            && y0 >= 0.0
-            && x1 <= tw
-            && y1 <= th
-            && x1 > x0
-            && y1 > y0;
-        if !inside {
+        let bounds = [
+            snap(r.x).floor(),
+            snap(r.y).floor(),
+            snap(r.x + r.width).ceil(),
+            snap(r.y + r.height).ceil(),
+        ];
+        let [x0, y0, x1, y1] = bounds.map(|v| if v.is_finite() { v as i64 } else { -1 });
+        let (tw, th) = (i64::from(texture.width), i64::from(texture.height));
+        if !(0 <= x0 && x0 < x1 && x1 <= tw && 0 <= y0 && y0 < y1 && y1 <= th) {
             return Err(Error::Invalid(format!(
-                "sprite {:?} covers {}x{} at {},{}, not inside the {}x{} texture it was given",
-                sprite.name, r.width, r.height, r.x, r.y, texture.width, texture.height
+                "sprite {name:?} covers {}x{} at {},{}, not inside the {}x{} texture it was given",
+                r.width, r.height, r.x, r.y, texture.width, texture.height
             )));
         }
-        let (x0, y0, x1, y1) = (x0 as u32, y0 as u32, x1 as u32, y1 as u32);
-        self.charge(u64::from(x1 - x0) * u64::from(y1 - y0))?;
-        // The texture is top-down and the rect counts from the bottom: take its rows bottom
-        // first, as Unity stores them, so rotation and the mesh apply unchanged.
-        let mut image = crop_bottom_up(texture, x0, y0, x1 - x0, y1 - y0);
+        // All four are within the texture, so they fit u32.
+        let (x0, y0) = (x0 as u32, y0 as u32);
+        let (w, h) = ((x1 - i64::from(x0)) as u32, (y1 - i64::from(y0)) as u32);
+        // Sprite space: the rect after undoing the packing, rows bottom first.
+        let (sw, sh) = if rotation == Rotation::Rotate90 {
+            (h, w)
+        } else {
+            (w, h)
+        };
+        let coverage = match triangles {
+            Some(t) => Some(self.coverage(sprite, t, placement, sw, sh)?),
+            None => None,
+        };
+        let copying = self.reserve(u64::from(sw) * u64::from(sh))?;
 
-        if placement.settings.packed() {
-            image = match placement.settings.rotation() {
-                Rotation::Unrotated => image,
-                Rotation::FlipHorizontal => flip_horizontal(&image),
-                Rotation::FlipVertical => flip_vertical(&image),
-                Rotation::Rotate180 => flip_vertical(&flip_horizontal(&image)),
-                Rotation::Rotate90 => rotate_90_counterclockwise(&image),
-            };
-        }
-        if let (true, Some(triangles)) = (tight, &sprite.triangles) {
-            if !triangles.is_empty() {
-                mask(self, &mut image, sprite, triangles, placement)?;
+        // The texel under sprite-space pixel (sx, sy): undo the rotation to get the crop
+        // pixel (cx, cy), counted from the rect's bottom left, then find it in the top-down
+        // texture.
+        let src_row = texture.row();
+        let texel = |cx: u32, cy: u32| {
+            (texture.height - 1 - (y0 + cy)) as usize * src_row + (x0 + cx) as usize * 4
+        };
+        let crop = |sx: u32, sy: u32| match rotation {
+            Rotation::Unrotated => (sx, sy),
+            Rotation::FlipHorizontal => (w - 1 - sx, sy),
+            Rotation::FlipVertical => (sx, h - 1 - sy),
+            Rotation::Rotate180 => (w - 1 - sx, h - 1 - sy),
+            // Undone counter-clockwise, as AssetStudio does; UnityPy turns the other way and
+            // no real sample settles which is right.
+            Rotation::Rotate90 => (w - 1 - sy, sx),
+        };
+        let out_row = sw as usize * 4;
+        let mut rgba = vec![0u8; out_row * sh as usize];
+        for (oy, line) in rgba.chunks_exact_mut(out_row.max(1)).enumerate() {
+            // Output rows run top first; sprite space counts from the bottom.
+            let sy = sh - 1 - oy as u32;
+            let whole_row = coverage.is_none()
+                && matches!(rotation, Rotation::Unrotated | Rotation::FlipVertical);
+            if whole_row {
+                let start = texel(0, crop(0, sy).1);
+                line.copy_from_slice(&texture.rgba[start..start + out_row]);
+                continue;
+            }
+            for (sx, px) in (0..sw).zip(line.chunks_exact_mut(4)) {
+                let masked_out = coverage
+                    .as_ref()
+                    .is_some_and(|(c, _)| !c[sy as usize * sw as usize + sx as usize]);
+                if masked_out {
+                    continue;
+                }
+                let (cx, cy) = crop(sx, sy);
+                let at = texel(cx, cy);
+                px.copy_from_slice(&texture.rgba[at..at + 4]);
             }
         }
-        Ok(flip_vertical(&image))
+        copying.keep();
+        if let Some((_, masking)) = coverage {
+            masking.keep();
+        }
+        Ok(Image {
+            width: sw,
+            height: sh,
+            rgba,
+        })
+    }
+
+    /// Which pixels of the `w` x `h` sprite-space image (rows bottom first) the mesh covers:
+    /// a pixel is kept when any of four sample points in it (see [`SAMPLES`]) lies in a
+    /// triangle.
+    /// Mesh vertices are in sprite units around the pivot. The work, one test per pixel of
+    /// each triangle's bounding box, is counted before any is done and held to
+    /// [`Limits::max_mask_work`] and the total.
+    fn coverage(
+        &self,
+        sprite: &Sprite,
+        triangles: &[[[f32; 2]; 3]],
+        placement: &Placement,
+        w: u32,
+        h: u32,
+    ) -> Result<(Vec<bool>, Reservation<'_>)> {
+        let name = &sprite.name;
+        let scale = sprite.pixels_to_units;
+        let dx = sprite.rect.width * sprite.pivot[0] - placement.texture_rect_offset[0];
+        let dy = sprite.rect.height * sprite.pivot[1] - placement.texture_rect_offset[1];
+        let (wf, hf) = (w as f32, h as f32);
+        // Triangles with area, mapped into pixels, with the pixel range each could touch.
+        let mut boxes = Vec::with_capacity(triangles.len());
+        let mut work = 0u64;
+        for t in triangles {
+            let p = t.map(|[x, y]| [x * scale + dx, y * scale + dy]);
+            if p.iter().flatten().any(|v| !v.is_finite()) {
+                return Err(Error::Invalid(format!(
+                    "sprite {name:?} has a mesh vertex that is not a finite number"
+                )));
+            }
+            let [a, b, c] = p;
+            let area = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+            if area.abs() < 1e-9 {
+                continue;
+            }
+            let lo = |i: usize| p.iter().map(|q| q[i]).fold(f32::INFINITY, f32::min);
+            let hi = |i: usize| p.iter().map(|q| q[i]).fold(f32::NEG_INFINITY, f32::max);
+            // Pixel x covers [x, x + 1]; it can overlap when x < max and x + 1 > min.
+            let x_from = lo(0).floor().clamp(0.0, wf) as u32;
+            let x_to = hi(0).ceil().clamp(0.0, wf) as u32;
+            let y_from = lo(1).floor().clamp(0.0, hf) as u32;
+            let y_to = hi(1).ceil().clamp(0.0, hf) as u32;
+            if x_from < x_to && y_from < y_to {
+                work += u64::from(x_to - x_from) * u64::from(y_to - y_from);
+                boxes.push((p, x_from..x_to, y_from..y_to));
+            } else {
+                // Area, but none of it inside the image.
+                boxes.push((p, 0..0, 0..0));
+            }
+        }
+        if boxes.is_empty() {
+            return Err(Error::Invalid(format!(
+                "sprite {name:?} is tight-packed, and no triangle of its mesh has any area"
+            )));
+        }
+        Error::limit(LimitKind::MaskWork, work, self.file.limits().max_mask_work)?;
+        let reservation = self.reserve(work)?;
+
+        let mut covered = vec![false; w as usize * h as usize];
+        for ([a, b, c], xs, ys) in boxes {
+            // On or inside all three edges, whichever way the triangle winds.
+            let inside = |px: f32, py: f32| {
+                let side = |p: [f32; 2], q: [f32; 2]| {
+                    (q[0] - p[0]) * (py - p[1]) - (q[1] - p[1]) * (px - p[0])
+                };
+                let (d1, d2, d3) = (side(a, b), side(b, c), side(c, a));
+                let neg = d1 < 0.0 || d2 < 0.0 || d3 < 0.0;
+                let pos = d1 > 0.0 || d2 > 0.0 || d3 > 0.0;
+                !(neg && pos)
+            };
+            for y in ys {
+                for x in xs.clone() {
+                    let (fx, fy) = (x as f32, y as f32);
+                    if SAMPLES.iter().any(|&(u, v)| inside(fx + u, fy + v)) {
+                        covered[y as usize * w as usize + x as usize] = true;
+                    }
+                }
+            }
+        }
+        Ok((covered, reservation))
     }
 }
+
+/// Where a pixel is sampled for the mask: at the quarter points. Of the rules measured
+/// against UnityPy's polygon fill on real sprites (pixel centre only, any overlap, these four,
+/// two of five), keeping a pixel when any of these four is covered disagreed on the fewest
+/// pixels.
+const SAMPLES: [(f32, f32); 4] = [(0.25, 0.25), (0.75, 0.25), (0.25, 0.75), (0.75, 0.75)];
 
 fn texture_id_of(sprite: &Sprite, placement: &Placement) -> Result<i64> {
     if placement.texture.is_null() {
@@ -545,179 +782,21 @@ fn texture_id_of(sprite: &Sprite, placement: &Placement) -> Result<i64> {
     Ok(placement.texture.path_id)
 }
 
-/// The rect `x, y, w, h` (y from the bottom) of a top-down image, rows bottom first.
-fn crop_bottom_up(src: &Image, x: u32, y: u32, w: u32, h: u32) -> Image {
-    let row = w as usize * 4;
-    let mut rgba = Vec::with_capacity(row * h as usize);
-    for k in 0..h {
-        let line = (src.height - 1 - (y + k)) as usize;
-        let start = line * src.row() + x as usize * 4;
-        rgba.extend_from_slice(&src.rgba[start..start + row]);
-    }
-    Image {
-        width: w,
-        height: h,
-        rgba,
-    }
-}
-
-fn flip_vertical(src: &Image) -> Image {
-    let mut rgba = Vec::with_capacity(src.rgba.len());
-    for line in src.rgba.chunks_exact(src.row().max(1)).rev() {
-        rgba.extend_from_slice(line);
-    }
-    Image { rgba, ..*src }
-}
-
-fn flip_horizontal(src: &Image) -> Image {
-    let mut rgba = Vec::with_capacity(src.rgba.len());
-    for line in src.rgba.chunks_exact(src.row().max(1)) {
-        for px in line.chunks_exact(4).rev() {
-            rgba.extend_from_slice(px);
-        }
-    }
-    Image { rgba, ..*src }
-}
-
-/// Undo `Rotate90` packing: a quarter turn counter-clockwise on the stored (bottom-up) rows,
-/// as `AssetStudio` does with `Rotate(270)`. `UnityPy` turns the other way; no real sample settles
-/// which is right.
-fn rotate_90_counterclockwise(src: &Image) -> Image {
-    let (w, h) = (src.width as usize, src.height as usize);
-    let mut rgba = vec![0; src.rgba.len()];
-    for y in 0..h {
-        for x in 0..w {
-            let from = (y * w + x) * 4;
-            let (nx, ny) = (y, w - 1 - x);
-            let to = (ny * h + nx) * 4;
-            rgba[to..to + 4].copy_from_slice(&src.rgba[from..from + 4]);
-        }
-    }
-    Image {
-        width: src.height,
-        height: src.width,
-        rgba,
-    }
-}
-
-/// Clear every pixel whose centre lies outside the sprite's mesh (colour and alpha both, as
-/// `AssetStudio` does). Mesh vertices are in sprite units around the pivot; this maps them into
-/// the cropped, bottom-up image. Each triangle is tested only over its own bounding box, and
-/// the work is held to [`Limits::max_mask_work`] and charged to the total.
-fn mask(
-    assets: &Assets,
-    image: &mut Image,
-    sprite: &Sprite,
-    triangles: &[[[f32; 2]; 3]],
-    placement: &Placement,
-) -> Result<()> {
-    let budget = assets.file.limits().max_mask_work;
-    let (w, h) = (image.width as usize, image.height as usize);
-    let scale = sprite.pixels_to_units;
-    let dx = sprite.rect.width * sprite.pivot[0] - placement.texture_rect_offset[0];
-    let dy = sprite.rect.height * sprite.pivot[1] - placement.texture_rect_offset[1];
-    let mut covered = vec![false; w * h];
-    let mut work = 0u64;
-    let mut with_area = 0usize;
-    for t in triangles {
-        let [a, b, c] = t.map(|[x, y]| [x * scale + dx, y * scale + dy]);
-        let pts = [a, b, c];
-        if pts.iter().flatten().any(|v| !v.is_finite()) {
-            return Err(Error::Invalid(format!(
-                "sprite {:?} has a mesh vertex that is not a finite number",
-                sprite.name
-            )));
-        }
-        let area = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
-        if area.abs() < 1e-9 {
-            continue;
-        }
-        with_area += 1;
-        let min = |i: usize| pts.iter().map(|p| p[i]).fold(f32::INFINITY, f32::min);
-        let max = |i: usize| pts.iter().map(|p| p[i]).fold(f32::NEG_INFINITY, f32::max);
-        // Pixel centres at +0.5: pixel p is a candidate when min <= p + 0.5 <= max.
-        let x0 = ((min(0) - 0.5).ceil().max(0.0) as usize).min(w);
-        let x1 = (((max(0) - 0.5).floor() + 1.0).max(0.0) as usize).min(w);
-        let y0 = ((min(1) - 0.5).ceil().max(0.0) as usize).min(h);
-        let y1 = (((max(1) - 0.5).floor() + 1.0).max(0.0) as usize).min(h);
-        if x0 >= x1 || y0 >= y1 {
-            continue;
-        }
-        work = work.saturating_add(((x1 - x0) * (y1 - y0)) as u64);
-        Error::limit(LimitKind::MaskWork, work, budget)?;
-        let side = |p: [f32; 2], q: [f32; 2], px: f32, py: f32| {
-            (q[0] - p[0]) * (py - p[1]) - (q[1] - p[1]) * (px - p[0])
-        };
-        for y in y0..y1 {
-            let py = y as f32 + 0.5;
-            for x in x0..x1 {
-                let px = x as f32 + 0.5;
-                let (d1, d2, d3) = (side(a, b, px, py), side(b, c, px, py), side(c, a, px, py));
-                let neg = d1 < 0.0 || d2 < 0.0 || d3 < 0.0;
-                let pos = d1 > 0.0 || d2 > 0.0 || d3 > 0.0;
-                if !(neg && pos) {
-                    covered[y * w + x] = true;
-                }
-            }
-        }
-    }
-    if with_area == 0 {
-        return Err(Error::Invalid(format!(
-            "sprite {:?} is tight-packed, and no triangle of its mesh has any area",
-            sprite.name
-        )));
-    }
-    assets.charge(work)?;
-    for (px, keep) in image.rgba.chunks_exact_mut(4).zip(&covered) {
-        if !keep {
-            px.fill(0);
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn numbered(w: u32, h: u32) -> Image {
-        Image {
-            width: w,
-            height: h,
-            rgba: (0..w * h).flat_map(|i| [i as u8, 0, 0, 255]).collect(),
-        }
-    }
-
-    fn reds(img: &Image) -> Vec<u8> {
-        img.rgba.chunks(4).map(|p| p[0]).collect()
-    }
-
-    #[test]
-    fn test_crop_and_flips() {
-        let img = numbered(3, 2); // top-down rows: [0 1 2] [3 4 5]
-                                  // Columns 1-2 of both rows, bottom row first.
-        assert_eq!(reds(&crop_bottom_up(&img, 1, 0, 2, 2)), [4, 5, 1, 2]);
-        // The top row alone (y = 1 counting from the bottom).
-        assert_eq!(reds(&crop_bottom_up(&img, 0, 1, 3, 1)), [0, 1, 2]);
-        assert_eq!(reds(&flip_vertical(&img)), [3, 4, 5, 0, 1, 2]);
-        assert_eq!(reds(&flip_horizontal(&img)), [2, 1, 0, 5, 4, 3]);
-    }
-
-    #[test]
-    fn test_rotate_90() {
-        let img = numbered(3, 2); // rows: [0 1 2] [3 4 5]
-                                  // [0 1 2]      [2 5]
-                                  // [3 4 5]  ->  [1 4]
-                                  //              [0 3]
-        let r = rotate_90_counterclockwise(&img);
-        assert_eq!((r.width, r.height), (2, 3));
-        assert_eq!(reds(&r), [2, 5, 1, 4, 0, 3]);
-    }
 
     #[test]
     fn test_image_new_checks_length() {
         assert!(Image::new(2, 2, vec![0; 16]).is_ok());
         assert!(Image::new(2, 2, vec![0; 15]).is_err());
         assert!(Image::new(u32::MAX, u32::MAX, vec![]).is_err());
+    }
+
+    #[test]
+    fn test_folder_of_a_bare_name_is_here() {
+        assert_eq!(folder_of(Path::new("t.assets")), Path::new("."));
+        assert_eq!(folder_of(Path::new("a/t.assets")), Path::new("a"));
+        assert_eq!(folder_of(Path::new("/t.assets")), Path::new("/"));
     }
 }

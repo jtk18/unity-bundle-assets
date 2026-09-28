@@ -4,7 +4,7 @@
 //! atlas holds the real texture and rectangle, keyed by the sprite's render-data key.
 
 use crate::reader::Reader;
-use crate::serialized::{ObjectInfo, SerializedFile};
+use crate::serialized::{class, ObjectInfo, SerializedFile};
 use crate::{check_release, Error, LimitKind, Result};
 
 use std::collections::HashMap;
@@ -84,6 +84,7 @@ pub struct Settings(pub u32);
 
 /// How a packed sprite was turned to fit its texture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum Rotation {
     /// Stored as drawn (Unity's `None`).
     Unrotated,
@@ -111,16 +112,17 @@ impl Settings {
         (self.0 >> 1) & 1 == 0
     }
 
-    /// The packing rotation. Values Unity does not define read as [`Rotation::Unrotated`].
+    /// The packing rotation, or `None` for a value Unity does not define.
     #[must_use]
-    pub const fn rotation(self) -> Rotation {
-        match (self.0 >> 2) & 0xf {
+    pub const fn rotation(self) -> Option<Rotation> {
+        Some(match (self.0 >> 2) & 0xf {
+            0 => Rotation::Unrotated,
             1 => Rotation::FlipHorizontal,
             2 => Rotation::FlipVertical,
             3 => Rotation::Rotate180,
             4 => Rotation::Rotate90,
-            _ => Rotation::Unrotated,
-        }
+            _ => return None,
+        })
     }
 }
 
@@ -143,7 +145,7 @@ pub struct Placement {
 }
 
 /// A `Sprite` object.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 #[non_exhaustive]
 pub struct Sprite {
     /// The object's path ID.
@@ -169,6 +171,22 @@ pub struct Sprite {
     pub triangles: Option<Vec<[[f32; 2]; 3]>>,
 }
 
+impl std::fmt::Debug for Sprite {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Sprite")
+            .field("path_id", &self.path_id)
+            .field("name", &self.name)
+            .field("rect", &self.rect)
+            .field("pixels_to_units", &self.pixels_to_units)
+            .field("pivot", &self.pivot)
+            .field("render_data_key", &self.render_data_key)
+            .field("atlas", &self.atlas)
+            .field("own", &self.own)
+            .field("triangles", &self.triangles.as_ref().map(Vec::len))
+            .finish()
+    }
+}
+
 impl Sprite {
     /// Read a `Sprite` object, Unity 2019.1 through 6000.4 (final and beta builds).
     ///
@@ -188,11 +206,10 @@ impl Sprite {
         remaining: u64,
     ) -> Result<Self> {
         check_release(file.unity_version(), "Sprite", OLDEST)?;
-        let v = file.unity_version_numbers();
         let limit = file.limits().max_sprite_triangles;
         let budget = Budget { limit, remaining };
-        let mut r = file.reader(object)?;
-        read_sprite(&mut r, v, file.big_endian(), budget, object.path_id())
+        let mut r = file.reader_for(object, class::SPRITE)?;
+        read_sprite(&mut r, file.big_endian(), budget, object.path_id())
             .map_err(|e| layout_error(e, "Sprite", object, file))
     }
 }
@@ -215,13 +232,7 @@ fn layout_error(e: Error, what: &str, object: &ObjectInfo, file: &SerializedFile
     }
 }
 
-fn read_sprite(
-    r: &mut Reader,
-    v: [u32; 3],
-    big_endian: bool,
-    budget: Budget,
-    path_id: i64,
-) -> Result<Sprite> {
+fn read_sprite(r: &mut Reader, big_endian: bool, budget: Budget, path_id: i64) -> Result<Sprite> {
     let name = r.aligned_string()?;
     let rect = Rect::read(r)?;
     r.skip(8)?; // m_Offset
@@ -229,9 +240,7 @@ fn read_sprite(
     let pixels_to_units = r.f32()?;
     let pivot = [r.f32()?, r.f32()?];
     r.u32()?; // m_Extrude
-    if v < [6000, 5, 0] {
-        r.bool()?; // m_IsPolygon, gone in 6000.5
-    }
+    r.bool()?; // m_IsPolygon (gone in 6000.5, past the releases this crate reads)
     r.align(4);
     let render_data_key = RenderDataKey::read(r)?;
     for _ in 0..r.len(4)? {
@@ -401,7 +410,7 @@ fn read_mesh(
                 } else {
                     u16::from_le_bytes([c[0], c[1]])
                 };
-                let i = usize::from(i) + sm.base_vertex as usize;
+                let i = usize::from(i).saturating_add(sm.base_vertex as usize);
                 // A triangle that points past the vertices makes the whole mesh untrustworthy.
                 match (i < vertex_count).then(|| vertex(i)).flatten() {
                     Some(p) => *corner = p,
@@ -415,13 +424,21 @@ fn read_mesh(
 }
 
 /// A `SpriteAtlas` object: where each of its sprites was packed.
-#[derive(Debug, Clone)]
-#[non_exhaustive]
+#[derive(Clone)]
 pub struct SpriteAtlas {
     /// `m_Name`.
     pub name: String,
     entries: Vec<(RenderDataKey, Placement)>,
     index: HashMap<RenderDataKey, usize>,
+}
+
+impl std::fmt::Debug for SpriteAtlas {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SpriteAtlas")
+            .field("name", &self.name)
+            .field("entries", &self.entries.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl SpriteAtlas {
@@ -433,7 +450,7 @@ impl SpriteAtlas {
     pub fn read(file: &SerializedFile, object: &ObjectInfo) -> Result<Self> {
         check_release(file.unity_version(), "SpriteAtlas", OLDEST)?;
         let v = file.unity_version_numbers();
-        let mut r = file.reader(object)?;
+        let mut r = file.reader_for(object, class::SPRITE_ATLAS)?;
         read_atlas(&mut r, v).map_err(|e| layout_error(e, "SpriteAtlas", object, file))
     }
 
@@ -457,7 +474,10 @@ fn read_atlas(r: &mut Reader, v: [u32; 3]) -> Result<SpriteAtlas> {
     for _ in 0..r.len(4)? {
         r.aligned_string()?; // m_PackedSpriteNamesToIndex
     }
-    let count = r.len(24)?;
+    // An entry is at least 104 bytes: key 24, two pointers 24, rect 16, offsets 16, UV
+    // transform 16, downscale and settings 8; from 2020.2 also a list count.
+    let secondary = v >= [2020, 2, 0];
+    let count = r.len(if secondary { 108 } else { 104 })?;
     let mut entries = Vec::with_capacity(count);
     let mut index = HashMap::with_capacity(count);
     for i in 0..count {
@@ -470,7 +490,7 @@ fn read_atlas(r: &mut Reader, v: [u32; 3]) -> Result<SpriteAtlas> {
         r.skip(16)?; // uvTransform
         let downscale = r.f32()?;
         let settings = Settings(r.u32()?);
-        if v >= [2020, 2, 0] {
+        if secondary {
             for _ in 0..r.len(16)? {
                 PPtr::read(r)?;
                 r.aligned_string()?;
@@ -488,6 +508,17 @@ fn read_atlas(r: &mut Reader, v: [u32; 3]) -> Result<SpriteAtlas> {
                 downscale,
             },
         ));
+    }
+    r.aligned_string()?; // m_Tag
+    r.bool()?; // m_IsVariant
+    r.align(4);
+    // The last field ends the object. Bytes left over mean the layout was misread.
+    if r.remaining() != 0 {
+        return Err(Error::Invalid(format!(
+            "sprite atlas {name:?} has {} bytes after its last field; the layout is probably \
+             misread",
+            r.remaining()
+        )));
     }
     Ok(SpriteAtlas {
         name,

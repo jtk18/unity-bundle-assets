@@ -435,9 +435,9 @@ fn a_bad_atlas_spoils_only_its_own_sprites() {
     assert!(a.decode_texture(TEX).is_ok());
     assert!(export_one(&mut a, "own").is_ok());
     match export_one(&mut a, "in") {
-        Err(Error::AtlasUnreadable { atlas, source, .. }) => {
+        Err(Error::AtlasUnreadable { atlas, error, .. }) => {
             assert_eq!(atlas, ATLAS);
-            assert!(matches!(*source, Error::Invalid(_)), "{source}");
+            assert!(matches!(*error, Error::Invalid(_)), "{error}");
         }
         other => panic!("{other:?}"),
     }
@@ -679,5 +679,5 @@ fn errors_quote_names_from_the_file() {
     let (_d, mut a) = open(&with_texture(vec![(1, s)]));
     let err = export_one(&mut a, evil).unwrap_err().to_string();
     assert!(err.contains("boom"), "{err}");
-    assert!(!err.chars().any(|c| c.is_control()), "{err:?}");
+    assert!(!err.chars().any(char::is_control), "{err:?}");
 }

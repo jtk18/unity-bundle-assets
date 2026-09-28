@@ -3,7 +3,7 @@
 
 use crate::bundle::{Bundle, Entry};
 use crate::reader::Reader;
-use crate::{Error, Limits, Result, Version};
+use crate::{check_version_string, Error, LimitKind, Limits, Result, Version};
 
 use std::collections::HashMap;
 use std::ops::Range;
@@ -114,7 +114,7 @@ impl std::fmt::Debug for SerializedFile {
             .field("target_platform", &self.target_platform)
             .field("big_endian", &self.big_endian)
             .field("objects", &self.objects.len())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -148,7 +148,7 @@ impl SerializedFile {
     ///
     /// As [`SerializedFile::parse`].
     pub fn parse_with(data: Vec<u8>, limits: Limits) -> Result<Self> {
-        let parsed = parse(&data)?;
+        let parsed = parse(&data, &limits)?;
         Ok(Self::build(parsed, Bytes::Owned(data), limits))
     }
 
@@ -178,7 +178,7 @@ impl SerializedFile {
         let bytes = bundle
             .bytes(entry)
             .ok_or_else(|| Error::NotFound(format!("entry {:?} in this bundle", entry.path())))?;
-        let mut parsed = parse(bytes)?;
+        let mut parsed = parse(bytes, &bundle.limits())?;
         if Version::parse(&parsed.unity_version).stripped() {
             parsed.unity_version = bundle.unity_revision().to_string();
         }
@@ -286,6 +286,18 @@ impl SerializedFile {
             .get(object.offset..object.offset.checked_add(object.size)?)
     }
 
+    /// A reader over an object of `class`'s bytes, or [`Error::WrongClass`].
+    pub(crate) fn reader_for(&self, object: &ObjectInfo, class: i32) -> Result<Reader<'_>> {
+        if object.class_id != class {
+            return Err(Error::WrongClass {
+                path_id: object.path_id,
+                found: object.class_id,
+                expected: class,
+            });
+        }
+        self.reader(object)
+    }
+
     /// A reader over one object's bytes.
     pub(crate) fn reader(&self, object: &ObjectInfo) -> Result<Reader<'_>> {
         let bytes = self
@@ -301,7 +313,7 @@ impl SerializedFile {
     }
 }
 
-fn parse(data: &[u8]) -> Result<Parsed> {
+fn parse(data: &[u8], limits: &Limits) -> Result<Parsed> {
     if crate::bundle::is_bundle(data) {
         return Err(Error::Unsupported(
             "this is an asset bundle (UnityFS), not a serialized file; open it with \
@@ -356,16 +368,20 @@ fn parse(data: &[u8]) -> Result<Parsed> {
 
     r.set_big_endian(big_endian);
     let unity_version = r.cstr()?;
+    check_version_string(&unity_version, "serialized file")?;
     let target_platform = r.i32()?;
     let has_type_trees = r.bool()?;
 
-    let type_count = r.len(4)?;
+    // Smallest records: a type is 23 bytes, an object 20 (24 from v22), a script 12, an
+    // external 22.
+    let type_count = r.len(23)?;
     let mut types = Vec::with_capacity(type_count);
     for _ in 0..type_count {
         types.push(read_type(&mut r, version, has_type_trees)?);
     }
 
-    let object_count = r.len(20)?;
+    let object_count = r.len(if version >= 22 { 24 } else { 20 })?;
+    Error::limit(LimitKind::Objects, object_count as u64, limits.max_objects)?;
     let mut objects = Vec::with_capacity(object_count);
     for _ in 0..object_count {
         r.align(4);
@@ -397,25 +413,25 @@ fn parse(data: &[u8]) -> Result<Parsed> {
 
     // Unity never writes two objects over the same bytes, or two with one ID. Allowing either
     // lets a small file name one large object many times over.
+    let mut ids: Vec<i64> = objects.iter().map(|o| o.path_id).collect();
+    ids.sort_unstable();
+    if let Some([id, _]) = ids.windows(2).find(|w| w[0] == w[1]) {
+        return Err(Error::Invalid(format!("two objects have path ID {id}")));
+    }
+    drop(ids);
     let mut spans: Vec<(usize, usize, i64)> = objects
         .iter()
         .filter(|o| o.size > 0)
         .map(|o| (o.offset, o.offset + o.size, o.path_id))
         .collect();
     spans.sort_unstable();
-    for w in spans.windows(2) {
-        if w[1].0 < w[0].1 {
-            return Err(Error::Invalid(format!(
-                "objects {} and {} overlap",
-                w[0].2, w[1].2
-            )));
-        }
+    if let Some(w) = spans.windows(2).find(|w| w[1].0 < w[0].1) {
+        return Err(Error::Invalid(format!(
+            "objects {} and {} overlap",
+            w[0].2, w[1].2
+        )));
     }
-    let mut ids: Vec<i64> = objects.iter().map(|o| o.path_id).collect();
-    ids.sort_unstable();
-    if let Some([id, _]) = ids.windows(2).find(|w| w[0] == w[1]) {
-        return Err(Error::Invalid(format!("two objects have path ID {id}")));
-    }
+    drop(spans);
 
     // Script references: which MonoScripts the MonoBehaviours use. Not needed here.
     let script_count = r.len(12)?;
@@ -425,7 +441,7 @@ fn parse(data: &[u8]) -> Result<Parsed> {
         r.i64()?;
     }
 
-    let external_count = r.len(21)?;
+    let external_count = r.len(22)?;
     let mut externals = Vec::with_capacity(external_count);
     for _ in 0..external_count {
         r.cstr()?; // always empty
@@ -455,6 +471,7 @@ fn read_type(r: &mut Reader, version: u32, has_type_trees: bool) -> Result<Seria
     }
     r.skip(16)?; // type hash
     if has_type_trees {
+        let at = r.pos();
         let nodes = r.len(24)?;
         let strings = r.len(1)?;
         let node_size = if version >= 19 { 32 } else { 24 };
@@ -462,7 +479,7 @@ fn read_type(r: &mut Reader, version: u32, has_type_trees: bool) -> Result<Seria
             .checked_mul(node_size)
             .and_then(|n| n.checked_add(strings))
             .ok_or(Error::BadLength {
-                at: 0,
+                at,
                 len: nodes as i64,
             })?;
         r.skip(skip)?;
