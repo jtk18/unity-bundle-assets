@@ -16,7 +16,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .next()
         .ok_or("usage: list <file-or-bundle> [class-id]")?;
     let filter: Option<i32> = common::text_arg(&mut args, "the class id")?
-        .map(|s| s.parse())
+        .map(|s| s.parse().map_err(|e| format!("the class id: {e}")))
         .transpose()?;
     let assets = unity_bundle_assets::Assets::open(&path)?;
     let file = assets.file();

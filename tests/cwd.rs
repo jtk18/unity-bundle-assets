@@ -21,5 +21,5 @@ fn a_bare_file_name_reads_streams_from_the_current_folder() {
     dir.file("t.assets.resS", &[9; 16]);
     std::env::set_current_dir(&dir.0).unwrap();
     let a = Assets::open("t.assets").unwrap();
-    assert_eq!(a.decode_texture(7).unwrap().rgba.len(), 64);
+    assert_eq!(a.decode_texture(7).unwrap().rgba().len(), 64);
 }

@@ -15,7 +15,7 @@ const RECT: u32 = 0b10;
 const PACKED: u32 = 0b01;
 
 fn ids(image: &Image) -> Vec<u8> {
-    image.rgba.chunks(4).map(|p| p[0] / 4).collect()
+    image.rgba().chunks(4).map(|p| p[0] / 4).collect()
 }
 
 fn texture_object(big: bool) -> Vec<u8> {
@@ -90,7 +90,7 @@ fn rect_sprite_crops_top_row_first() {
         own("s", [1.0, 1.0, 2.0, 2.0], RECT),
     )]));
     let img = export_one(&mut a, "s").unwrap();
-    assert_eq!((img.width, img.height), (2, 2));
+    assert_eq!((img.width(), img.height()), (2, 2));
     assert_eq!(ids(&img), [9, 10, 5, 6]);
 }
 
@@ -116,7 +116,7 @@ fn packing_rotations_are_undone() {
     let s = own("s", [0.0, 0.0, 3.0, 2.0], PACKED | RECT | 4 << 2);
     let (_d, mut a) = open(&with_texture(vec![(1, s)]));
     let img = export_one(&mut a, "s").unwrap();
-    assert_eq!((img.width, img.height), (2, 3));
+    assert_eq!((img.width(), img.height()), (2, 3));
     assert_eq!(ids(&img), [0, 4, 1, 5, 2, 6]);
 }
 
@@ -128,7 +128,7 @@ fn rects_are_snapped_then_must_fit() {
         own("s", [1.0, 1.00003, 2.0, 2.0], RECT),
     )]));
     let img = export_one(&mut a, "s").unwrap();
-    assert_eq!((img.width, img.height), (2, 2));
+    assert_eq!((img.width(), img.height()), (2, 2));
     // Anything else outside the texture, or empty, is an error rather than a smaller image.
     for rect in [
         [3.0, 3.0, 2.0, 2.0],
@@ -173,7 +173,8 @@ fn tight(big: bool, unity_6000_5: bool, mesh: &Mesh) -> Vec<u8> {
 
 fn kept(img: &Image) -> Vec<u8> {
     // Stored indices of the pixels left opaque, in output (top-down) order.
-    img.rgba
+    img.rgba()
+        .to_vec()
         .chunks(4)
         .filter(|p| p[3] != 0)
         .map(|p| p[0] / 4)
@@ -193,7 +194,7 @@ fn tight_sprites_are_masked_to_their_mesh() {
     assert_eq!(kept(&img), LOWER_LEFT);
     // Masked pixels are cleared entirely.
     assert!(img
-        .rgba
+        .into_rgba()
         .chunks(4)
         .filter(|p| p[3] == 0)
         .all(|p| p == [0, 0, 0, 0]));
@@ -548,12 +549,15 @@ fn cut_checks_what_it_is_given() {
     let sprite = a.sprites(|_| true).sprites.remove(0);
     let small = Image::new(1, 1, vec![0; 4]).unwrap();
     assert!(matches!(a.cut(&sprite, &small), Err(Error::Invalid(_))));
-    let mut lying = a.decode_texture(TEX).unwrap();
-    lying.width += 1;
-    assert!(a.cut(&sprite, &lying).is_err());
-    lying.width -= 1;
-    lying.rgba.truncate(10);
-    assert!(a.cut(&sprite, &lying).is_err());
+    // An image cannot disagree with itself: the constructor refuses one that would.
+    assert!(matches!(
+        Image::new(5, 4, vec![0; 64]),
+        Err(Error::InvalidArgument(_))
+    ));
+    assert!(matches!(
+        Image::new(4, 4, vec![0; 10]),
+        Err(Error::InvalidArgument(_))
+    ));
 }
 
 #[test]

@@ -25,7 +25,9 @@ fn streamed_from(
         serialized(17, "2018.4.36f1", false, 19, &[(7, TEXTURE_2D, obj)]),
     )
     .unwrap();
-    Assets::open(&path)?.decode_texture(7).map(|i| i.rgba)
+    Assets::open(&path)?
+        .decode_texture(7)
+        .map(unity_bundle_assets::Image::into_rgba)
 }
 
 fn alpha8(dir: &TempDir, stream_path: &str) -> Result<Vec<u8>, Error> {

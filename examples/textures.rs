@@ -53,9 +53,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
-    outln!("exported {ok}, failed {failed}");
+    // The failures decide the exit status, even if the summary cannot be written.
+    let summary = common::write_line(format_args!("exported {ok}, failed {failed}"));
     if failed > 0 {
         return Err(format!("{failed} not exported").into());
     }
-    Ok(())
+    Ok(summary?)
 }

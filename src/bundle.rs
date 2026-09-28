@@ -507,7 +507,7 @@ fn declared_len(declared_size: i64, header: usize, len: u64) -> Result<u64> {
         .ok()
         .filter(|&n| n >= header as u64 && n <= len)
         .ok_or_else(|| {
-            Error::Invalid(if (0..header as i64).contains(&declared_size) {
+            Error::Invalid(if declared_size < header as i64 {
                 format!("bundle header declares {declared_size} bytes, less than its own {header}")
             } else {
                 format!("bundle header declares {declared_size} bytes; the data holds {len}")

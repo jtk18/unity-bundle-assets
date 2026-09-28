@@ -19,5 +19,5 @@ First release. Minimum Rust version 1.83.
   overlap, whatever path spelling reaches them (on Unix by device and inode); strings are held
   to 4 KiB (versions and the paths used to find data must be UTF-8); files are checked by
   header before they are read; stream files must be regular files beside the asset, with
-  plain ASCII names, no device names or data streams, and (on Unix) no links, opened without
-  blocking.
+  plain ASCII names, no device names or data streams, no symbolic links, and (on Unix) no
+  other hard links, opened without blocking.

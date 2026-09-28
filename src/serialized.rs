@@ -148,6 +148,8 @@ impl SerializedFile {
     ///
     /// As [`SerializedFile::parse`].
     pub fn parse_with(data: Vec<u8>, limits: Limits) -> Result<Self> {
+        // As when the bytes come from a file.
+        Error::limit(LimitKind::FileSize, data.len() as u64, limits.max_file_size)?;
         let parsed = parse(&data, &limits)?;
         Ok(Self::build(parsed, Bytes::Owned(data), limits))
     }

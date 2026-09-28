@@ -14,9 +14,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .ok_or("usage: dump <file> <path-id> [max-bytes]")?;
     let id: i64 = common::text_arg(&mut args, "the path id")?
         .ok_or("usage: dump <file> <path-id> [max-bytes]")?
-        .parse()?;
+        .parse()
+        .map_err(|e| format!("the path id: {e}"))?;
     let max: usize = common::text_arg(&mut args, "the byte count")?
-        .map(|s| s.parse())
+        .map(|s| s.parse().map_err(|e| format!("the byte count: {e}")))
         .transpose()?
         .unwrap_or(512);
     let assets = unity_bundle_assets::Assets::open(&path)?;

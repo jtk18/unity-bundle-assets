@@ -67,8 +67,12 @@ fn inline_textures_in_every_layout() {
             "{unity}"
         );
         let image = assets.decode_texture(7).unwrap();
-        assert_eq!((image.width, image.height), (4, 4));
-        assert_eq!(image.rgba, flip(&pixels, 4), "{unity}: top row first");
+        assert_eq!((image.width(), image.height()), (4, 4));
+        assert_eq!(
+            image.into_rgba(),
+            flip(&pixels, 4),
+            "{unity}: top row first"
+        );
     }
 }
 
@@ -129,7 +133,7 @@ fn metadata_sections_are_stepped_over() {
         );
         let (_d, assets) = open_file("meta", &file);
         assert_eq!(
-            assets.unwrap().decode_texture(7).unwrap().rgba,
+            assets.unwrap().decode_texture(7).unwrap().into_rgba(),
             flip(&rgba_4x4(), 4)
         );
     }
@@ -184,7 +188,10 @@ fn big_endian_files() {
     let (_d, assets) = open_file("be", &file);
     let assets = assets.unwrap();
     assert!(assets.file().big_endian());
-    assert_eq!(assets.decode_texture(7).unwrap().rgba, flip(&pixels, 4));
+    assert_eq!(
+        assets.decode_texture(7).unwrap().into_rgba(),
+        flip(&pixels, 4)
+    );
 }
 
 #[test]
@@ -203,8 +210,8 @@ fn several_objects() {
     );
     let (_d, assets) = open_file("multi", &file);
     let assets = assets.unwrap();
-    assert_eq!(assets.decode_texture(9).unwrap().rgba, flip(&b, 4));
-    assert_eq!(assets.decode_texture(5).unwrap().rgba, flip(&a, 4));
+    assert_eq!(assets.decode_texture(9).unwrap().into_rgba(), flip(&b, 4));
+    assert_eq!(assets.decode_texture(5).unwrap().into_rgba(), flip(&a, 4));
     assert!(matches!(assets.decode_texture(6), Err(Error::NotFound(_))));
 }
 
@@ -221,7 +228,7 @@ fn mip_levels_after_the_first_are_ignored() {
     );
     let (_d, assets) = open_file("mip", &file);
     assert_eq!(
-        assets.unwrap().decode_texture(7).unwrap().rgba,
+        assets.unwrap().decode_texture(7).unwrap().into_rgba(),
         flip(&rgba_4x4(), 4)
     );
 }
@@ -282,7 +289,11 @@ fn streamed_textures_beside_the_file() {
             &serialized(22, unity, false, 19, &[(7, TEXTURE_2D, obj)]),
         );
         assert_eq!(
-            Assets::open(&path).unwrap().decode_texture(7).unwrap().rgba,
+            Assets::open(&path)
+                .unwrap()
+                .decode_texture(7)
+                .unwrap()
+                .into_rgba(),
             flip(&pixels, 4)
         );
     }
@@ -366,7 +377,7 @@ fn bundles_in_every_container_variant() {
         let dir = TempDir::new("bundle");
         let assets = Assets::open(dir.file("b", &bytes)).unwrap();
         assert_eq!(
-            assets.decode_texture(7).unwrap().rgba,
+            assets.decode_texture(7).unwrap().into_rgba(),
             want,
             "{unity} {:?}",
             opts.blocks
@@ -518,7 +529,7 @@ fn bundles_with_several_serialized_files() {
         assert!(assets
             .decode_texture(7)
             .unwrap()
-            .rgba
+            .into_rgba()
             .chunks(4)
             .all(|p| p[..3] == [byte; 3]));
     }

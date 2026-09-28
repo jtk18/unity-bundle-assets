@@ -18,12 +18,9 @@ use std::sync::{Arc, OnceLock, RwLock};
 #[derive(Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Image {
-    /// Width in pixels.
-    pub width: u32,
-    /// Height in pixels.
-    pub height: u32,
-    /// Four bytes per pixel, row after row, top row first.
-    pub rgba: Vec<u8>,
+    width: u32,
+    height: u32,
+    rgba: Vec<u8>,
 }
 
 impl std::fmt::Debug for Image {
@@ -51,6 +48,30 @@ impl Image {
         };
         image.check()?;
         Ok(image)
+    }
+
+    /// Width in pixels.
+    #[must_use]
+    pub const fn width(&self) -> u32 {
+        self.width
+    }
+
+    /// Height in pixels.
+    #[must_use]
+    pub const fn height(&self) -> u32 {
+        self.height
+    }
+
+    /// Four bytes per pixel, row after row, top row first.
+    #[must_use]
+    pub fn rgba(&self) -> &[u8] {
+        &self.rgba
+    }
+
+    /// The pixels, as [`Image::rgba`], without copying them.
+    #[must_use]
+    pub fn into_rgba(self) -> Vec<u8> {
+        self.rgba
     }
 
     fn check(&self) -> Result<()> {
@@ -181,7 +202,7 @@ fn folder_of(path: &Path) -> &Path {
 
 impl Assets {
     /// Open a serialized file, or an asset bundle holding exactly one, with the default
-    /// [`Limits`]. For a bundle holding several (scene bundles), use [`Bundle::parse`] and
+    /// [`Limits`]. For a bundle holding several (scene bundles), use [`Bundle::open`] and
     /// [`Assets::from_bundle`].
     ///
     /// # Errors
@@ -387,6 +408,17 @@ impl Assets {
                             list.sprites.push(sprite);
                             continue;
                         }
+                        // Say what the list would hold, against the limit set, not what
+                        // was left of it.
+                        Err(Error::LimitExceeded {
+                            kind: LimitKind::TotalTriangles,
+                            value,
+                            ..
+                        }) => Error::LimitExceeded {
+                            kind: LimitKind::TotalTriangles,
+                            value: triangles.saturating_add(value),
+                            limit,
+                        },
                         Err(e) => e,
                     }
                 }
@@ -447,6 +479,18 @@ impl Assets {
         Texture2D::read(&self.file, object)
     }
 
+    /// The length an object's name states (its first field), as far as the file holds it: what
+    /// reading the name will cost, known before it is read.
+    fn name_len(&self, path_id: i64) -> u64 {
+        let stated = self
+            .file
+            .object(path_id)
+            .and_then(|o| self.file.reader(o).ok())
+            .and_then(|mut r| r.i32().ok())
+            .unwrap_or(0);
+        u64::try_from(stated).map_or(0, |n| n.min(crate::reader::MAX_STRING as u64))
+    }
+
     /// Where the sprite's pixels are: its atlas entry when it has one, its own render data
     /// otherwise.
     ///
@@ -497,11 +541,15 @@ impl Assets {
     ///
     /// When the texture cannot be read or decoded, or a limit is reached.
     pub fn decode_texture(&self, path_id: i64) -> Result<Image> {
-        // Every call costs its step, refused or not, and reading a long name costs more: a
-        // unit for each byte of it past the step's share. Kept whatever happens next.
+        // Every call costs its step, refused or not, and reading long strings costs more: a
+        // unit for each byte of the name and stream path past the step's share, the name's
+        // taken from its length before it is read. Kept whatever happens next.
         self.reserve(CALL_STEP)?;
+        let name_len = self.name_len(path_id);
+        self.reserve(name_len.saturating_sub(CALL_STEP))?;
         let texture = self.texture(path_id)?;
-        self.reserve((texture.name.len() as u64).saturating_sub(CALL_STEP))?;
+        let path = texture.stream.as_ref().map_or(0, |s| s.path.len() as u64);
+        self.reserve((name_len + path).saturating_sub(CALL_STEP.max(name_len)))?;
         if texture.width == 0 || texture.height == 0 {
             return Err(Error::EmptyTexture(texture.name));
         }
@@ -561,7 +609,8 @@ impl Assets {
             Cow::Borrowed(b) => decode::decode(format, width, height, b),
         }
         .map_err(|e| match e {
-            Error::Invalid(what) => {
+            // Sizes the file gave: the file's fault, not the caller's.
+            Error::Invalid(what) | Error::InvalidArgument(what) => {
                 Error::Invalid(format!("texture {}: {what}", quoted(&texture.name)))
             }
             e => e,
@@ -582,6 +631,8 @@ impl Assets {
     /// As [`Assets::cut`]; when the texture cannot be decoded,
     /// [`Error::TextureUnreadable`] holding the reason.
     pub fn export(&mut self, sprite: &Sprite) -> Result<Image> {
+        // The cut's step first, refused or not; the decode charges its own.
+        self.reserve(CALL_STEP)?;
         let placement = self.placement(sprite)?;
         let texture = texture_id_of(sprite, &placement)?;
         // The old texture is dropped before the next is decoded, so two are never held at
@@ -628,11 +679,12 @@ impl Assets {
     /// When the image is inconsistent or does not contain the sprite's rect, the sprite uses
     /// packing this crate does not undo, its mask cannot be built, or a limit is reached.
     pub fn cut(&self, sprite: &Sprite, texture: &Image) -> Result<Image> {
+        // Every cut costs its step, refused or not, before anything is read.
+        self.reserve(CALL_STEP)?;
         self.cut_at(sprite, &self.placement(sprite)?, texture)
     }
 
     fn cut_at(&self, sprite: &Sprite, placement: &Placement, texture: &Image) -> Result<Image> {
-        texture.check()?;
         let name = &sprite.name;
         if !placement.alpha_texture.is_null() {
             return Err(Error::Unsupported(format!(
@@ -737,7 +789,7 @@ impl Assets {
         let columns = mask.as_ref().map_or(0, |m| m.columns);
         // A quarter turn reads the texture down its columns, at about twice the cost a pixel.
         let per_pixel = if rotation == Rotation::Rotate90 { 2 } else { 1 };
-        self.reserve(CALL_STEP + columns + per_pixel * u64::from(sw) * u64::from(sh))?;
+        self.reserve(columns + per_pixel * u64::from(sw) * u64::from(sh))?;
         let coverage = mask.map(|m| m.fill(sw, sh)).transpose()?;
 
         // The texel under sprite-space pixel (sx, sy): undo the rotation to get the crop

@@ -51,7 +51,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         *by.entry((
             tex,
             settings.map(Settings::tight),
-            settings.map_or_else(|| "?".into(), |s| format!("{:?}", s.rotation())),
+            settings
+                .and_then(Settings::rotation)
+                .map_or_else(|| "?".into(), |r| format!("{r:?}")),
             !sprite.atlas.is_null(),
         ))
         .or_insert(0) += 1;
@@ -86,7 +88,7 @@ fn kind(e: &Error) -> String {
         Error::Unsupported(_) => "unsupported".into(),
         Error::UnsupportedTextureFormat { format, .. } => format!("texture format {format}"),
         Error::Encrypted => "encrypted".into(),
-        Error::LimitExceeded { kind, .. } => format!("limit {kind:?}"),
+        Error::LimitExceeded { kind, .. } => format!("limit: {kind}"),
         Error::NotFound(_) => "not found".into(),
         Error::WrongClass { .. } => "wrong class".into(),
         Error::EmptyTexture(_) => "empty texture".into(),

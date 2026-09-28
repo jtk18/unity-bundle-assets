@@ -340,7 +340,7 @@ fn read_fields<'a>(r: &mut Reader<'a>, version: Version) -> Result<Texture2D<'a>
     // The limit group name arrived in 2022.2.0b3; b1 and b2 lack it.
     if version.at_least([2022, 2, 0], 'b', 3) {
         r.align(4);
-        r.aligned_string()?; // m_MipmapLimitGroupName
+        r.skip_string()?; // m_MipmapLimitGroupName
     }
     if at_least(2018, 2, 0) {
         r.bool()?; // m_StreamingMipmaps
@@ -368,11 +368,17 @@ fn read_fields<'a>(r: &mut Reader<'a>, version: Version) -> Result<Texture2D<'a>
         u64::from(r.u32()?)
     };
     let size = r.u32()?;
-    // A path that names the stream must be UTF-8; one no stream uses is only kept.
+    // A path that names the stream must be UTF-8; one no stream uses is stepped over.
     let path = if image_data.is_empty() && size > 0 {
-        r.aligned_path()?
+        r.aligned_path().map_err(|e| match e {
+            Error::Invalid(what) => {
+                Error::Invalid(format!("texture {}: stream {what}", quoted(&name)))
+            }
+            e => e,
+        })?
     } else {
-        r.aligned_string()?
+        r.skip_string()?;
+        String::new()
     };
     let stream =
         Some(StreamingInfo { offset, size, path }).filter(|s| image_data.is_empty() && s.size > 0);

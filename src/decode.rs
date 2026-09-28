@@ -80,13 +80,16 @@ pub fn decode(format: i32, width: u32, height: u32, data: &[u8]) -> Result<Vec<u
         .and_then(|p| p.checked_mul(4))
         .filter(|&n| isize::try_from(n).is_ok());
     let (Some(size), Some(out_len)) = (mip0_size(format, width, height), out_len) else {
-        return Err(Error::Invalid(format!(
+        return Err(Error::InvalidArgument(format!(
             "a {width}x{height} texture is too large to decode"
         )));
     };
-    let data = data
-        .get(..size)
-        .ok_or_else(|| Error::Invalid(format!("{} bytes of pixels, need {size}", data.len())))?;
+    let data = data.get(..size).ok_or_else(|| {
+        Error::InvalidArgument(format!("{} bytes of pixels, need {size}", data.len()))
+    })?;
+    if out_len == 0 {
+        return Ok(Vec::new());
+    }
     let mut out = crate::zeroed(out_len)?;
     match format {
         format::DXT1 => blocks(data, &mut out, w, h, 8, |b, px| color_block(b, px, true)),

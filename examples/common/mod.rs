@@ -21,7 +21,7 @@ pub fn file_name(name: &str) -> String {
         .take(100)
         .collect();
     let stem = safe.split('.').next().unwrap_or("").to_ascii_uppercase();
-    let device = ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"].contains(&stem.as_str())
+    let device = ["CON", "PRN", "AUX", "NUL"].contains(&stem.as_str())
         || (stem.len() == 4
             && (stem.starts_with("COM") || stem.starts_with("LPT"))
             && stem.as_bytes()[3].is_ascii_digit());
@@ -93,17 +93,22 @@ pub fn save_png(
         .create_new(true)
         .open(path)
         .map_err(|e| format!("{}: {e}", path.display()))?;
-    image::codecs::png::PngEncoder::new(std::io::BufWriter::new(file)).write_image(
-        &image.rgba,
-        image.width,
-        image.height,
+    // Flushed here, not on drop, so a disk that fills up at the end is an error, not a
+    // silently truncated PNG.
+    let mut out = std::io::BufWriter::new(file);
+    image::codecs::png::PngEncoder::new(&mut out).write_image(
+        image.rgba(),
+        image.width(),
+        image.height(),
         image::ExtendedColorType::Rgba8,
     )?;
+    std::io::Write::flush(&mut out)?;
     Ok(())
 }
 
 /// Print a line to standard output, returning the error instead of panicking when it cannot
 /// be written (a closed pipe, as `| head` makes).
+#[allow(unused_macros, reason = "each example uses only some of these helpers")]
 macro_rules! outln {
     ($($arg:tt)*) => {
         common::write_line(format_args!($($arg)*))?
@@ -114,6 +119,13 @@ macro_rules! outln {
 pub fn write_line(line: std::fmt::Arguments<'_>) -> std::io::Result<()> {
     use std::io::Write;
     writeln!(std::io::stdout().lock(), "{line}")
+}
+
+/// Write a line to standard error, dropping it if standard error is gone (a closed pipe):
+/// the exit status still says what happened.
+fn to_stderr(line: std::fmt::Arguments<'_>) {
+    use std::io::Write;
+    let _ = writeln!(std::io::stderr().lock(), "{line}");
 }
 
 /// End an example: print its error, if any, as one cleaned line (not `Debug`), and exit
@@ -150,11 +162,11 @@ pub fn report(printed: &mut usize, line: impl FnOnce() -> String) {
     if *printed < MAX_REPORTED {
         let line = line();
         match line.char_indices().nth(MAX_LINE) {
-            Some((cut, _)) => eprintln!("{}...", &line[..cut]),
-            None => eprintln!("{line}"),
+            Some((cut, _)) => to_stderr(format_args!("{}...", &line[..cut])),
+            None => to_stderr(format_args!("{line}")),
         }
     } else if *printed == MAX_REPORTED {
-        eprintln!("(further errors are counted, not printed)");
+        to_stderr(format_args!("(further errors are counted, not printed)"));
     }
     *printed += 1;
 }

@@ -314,7 +314,8 @@ pub struct Limits {
     pub max_objects: u64,
     /// Most pixels in one texture this crate will decode. Default 16384 x 16384, Unity's
     /// own maximum: beyond the open file, up to about 1.75 GiB more to decode one texture of
-    /// that size and 2.25 GiB more to export a sprite from it.
+    /// that size and 2.25 GiB more to export a sprite from it. Raising it does not admit
+    /// larger textures: a side past 16384 is refused when the texture is read.
     pub max_texture_pixels: u64,
     /// Most triangles in one sprite's mesh. Default 65,536.
     pub max_sprite_triangles: u64,

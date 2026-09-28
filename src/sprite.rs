@@ -258,7 +258,7 @@ fn read_sprite(
     r.align(4);
     let render_data_key = RenderDataKey::read(r)?;
     for _ in 0..r.len(4)? {
-        r.aligned_string()?; // m_AtlasTags
+        r.skip_string()?; // m_AtlasTags
     }
     let atlas = PPtr::read(r)?;
 
@@ -267,7 +267,7 @@ fn read_sprite(
     let alpha_texture = PPtr::read(r)?;
     for _ in 0..r.len(16)? {
         PPtr::read(r)?; // secondaryTextures
-        r.aligned_string()?;
+        r.skip_string()?;
     }
     let triangles = read_mesh(r, big_endian, budget)?;
     let bindposes = r.len(64)?;
@@ -287,9 +287,9 @@ fn read_sprite(
     }
     let bone_guid_and_colour = v >= [2021, 1, 0];
     for _ in 0..r.len(if bone_guid_and_colour { 48 } else { 40 })? {
-        r.aligned_string()?; // name
+        r.skip_string()?; // name
         if bone_guid_and_colour {
-            r.aligned_string()?; // guid
+            r.skip_string()?; // guid
         }
         r.skip(12 + 16 + 4 + 4)?; // position, rotation, length, parentId
         if bone_guid_and_colour {
@@ -527,7 +527,7 @@ fn read_atlas(r: &mut Reader, v: [u32; 3]) -> Result<SpriteAtlas> {
     let packed = r.len(12)?;
     r.skip(packed * 12)?; // m_PackedSprites
     for _ in 0..r.len(4)? {
-        r.aligned_string()?; // m_PackedSpriteNamesToIndex
+        r.skip_string()?; // m_PackedSpriteNamesToIndex
     }
     // An entry is at least 104 bytes: key 24, two pointers 24, rect 16, offsets 16, UV
     // transform 16, downscale and settings 8; from 2020.2 also a list count.
@@ -548,7 +548,7 @@ fn read_atlas(r: &mut Reader, v: [u32; 3]) -> Result<SpriteAtlas> {
         if secondary {
             for _ in 0..r.len(16)? {
                 PPtr::read(r)?;
-                r.aligned_string()?;
+                r.skip_string()?;
             }
         }
         index.entry(key).or_insert(i);
@@ -564,7 +564,7 @@ fn read_atlas(r: &mut Reader, v: [u32; 3]) -> Result<SpriteAtlas> {
             },
         ));
     }
-    r.aligned_string()?; // m_Tag
+    r.skip_string()?; // m_Tag
     r.bool()?; // m_IsVariant
     r.align(4);
     // The last field ends the object. Bytes left over mean the layout was misread.
