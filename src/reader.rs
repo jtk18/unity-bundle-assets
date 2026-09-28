@@ -122,10 +122,11 @@ impl<'a> Reader<'a> {
         Ok(self.u8()? != 0)
     }
 
-    /// A NUL-terminated string, as used in serialized-file metadata, of at most
-    /// [`MAX_STRING`] bytes.
-    pub fn cstr(&mut self) -> Result<String> {
-        let rest = &self.data[self.pos.min(self.data.len())..];
+    /// A NUL-terminated string's bytes, as used in serialized-file metadata, of at most
+    /// [`MAX_STRING`] bytes, and the position it starts at.
+    pub fn cstr_bytes(&mut self) -> Result<(usize, &'a [u8])> {
+        let at = self.pos;
+        let rest = &self.data[at.min(self.data.len())..];
         let len = rest
             .iter()
             .take(MAX_STRING + 1)
@@ -133,40 +134,30 @@ impl<'a> Reader<'a> {
             .ok_or_else(|| {
                 if rest.len() > MAX_STRING {
                     Error::Invalid(format!(
-                        "string at byte {} is longer than {MAX_STRING} bytes",
-                        self.pos
+                        "string at byte {at} is longer than {MAX_STRING} bytes"
                     ))
                 } else {
-                    Error::Truncated(self.pos)
+                    Error::Truncated(at)
                 }
             })?;
-        // Metadata strings (versions, paths) are ASCII as Unity writes them; anything that is
-        // not UTF-8 is not a file this crate reads.
-        let s = std::str::from_utf8(&rest[..len])
-            .map_err(|_| Error::Invalid(format!("string at byte {} is not UTF-8", self.pos)))?
-            .to_owned();
         self.pos += len + 1;
-        Ok(s)
+        Ok((at, &rest[..len]))
     }
 
-    /// As [`Reader::cstr`], but invalid UTF-8 becomes U+FFFD: for strings that are only
-    /// reported, never used to find anything.
+    /// [`Reader::cstr_bytes`] as text. Metadata strings (versions, paths) are ASCII as Unity
+    /// writes them; anything that is not UTF-8 is not a file this crate reads.
+    pub fn cstr(&mut self) -> Result<String> {
+        let (at, bytes) = self.cstr_bytes()?;
+        std::str::from_utf8(bytes)
+            .map(str::to_owned)
+            .map_err(|_| Error::Invalid(format!("string at byte {at} is not UTF-8")))
+    }
+
+    /// [`Reader::cstr_bytes`] as text, invalid UTF-8 shown as U+FFFD: for strings that are
+    /// only reported, never used to find anything.
     pub fn cstr_lossy(&mut self) -> Result<String> {
-        let start = self.pos;
-        let mut strict = self.clone();
-        match strict.cstr() {
-            Ok(s) => {
-                *self = strict;
-                Ok(s)
-            }
-            Err(Error::Invalid(msg)) if msg.ends_with("is not UTF-8") => {
-                let rest = &self.data[start..];
-                let len = rest.iter().position(|&b| b == 0).unwrap_or(rest.len());
-                self.pos = start + len + 1;
-                Ok(text(&rest[..len]))
-            }
-            Err(e) => Err(e),
-        }
+        let (_, bytes) = self.cstr_bytes()?;
+        Ok(text(bytes))
     }
 
     /// An array length, checked against the bytes left so a corrupt length fails cleanly

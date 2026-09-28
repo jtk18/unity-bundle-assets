@@ -50,6 +50,11 @@ pub fn mip0_size(format: i32, width: u32, height: u32) -> Option<usize> {
     }
 }
 
+/// Whether `format` is stored in 4x4 blocks (DXT1, DXT5).
+pub(crate) const fn is_block_format(format: i32) -> bool {
+    matches!(format, format::DXT1 | format::DXT5)
+}
+
 /// Whether this crate decodes `format`.
 #[must_use]
 pub fn is_supported(format: i32) -> bool {
@@ -273,6 +278,22 @@ fn alpha_block(b: &[u8], out: &mut [[u8; 4]; 16]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_four_byte_pixels_are_decoded_in_their_own_buffer() {
+        // Exactly the first mip, and with a mip tail after it: either way the result is the
+        // buffer given, not a copy (the memory figures rest on it).
+        for format in [format::RGBA32, format::BGRA32, format::ARGB32] {
+            for extra in [0, 12] {
+                let data: Vec<u8> = (0..(4 * 3 * 4 + extra) as u8).collect();
+                let at = data.as_ptr();
+                let want = decode(format, 4, 3, &data).unwrap();
+                let got = decode_owned(format, 4, 3, data).unwrap();
+                assert_eq!(got.as_ptr(), at, "format {format}, {extra} extra");
+                assert_eq!(got, want, "format {format}, {extra} extra");
+            }
+        }
+    }
 
     /// The output pixel for stored pixel (x, y), y counted from the bottom as stored.
     fn at(out: &[u8], w: usize, h: usize, x: usize, y: usize) -> [u8; 4] {

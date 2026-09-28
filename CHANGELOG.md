@@ -2,7 +2,7 @@
 
 ## 0.1.0 (unreleased)
 
-First release.
+First release. Minimum Rust version 1.83.
 
 - Serialized files, format versions 17 to 22, little- or big-endian.
 - Asset bundles (`UnityFS`), with blocks stored plain or compressed with LZ4, LZ4HC or LZMA.

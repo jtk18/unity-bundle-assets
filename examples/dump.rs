@@ -1,5 +1,6 @@
 //! Hex-dump one object: `cargo run --example dump -- <file-or-bundle> <path-id> [max-bytes]`.
 
+#[macro_use]
 mod common;
 
 fn main() -> std::process::ExitCode {
@@ -21,7 +22,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let assets = unity_bundle_assets::Assets::open(&path)?;
     let file = assets.file();
     let object = file.object(id).ok_or("no such object")?;
-    println!("class {} size {}", object.class_id(), object.size());
+    outln!("class {} size {}", object.class_id(), object.size());
     let bytes = file.bytes(object).ok_or("object outside the file")?;
     for (i, chunk) in bytes[..object.size().min(max)].chunks(16).enumerate() {
         let hex: Vec<String> = chunk.iter().map(|b| format!("{b:02x}")).collect();
@@ -29,7 +30,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             .iter()
             .map(|&b| if b.is_ascii_graphic() { b as char } else { '.' })
             .collect();
-        println!("{:06x}  {:<48} {text}", i * 16, hex.join(" "));
+        outln!("{:06x}  {:<48} {text}", i * 16, hex.join(" "));
     }
     Ok(())
 }

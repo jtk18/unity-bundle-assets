@@ -1,7 +1,7 @@
 //! Helpers the examples share. Names come from the file being read, so they are cleaned
 //! before they touch a path or a terminal.
 
-#![allow(dead_code)]
+#![allow(dead_code, reason = "each example uses only some of these helpers")]
 
 use std::collections::HashSet;
 
@@ -21,12 +21,13 @@ pub fn file_name(name: &str) -> String {
         .take(100)
         .collect();
     let stem = safe.split('.').next().unwrap_or("").to_ascii_uppercase();
-    let device = ["CON", "PRN", "AUX", "NUL"].contains(&stem.as_str())
+    let device = ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"].contains(&stem.as_str())
         || (stem.len() == 4
             && (stem.starts_with("COM") || stem.starts_with("LPT"))
             && stem.as_bytes()[3].is_ascii_digit());
     if safe.is_empty() || safe.chars().all(|c| c == '.') || safe.starts_with('-') || device {
         safe.insert(0, '_');
+        safe.truncate(100);
     }
     safe
 }
@@ -101,11 +102,31 @@ pub fn save_png(
     Ok(())
 }
 
+/// Print a line to standard output, returning the error instead of panicking when it cannot
+/// be written (a closed pipe, as `| head` makes).
+macro_rules! outln {
+    ($($arg:tt)*) => {
+        common::write_line(format_args!($($arg)*))?
+    };
+}
+
+/// [`outln!`]'s writer.
+pub fn write_line(line: std::fmt::Arguments<'_>) -> std::io::Result<()> {
+    use std::io::Write;
+    writeln!(std::io::stdout().lock(), "{line}")
+}
+
 /// End an example: print its error, if any, as one cleaned line (not `Debug`), and exit
-/// non-zero on failure.
+/// non-zero on failure. Output cut short by a closed pipe is not a failure.
 pub fn finish(result: Result<(), Box<dyn std::error::Error>>) -> std::process::ExitCode {
     match result {
         Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e)
+            if e.downcast_ref::<std::io::Error>()
+                .is_some_and(|e| e.kind() == std::io::ErrorKind::BrokenPipe) =>
+        {
+            std::process::ExitCode::SUCCESS
+        }
         Err(e) => {
             let mut printed = 0;
             report(&mut printed, || {

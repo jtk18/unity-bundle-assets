@@ -1,6 +1,7 @@
 //! Read every sprite and count them by texture format, packing, and atlas use:
 //! `cargo run --example survey -- <file>`.
 
+#[macro_use]
 mod common;
 
 use std::collections::BTreeMap;
@@ -14,12 +15,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let path = std::env::args_os().nth(1).ok_or("usage: survey <file>")?;
     let assets = Assets::open(&path)?;
     let list = assets.sprites(|_| true);
-    for s in list.skipped.iter().take(5) {
-        eprintln!(
-            "sprite {}: {}",
-            s.path_id,
-            common::printable(&s.error.to_string())
-        );
+    let mut printed = 0;
+    for s in &list.skipped {
+        common::report(&mut printed, || {
+            format!(
+                "sprite {}: {}",
+                s.path_id,
+                common::printable(&s.error.to_string())
+            )
+        });
     }
     let mut formats = BTreeMap::new();
     let mut by = BTreeMap::new();
@@ -36,7 +40,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         .map(|t| t.format)
                         .map_err(|e| kind(&e))
                 });
-                format!("{t:?}")
+                match t {
+                    Ok(format) => format!("format {format}"),
+                    Err(kind) => format!("texture error: {kind}"),
+                }
             }
         };
         // Packing is unknown when the placement is: counted apart, not as defaults.
@@ -44,22 +51,28 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         *by.entry((
             tex,
             settings.map(Settings::tight),
-            format!("{:?}", settings.map(Settings::rotation)),
+            settings.map_or_else(|| "?".into(), |s| format!("{:?}", s.rotation())),
             !sprite.atlas.is_null(),
         ))
         .or_insert(0) += 1;
     }
-    println!(
+    outln!(
         "sprites read {}, skipped {}",
         list.sprites.len(),
         list.skipped.len()
     );
     let groups = by.len();
     for (k, n) in by.into_iter().take(common::MAX_REPORTED) {
-        println!("{n:>6} {k:?}");
+        let (texture, tight, rotation, atlas) = k;
+        let tight = match tight {
+            Some(true) => "tight",
+            Some(false) => "rect",
+            None => "?",
+        };
+        outln!("{n:>6} {texture} {tight} {rotation} atlas={atlas}");
     }
     if groups > common::MAX_REPORTED {
-        println!("({} more groups not shown)", groups - common::MAX_REPORTED);
+        outln!("({} more groups not shown)", groups - common::MAX_REPORTED);
     }
     Ok(())
 }
@@ -78,6 +91,7 @@ fn kind(e: &Error) -> String {
         Error::WrongClass { .. } => "wrong class".into(),
         Error::EmptyTexture(_) => "empty texture".into(),
         Error::Invalid(_) => "invalid".into(),
+        Error::InvalidArgument(_) => "invalid argument".into(),
         Error::OutOfMemory { .. } => "out of memory".into(),
         Error::Io { error, .. } => format!("io {:?}", error.kind()),
         _ => "other".into(),

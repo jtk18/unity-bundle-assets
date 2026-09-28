@@ -48,7 +48,7 @@
 //!   size (the parsed directory and LZMA's working memory included), object count, decoded
 //!   pixels, sprite meshes, and the total work spent decoding, cutting and masking, shared by
 //!   everything opened from one file or bundle. Work is reserved before it starts and kept once
-//!   started. The limits bound work, not peak memory: at the default 16384 x 16384, beyond
+//!   reserved. The limits bound work, not peak memory: at the default 16384 x 16384, beyond
 //!   the open file, up to about 1.75 GiB more to decode one texture of that size and 2.25 GiB
 //!   more to export a sprite from it.
 //! - Streamed pixels are read only from the same bundle, or from a `.resS` / `.resource` file
@@ -96,7 +96,8 @@ pub struct ReadmeDoctests;
 /// Everything that can go wrong reading a file.
 ///
 /// Strings that came from a file are quoted (`{:?}`) when displayed, and cut to 64
-/// characters. Each message is complete: an underlying cause is part of it rather than a
+/// characters; the fields themselves (and so `Debug`) hold them whole, up to 12 KiB. Each
+/// message is complete: an underlying cause is part of it rather than a
 /// separate [`std::error::Error::source`] (see [`Error::root`] for the wrapped ones).
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -105,8 +106,9 @@ pub enum Error {
     /// structure being read (an object, a header, a block table), not the file.
     #[error("unexpected end of data at byte {0}")]
     Truncated(usize),
-    /// A length or count that cannot fit in the bytes that follow it, or a string longer
-    /// than the 4 KiB this crate reads. The offset counts as for [`Error::Truncated`].
+    /// A length or count that cannot fit in the bytes that follow it, or a length-prefixed
+    /// string longer than the 4 KiB this crate reads (a NUL-terminated one that long is
+    /// [`Error::Invalid`]). The offset counts as for [`Error::Truncated`].
     #[error("bad length {len} at byte {at}")]
     #[non_exhaustive]
     BadLength {
@@ -184,6 +186,10 @@ pub enum Error {
     /// Data that contradicts itself, or a layout this crate misread.
     #[error("invalid file: {0}")]
     Invalid(String),
+    /// An argument the caller built that contradicts itself, such as an [`Image`] whose
+    /// pixels do not match its size.
+    #[error("invalid argument: {0}")]
+    InvalidArgument(String),
     /// Memory for data within the limits could not be had.
     #[error("out of memory allocating {bytes} bytes")]
     #[non_exhaustive]
@@ -319,10 +325,12 @@ pub struct Limits {
     /// each row a triangle crosses, and one for each column tested. Default 2^29, enough for
     /// a two-triangle mesh over a 16384 x 16384 sprite.
     pub max_mask_work: u64,
-    /// Most work, all told, by one [`Assets`], or by every `Assets` opened from one
-    /// [`Bundle`], in units of about one pixel's: a unit for each pixel decoded or copied,
-    /// 64 for each decode or cut (8192 for a decode that opens a stream file), and the mask
-    /// work. Default 2^34, under a minute of CPU.
+    /// Most work decoding, masking and cutting by one [`Assets`], or by every `Assets` opened
+    /// from one [`Bundle`], in units of about one pixel's: a unit for each pixel decoded
+    /// (whole 4x4 blocks for block formats) or copied (two for a quarter-turned sprite), 64
+    /// for each decode or cut asked for, refused or not, a unit for each byte of a texture
+    /// name past 64, 8192 more for each stream file opened, and the mask work. Opening and
+    /// listing are not counted. Default 2^34, under a minute of CPU.
     pub max_total_work: u64,
 }
 

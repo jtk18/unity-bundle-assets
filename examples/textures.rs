@@ -3,9 +3,10 @@
 //!
 //! Files already in the output folder are never overwritten (each is reported instead), so
 //! export into an empty folder. The output is bounded only by the file's work limit: a small
-//! hostile file can ask for tens of gigabytes of PNG. This example uses the default limits:
-//! watch the disk when exporting files you did not make.
+//! hostile file can ask for tens of gigabytes of PNG, in up to millions of files. This
+//! example uses the default limits: watch the disk when exporting files you did not make.
 
+#[macro_use]
 mod common;
 
 fn main() -> std::process::ExitCode {
@@ -14,16 +15,16 @@ fn main() -> std::process::ExitCode {
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args_os().skip(1);
-    let path = args
-        .next()
-        .ok_or("usage: textures <file-or-bundle> <out-dir> [name-prefix...]")?;
-    let out = std::path::PathBuf::from(args.next().ok_or("out dir")?);
+    let usage = "usage: textures <file-or-bundle> <out-dir> [name-prefix...]";
+    let path = args.next().ok_or(usage)?;
+    let out = std::path::PathBuf::from(args.next().ok_or(usage)?);
     let mut prefixes = Vec::new();
     while let Some(prefix) = common::text_arg(&mut args, "a name prefix")? {
         prefixes.push(prefix);
     }
-    std::fs::create_dir_all(&out)?;
     let assets = unity_bundle_assets::Assets::open(&path)?;
+    // Only once the input opens, so a mistyped input path makes no folder.
+    std::fs::create_dir_all(&out)?;
     let (mut ok, mut failed) = (0, 0);
     let mut printed = 0;
     for texture in
@@ -52,6 +53,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
-    println!("exported {ok}, failed {failed}");
+    outln!("exported {ok}, failed {failed}");
+    if failed > 0 {
+        return Err(format!("{failed} not exported").into());
+    }
     Ok(())
 }

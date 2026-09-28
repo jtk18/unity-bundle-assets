@@ -58,7 +58,7 @@ impl Image {
             .checked_mul(self.height as usize)
             .and_then(|p| p.checked_mul(4));
         if want != Some(self.rgba.len()) {
-            return Err(Error::Invalid(format!(
+            return Err(Error::InvalidArgument(format!(
                 "a {}x{} image holds {} bytes, not {}",
                 self.width,
                 self.height,
@@ -497,7 +497,11 @@ impl Assets {
     ///
     /// When the texture cannot be read or decoded, or a limit is reached.
     pub fn decode_texture(&self, path_id: i64) -> Result<Image> {
+        // Every call costs its step, refused or not, and reading a long name costs more: a
+        // unit for each byte of it past the step's share. Kept whatever happens next.
+        self.reserve(CALL_STEP)?;
         let texture = self.texture(path_id)?;
+        self.reserve((texture.name.len() as u64).saturating_sub(CALL_STEP))?;
         if texture.width == 0 || texture.height == 0 {
             return Err(Error::EmptyTexture(texture.name));
         }
@@ -519,32 +523,37 @@ impl Assets {
         let pixels = u64::from(texture.width) * u64::from(texture.height);
         let limit = self.file.limits().max_texture_pixels;
         Error::limit(LimitKind::TexturePixels, pixels, limit)?;
+        // Block formats decode whole 4x4 blocks, the parts past the edge included.
+        let pixels = if decode::is_block_format(texture.format) {
+            u64::from(texture.width.div_ceil(4) * 4) * u64::from(texture.height.div_ceil(4) * 4)
+        } else {
+            pixels
+        };
+
         // A streamed texture claims its range and reserves its work in one step, before any
         // of it is read: a texture refused its range takes no budget, and a range is claimed
         // only by a texture whose work was reserved. Once reserved, the work is kept: reading
         // starts at once, and work started is never given back.
-        // Opening a stream file costs more than a call; see `FILE_STEP`.
-        let step = if matches!(self.streams, Streams::Dir(_)) {
-            FILE_STEP
-        } else {
-            CALL_STEP
-        };
         let mut claimed = false;
         let mut claim = |stream: StreamKey, start, end| {
             self.shared
                 .claim_stream(stream, start, end, &self.owner, path_id, || {
-                    self.reserve(step + pixels)
+                    self.reserve(pixels)
                 })?;
             claimed = true;
             Ok(())
         };
         let data = match &self.streams {
-            Streams::Dir(dir) => texture.data_claimed(dir, &mut claim)?,
+            // Opening a stream file costs its step before the range is known, and keeps it
+            // whether the range is then granted or refused.
+            Streams::Dir(dir) => {
+                texture.data_claimed(dir, &mut || self.reserve(FILE_STEP), &mut claim)?
+            }
             Streams::Bundle(bundle) => texture.data_in_claimed(bundle, &mut claim)?,
         };
         // Inline pixels claim nothing; they reserve here, with nothing done yet.
         if !claimed {
-            self.reserve(CALL_STEP + pixels)?;
+            self.reserve(pixels)?;
         }
         let (format, width, height) = (texture.format, texture.width, texture.height);
         let rgba = match data {
@@ -726,7 +735,9 @@ impl Assets {
             None => None,
         };
         let columns = mask.as_ref().map_or(0, |m| m.columns);
-        self.reserve(CALL_STEP + columns + u64::from(sw) * u64::from(sh))?;
+        // A quarter turn reads the texture down its columns, at about twice the cost a pixel.
+        let per_pixel = if rotation == Rotation::Rotate90 { 2 } else { 1 };
+        self.reserve(CALL_STEP + columns + per_pixel * u64::from(sw) * u64::from(sh))?;
         let coverage = mask.map(|m| m.fill(sw, sh)).transpose()?;
 
         // The texel under sprite-space pixel (sx, sy): undo the rotation to get the crop
@@ -998,8 +1009,9 @@ const ROW_STEP: u64 = 16;
 /// is held to the total like large ones.
 const CALL_STEP: u64 = 64;
 
-/// Work for a decode that reads its pixels from a stream file, instead of [`CALL_STEP`]:
-/// opening, checking and reading a file costs about 10 microseconds.
+/// Work for a decode that looks for its pixels in a stream file, besides [`CALL_STEP`]:
+/// checking the name, opening and checking the file costs about 10 microseconds, whether or
+/// not the range is then refused.
 const FILE_STEP: u64 = 8192;
 
 /// Farthest a mesh vertex may lie from the image's corner, in pixels: four times the largest

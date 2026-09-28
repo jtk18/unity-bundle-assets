@@ -64,7 +64,8 @@ Exports follow AssetStudio where references disagree: the sprite's texture recta
 padded out to its full rect; Alpha8 as white with the stored alpha (UnityPy gives black);
 `Rotate90` packing undone counter-clockwise (UnityPy turns the other way, and no real sample
 here settles it); the mask's pixel grid starts at the texture rectangle's own origin, not at
-the whole pixel the cut-out starts from, so it can sit a fraction of a pixel off it. A tight
+the whole pixel the cut-out starts from, so it can sit a fraction of a pixel off it; and a
+triangle with no area covers nothing (Pillow, under UnityPy, draws it as a line). A tight
 sprite's mask keeps a pixel when the mesh covers any of four points
 at its quarter positions. Measured against UnityPy's polygon fill over two real files, that
 rule disagreed on 324 pixels; testing the pixel centre alone disagreed on 349, any overlap on
@@ -103,7 +104,7 @@ Files are treated as hostile:
 - One blob cannot be decoded many times over: objects may not overlap or share an ID, bundle
   entries and a sprite's sub-meshes may not overlap, and a range of stream data may be read by
   one texture only. Ranges are compared by the bytes they reach (on Unix, the file's device and
-  inode; elsewhere its lower-cased name, and stream names must be ASCII), not by how the path
+  inode; elsewhere its lower-cased name; stream names must be ASCII everywhere), not by how the path
   to them is spelled; a texture may not stream from a serialized file. Claims last as long as
   the `Assets` (or the `Bundle`), so separate `Assets::open` calls on files that share a
   stream file each claim its ranges afresh.
@@ -119,18 +120,25 @@ Files are treated as hostile:
   objects (4M, across all the files of a bundle); pixels per texture (16384 x 16384);
   triangles per sprite (65,536) and per `sprites` call (4M); mask work per sprite (2^29) and
   total work (2^34). Work is counted in units of about one pixel's: a unit for each pixel
-  decoded or copied and each column tested for a mask; 64 for each decode or cut, whatever
-  its size (8192 for a decode that opens a stream file); and 16 for each mesh triangle and
-  each row a triangle crosses, which is what working them out costs. Mesh vertices must lie
+  decoded (whole 4x4 blocks for DXT) or copied (two for a quarter-turned sprite, which reads
+  the texture down its columns) and each column tested for a mask; 64 for each decode or
+  cut asked for, refused or not, and a unit for each byte of a texture's name past 64; 8192
+  more each time a stream file is opened, whether or not its range is then granted; and 16
+  for each mesh triangle and each row a triangle crosses. Mesh vertices must lie
   within 65,536 pixels of the image's corner, after pivot and offset. A unit costs about 2 ns
   on an Apple silicon Mac, so the total is under a minute of CPU. It is shared by every
   `Assets` opened from one `Bundle` (two `Assets::open` calls on one path are two totals),
   and it is never given back: a long-running program that decodes the same textures again
   and again should raise it. Work is reserved before it starts, and kept once reserved: a
-  request refused before it starts, or data refused before it is read, costs nothing, and a
-  mask refused after its triangles and rows were worked out is charged for those (not for
-  the columns it never tested). Which of several threads' requests are refused under the
-  limit depends on their timing.
+  refusal keeps the steps already reserved (the call, a stream file opened, and a mask's
+  triangles and rows, reserved all at once before any is worked out, so a mask refused
+  partway still pays for all of them) and is not charged for pixels or columns it never
+  touched. Once the total is
+  spent, every decode and cut is refused before it reads anything. Which of several
+  threads' requests are refused under the limit depends on their timing. Opening files and
+  listing their contents is not counted: decompressing LZMA runs at up to about 16 ns a
+  byte, so a bundle that decompresses to the default 1 GiB can take some 15 s of CPU to
+  open, before any work limit applies.
 - `Assets` enforces all of that. Used directly, `Bundle` and `SerializedFile` apply their own
   limits, `Texture2D` refuses data too short for its size but claims no ranges (texture after
   texture may read the same bytes), and `decode::decode` applies none; a caller using them
@@ -144,8 +152,12 @@ Files are treated as hostile:
   texture's stored pixels while they are decoded, unless they are four bytes a pixel and
   converted in place: up to 1.75 GiB in all (RGB24). Exporting a sprite holds up to about
   2.25 GiB more (the decoded texture, the sprite and its mask); each thread decoding and
-  cutting in parallel holds about that much. `Assets::sprites` keeps an entry, some 250
-  bytes with its message, for each sprite it could not read, up to `max_objects`. LZMA can
+  cutting in parallel holds about that much. Names are held as text, up to three times
+  their bytes: every sprite `Assets::sprites` reads and every texture `Assets::textures`
+  lists keeps its name, and each sprite it could not read keeps an entry of some 250 bytes
+  besides its name, up to `max_objects`; so the lists can take up to about three times the
+  file. Each stream range decoded is remembered, some 100 bytes, for the life of the
+  `Assets`. LZMA can
   expand a 150 KB file to the full 1 GiB of decompressed data, and 40 KB of stream data can
   make a 1 GiB texture. Allocations sized by the file fail as `Error::OutOfMemory` where the
   crate makes them, but that is best effort: LZMA's own buffers, the object table and other
@@ -167,7 +179,8 @@ Files are treated as hostile:
   escape them before printing.
 - `ObjectInfo` and `Entry` values are not tied to the file they came from: given to another
   file's readers they read that file's bytes at their offsets. A stream path that names an
-  entry by file name alone (`archive:/<other>/<name>`) finds the first entry of that name.
+  entry by file name alone (`archive:/<other>/<name>`) finds the one entry of that name, or
+  none when two entries share it.
 - An error that `Assets::export` or an atlas passes on wraps its cause
   (`Error::TextureUnreadable`, `Error::AtlasUnreadable`); `Error::root` unwraps it, and
   `Error::io_error` finds an I/O error inside.

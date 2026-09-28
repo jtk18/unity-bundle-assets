@@ -438,7 +438,13 @@ fn parse(data: &[u8], limits: &Limits) -> Result<Parsed> {
     } = header(&mut r, data.len() as u64)?;
 
     r.set_big_endian(big_endian);
-    let unity_version = r.cstr()?;
+    // Not UTF-8 is not a version, as other odd bytes are not.
+    let (_, version_bytes) = r.cstr_bytes()?;
+    let unity_version = std::str::from_utf8(version_bytes)
+        .map_err(|_| {
+            Error::NotUnity("serialized file engine version is not a version (not UTF-8)".into())
+        })?
+        .to_owned();
     check_version_string(&unity_version, "serialized file")?;
     let target_platform = r.i32()?;
     let has_type_trees = r.bool()?;
@@ -515,7 +521,7 @@ fn parse(data: &[u8], limits: &Limits) -> Result<Parsed> {
     let external_count = r.len(22)?;
     let mut externals = Vec::with_capacity(external_count);
     for _ in 0..external_count {
-        r.cstr()?; // always empty
+        r.cstr_bytes()?; // always empty; unused
         r.skip(16)?; // GUID
         r.i32()?; // type
                   // Only reported, never opened: an odd byte here need not refuse the file.

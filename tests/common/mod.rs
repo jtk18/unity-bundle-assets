@@ -970,7 +970,10 @@ impl TempDir {
     pub fn new(tag: &str) -> Self {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static N: AtomicUsize = AtomicUsize::new(0);
-        let dir = std::env::temp_dir().join(format!(
+        // Under the build's own scratch folder when Cargo names one (integration tests), so a
+        // test run leaves nothing in the system's temporary folder.
+        let root = option_env!("CARGO_TARGET_TMPDIR").map_or_else(std::env::temp_dir, Into::into);
+        let dir = root.join(format!(
             "unity-bundle-assets-{tag}-{}-{}",
             std::process::id(),
             N.fetch_add(1, Ordering::Relaxed)

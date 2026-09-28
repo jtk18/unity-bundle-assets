@@ -131,6 +131,9 @@ impl Bundle {
     ///
     /// As [`Bundle::parse`].
     pub fn parse_with(file: &[u8], limits: Limits) -> Result<Self> {
+        // As when the bytes come from a file: the whole of what was given, trailing bytes
+        // included.
+        Error::limit(LimitKind::FileSize, file.len() as u64, limits.max_file_size)?;
         let mut head = Reader::new(file, true);
         let Header {
             format,
@@ -284,6 +287,22 @@ impl Bundle {
         if spans.windows(2).any(|w| w[1].0 < w[0].1) {
             return Err(Error::Invalid("bundle entries overlap".into()));
         }
+        // One entry to a path: with two, which one a path names would depend on how it is
+        // looked up. A file name two entries share names neither.
+        let mut by_path = HashMap::with_capacity(entries.len());
+        let mut by_name = HashMap::with_capacity(entries.len());
+        for (i, e) in entries.iter().enumerate() {
+            if by_path.insert(e.path.clone(), i).is_some() {
+                return Err(Error::Invalid(format!(
+                    "bundle entry {} appears twice",
+                    quoted(&e.path)
+                )));
+            }
+            by_name
+                .entry(file_name(&e.path).to_string())
+                .and_modify(|v: &mut Option<usize>| *v = None)
+                .or_insert(Some(i));
+        }
         drop(spans);
 
         if new_flags && flags & flags::BLOCK_INFO_NEEDS_PADDING != 0 {
@@ -313,22 +332,6 @@ impl Bundle {
             )?;
         }
 
-        // One entry to a path: with two, which one a path names would depend on how it is
-        // looked up. A file name two entries share names neither.
-        let mut by_path = HashMap::with_capacity(entries.len());
-        let mut by_name = HashMap::with_capacity(entries.len());
-        for (i, e) in entries.iter().enumerate() {
-            if by_path.insert(e.path.clone(), i).is_some() {
-                return Err(Error::Invalid(format!(
-                    "bundle entry {} appears twice",
-                    quoted(&e.path)
-                )));
-            }
-            by_name
-                .entry(file_name(&e.path).to_string())
-                .and_modify(|v: &mut Option<usize>| *v = None)
-                .or_insert(Some(i));
-        }
         Ok(Self {
             format,
             unity_version,
@@ -382,8 +385,9 @@ impl Bundle {
             .get(entry.offset..entry.offset.checked_add(entry.size)?)
     }
 
-    /// The entry with this path, or else the first with this file name (stream paths look
-    /// like `archive:/CAB-.../CAB-....resS`; the directory lists `CAB-....resS`).
+    /// The entry with this path, or else the one entry with this file name (stream paths look
+    /// like `archive:/CAB-.../CAB-....resS`; the directory lists `CAB-....resS`). A file name
+    /// two entries share finds neither.
     #[must_use]
     pub fn entry(&self, path: &str) -> Option<&Entry> {
         self.by_path
@@ -464,11 +468,11 @@ fn header(r: &mut Reader<'_>) -> Result<Header> {
     }
     // A version that is not UTF-8 is not a version, as one with other odd bytes is not.
     let mut version = |what: &str| {
-        r.cstr().map_err(|e| match e {
-            Error::Invalid(_) => Error::NotUnity(format!(
+        let (_, bytes) = r.cstr_bytes()?;
+        std::str::from_utf8(bytes).map(str::to_owned).map_err(|_| {
+            Error::NotUnity(format!(
                 "{what} engine version is not a version (not UTF-8)"
-            )),
-            e => e,
+            ))
         })
     };
     let unity_version = version("bundle player")?;
@@ -503,9 +507,11 @@ fn declared_len(declared_size: i64, header: usize, len: u64) -> Result<u64> {
         .ok()
         .filter(|&n| n >= header as u64 && n <= len)
         .ok_or_else(|| {
-            Error::Invalid(format!(
-                "bundle header declares {declared_size} bytes; the data holds {len}"
-            ))
+            Error::Invalid(if (0..header as i64).contains(&declared_size) {
+                format!("bundle header declares {declared_size} bytes, less than its own {header}")
+            } else {
+                format!("bundle header declares {declared_size} bytes; the data holds {len}")
+            })
         })
 }
 

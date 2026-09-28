@@ -218,7 +218,7 @@ fn object_count_is_limited() {
 }
 
 #[test]
-fn work_refused_or_failing_before_reading_is_not_charged() {
+fn work_refused_or_failing_is_charged_only_its_steps() {
     let dir = TempDir::new("charge");
     let file = file_2018(&[
         (
@@ -248,7 +248,19 @@ fn work_refused_or_failing_before_reading_is_not_charged() {
         ),
     ]);
     let path = dir.file("t.assets", &file);
-    let a = Assets::open_with(&path, Limits::DEFAULT.with_max_total_work(CALL + 20)).unwrap();
+    // Room for three failed looks for "gone.resS", texture 2, and texture 1's call but not
+    // its 64 pixels.
+    let limit = 3 * (CALL + FILE) + (CALL + 16) + CALL + 63;
+    let a = Assets::open_with(&path, Limits::DEFAULT.with_max_total_work(limit)).unwrap();
+    for n in 1..=3 {
+        assert!(matches!(a.decode_texture(3), Err(Error::Io { .. })));
+        assert_eq!(
+            a.work_done(),
+            n * (CALL + FILE),
+            "a failed open costs its steps"
+        );
+    }
+    assert!(a.decode_texture(2).is_ok());
     assert!(matches!(
         a.decode_texture(1),
         Err(Error::LimitExceeded {
@@ -256,12 +268,11 @@ fn work_refused_or_failing_before_reading_is_not_charged() {
             ..
         })
     ));
-    for _ in 0..3 {
-        assert!(matches!(a.decode_texture(3), Err(Error::Io { .. })));
-    }
-    assert_eq!(a.work_done(), 0);
-    assert!(a.decode_texture(2).is_ok());
-    assert_eq!(a.work_done(), CALL + 16);
+    assert_eq!(
+        a.work_done(),
+        limit - 63,
+        "the refused pixels are not charged"
+    );
 }
 
 const TRIANGLE: Mesh = Mesh {
@@ -899,7 +910,7 @@ fn an_undecodable_texture_is_refused_before_its_stream_is_read() {
         }
         other => panic!("{other:?}"),
     }
-    assert_eq!(a.work_done(), 0);
+    assert_eq!(a.work_done(), CALL, "the call only: no file was looked for");
 }
 
 // Round 5.
@@ -946,7 +957,11 @@ fn every_spelling_of_a_bundle_stream_claims_the_same_bytes() {
         }
     }
     assert!(a.decode_texture(5).is_ok(), "the next range is fine");
-    assert_eq!(a.work_done(), 2 * (CALL + 16));
+    assert_eq!(
+        a.work_done(),
+        5 * CALL + 2 * 16,
+        "a call each, pixels for two"
+    );
 }
 
 #[test]
@@ -1008,7 +1023,9 @@ fn a_texture_that_fails_claims_nothing() {
         other => panic!("{other:?}"),
     }
     assert!(a.decode_texture(3).is_ok());
-    assert_eq!(a.work_done(), FILE + 16);
+    // Each call its step; textures 1 and 3 opened the file; only texture 3 read pixels.
+    // Texture 2 was refused for its size before the file was looked for.
+    assert_eq!(a.work_done(), 3 * CALL + 2 * FILE + 16);
 }
 
 #[test]
@@ -1023,11 +1040,12 @@ fn short_pixel_data_is_refused_before_it_is_read() {
         Err(Error::Invalid(msg)) => assert!(msg.contains("needs 1073741824"), "{msg}"),
         other => panic!("{other:?}"),
     }
+    assert_eq!(a.work_done(), CALL, "the call only: no file was looked for");
     // Inline data too.
     let obj = rgba_texture(Layout::U2018_4, "t", 4, 4, &Pixels::Inline(&[1; 60]));
     let a = Assets::open(dir.file("u.assets", &file_2018(&[(1, TEXTURE_2D, obj)]))).unwrap();
     assert!(matches!(a.decode_texture(1), Err(Error::Invalid(_))));
-    assert_eq!(a.work_done(), 0);
+    assert_eq!(a.work_done(), CALL);
 }
 
 #[test]
@@ -1461,8 +1479,8 @@ fn threads_share_one_budget_and_one_set_of_claims() {
     paths.extend((1..=8).map(|i| ("t.resS", 64 * i, 64)));
     let file = textures_on(&paths);
     let path = dir.file("t.assets", &file);
-    // Room for five decodes.
-    let room = 5 * (FILE + 16);
+    // Room for every call's steps and five decodes' pixels, if the steps came first.
+    let room = 16 * (CALL + FILE) + 5 * 16;
     let a = Arc::new(Assets::open_with(&path, Limits::DEFAULT.with_max_total_work(room)).unwrap());
     let results: Vec<(i64, bool)> = std::thread::scope(|scope| {
         #[allow(
@@ -1480,8 +1498,10 @@ fn threads_share_one_budget_and_one_set_of_claims() {
     let decoded: Vec<i64> = results.iter().filter(|r| r.1).map(|r| r.0).collect();
     let shared = decoded.iter().filter(|&&id| id <= 8).count();
     assert!(shared <= 1, "one range decoded {shared} times: {decoded:?}");
-    assert_eq!(decoded.len(), 5, "{decoded:?}");
-    assert_eq!(a.work_done(), room);
+    // Every call is charged its steps as it reaches them, so how many get to their pixels
+    // depends on timing; the total is never passed.
+    assert!(!decoded.is_empty());
+    assert!(a.work_done() <= room);
 }
 
 // Round 5: gaps the mutation run found.
@@ -1509,7 +1529,7 @@ fn cut_names_the_image_it_was_given() {
     let mut image = Image::new(3, 2, vec![0; 24]).unwrap();
     image.rgba.pop();
     match a.cut(&s, &image) {
-        Err(Error::Invalid(msg)) => {
+        Err(Error::InvalidArgument(msg)) => {
             assert!(msg.contains("3x2 image holds 23 bytes, not 24"), "{msg}");
         }
         other => panic!("{other:?}"),
@@ -1831,6 +1851,7 @@ fn a_downscale_within_a_ten_thousandth_counts_as_none() {
         (1.0, true),
         (1.000_05, true),
         (0.999_95, true),
+        (1.000_15, false),
         (1.000_5, false),
         (0.5, false),
     ] {
@@ -2370,22 +2391,32 @@ fn rotation_bits_count_only_when_packed() {
 
 #[test]
 fn a_texture_refused_its_budget_gives_its_range_back() {
+    // Texture 1 wants 16384 pixels of the range, texture 2 16 pixels of the same range.
+    // Texture 1 is charged its steps and refused its pixels, and claims nothing.
     let dir = TempDir::new("giveback");
-    dir.file("t.resS", &[7; 256]);
-    // Texture 1 wants 64 pixels of the range, texture 2 16 pixels of the same range.
-    let big = rgba_texture(Layout::U2018_4, "big", 8, 8, &streamed("t.resS", 0, 256));
+    dir.file("t.resS", &vec![7; 65536]);
+    let big = rgba_texture(
+        Layout::U2018_4,
+        "big",
+        128,
+        128,
+        &streamed("t.resS", 0, 65536),
+    );
     let small = rgba_texture(Layout::U2018_4, "small", 4, 4, &streamed("t.resS", 0, 64));
     let file = file_2018(&[(1, TEXTURE_2D, big), (2, TEXTURE_2D, small)]);
+    let steps = CALL + FILE;
     let a = Assets::open_with(
         dir.file("t.assets", &file),
-        Limits::DEFAULT.with_max_total_work(FILE + 20),
+        Limits::DEFAULT.with_max_total_work(2 * steps + 100),
     )
     .unwrap();
     assert!(matches!(
         a.decode_texture(1),
         Err(Error::LimitExceeded { .. })
     ));
+    assert_eq!(a.work_done(), steps);
     assert!(a.decode_texture(2).is_ok());
+    assert_eq!(a.work_done(), 2 * steps + 16);
 }
 
 #[test]
@@ -2782,14 +2813,23 @@ fn racing_threads_never_share_a_range() {
 
 #[test]
 fn a_texture_refused_its_budget_keeps_the_range_it_read() {
+    // Texture 1 reads 16384 pixels of the file; asked again, it is charged its steps and
+    // refused its pixels, and keeps its range: texture 2 may not read the same bytes.
     let dir = TempDir::new("keep");
-    dir.file("t.resS", &[7; 256]);
-    let big = rgba_texture(Layout::U2018_4, "big", 8, 8, &streamed("t.resS", 0, 256));
+    dir.file("t.resS", &vec![7; 65536]);
+    let big = rgba_texture(
+        Layout::U2018_4,
+        "big",
+        128,
+        128,
+        &streamed("t.resS", 0, 65536),
+    );
     let small = rgba_texture(Layout::U2018_4, "small", 4, 4, &streamed("t.resS", 0, 64));
     let file = file_2018(&[(1, TEXTURE_2D, big), (2, TEXTURE_2D, small)]);
+    let steps = CALL + FILE;
     let a = Assets::open_with(
         dir.file("t.assets", &file),
-        Limits::DEFAULT.with_max_total_work(FILE + 80),
+        Limits::DEFAULT.with_max_total_work((steps + 16384) + (steps + 100) + steps),
     )
     .unwrap();
     assert!(a.decode_texture(1).is_ok());
@@ -2797,10 +2837,10 @@ fn a_texture_refused_its_budget_keeps_the_range_it_read() {
         a.decode_texture(1),
         Err(Error::LimitExceeded { .. })
     ));
-    assert!(
-        a.decode_texture(2).is_err(),
-        "range read by texture 1 was handed to texture 2"
-    );
+    match a.decode_texture(2) {
+        Err(Error::Invalid(msg)) => assert!(msg.contains("already read"), "{msg}"),
+        other => panic!("range read by texture 1 was handed to texture 2: {other:?}"),
+    }
 }
 
 #[test]
@@ -3925,4 +3965,299 @@ fn a_dependency_path_that_is_not_utf8_is_shown_not_refused() {
     assert_eq!(parsed.externals()[0].path, "library/\u{fffd}QQ.assets");
     let a = Assets::from_serialized(parsed, "").unwrap();
     assert!(a.decode_texture(7).is_ok());
+}
+
+// Round 9.
+
+#[test]
+fn a_long_name_costs_a_unit_a_byte_past_the_calls_share() {
+    for (len, extra) in [(1, 0), (64, 0), (65, 1), (4096, 4096 - 64)] {
+        let name = "n".repeat(len);
+        let t = rgba_texture(Layout::U2022_3, &name, 1, 1, &Pixels::Inline(&[1, 2, 3, 4]));
+        let file = serialized(22, "2022.3.62f1", false, 19, &[(7, TEXTURE_2D, t)]);
+        let a = Assets::from_serialized(SerializedFile::parse(file).unwrap(), "").unwrap();
+        a.decode_texture(7).unwrap();
+        assert_eq!(a.work_done(), CALL + extra + 1, "name of {len}");
+    }
+}
+
+#[test]
+fn a_quarter_turn_costs_two_units_a_pixel() {
+    // A 4x4 sprite over the whole 4x4 texture, packed with each rotation: the copy is a unit
+    // a pixel, two for a quarter turn, which reads the texture down its columns.
+    for (rotation, per_pixel) in [(0u32, 1u64), (1, 1), (3, 1), (4, 2)] {
+        let r = [0.0, 0.0, 4.0, 4.0];
+        let s = sprite(
+            false,
+            false,
+            "s",
+            r,
+            [0.0, 0.0],
+            1,
+            0,
+            TEX,
+            0,
+            r,
+            RECT | PACKED | rotation << 2,
+            1.0,
+            &Mesh::BASE,
+        );
+        let (_d, mut a, s) = one_sprite(s, Limits::default());
+        a.export(&s).unwrap();
+        assert_eq!(
+            a.work_done(),
+            (CALL + 16) + (CALL + per_pixel * 16),
+            "rotation {rotation}"
+        );
+    }
+}
+
+#[test]
+fn block_formats_are_charged_their_whole_blocks() {
+    // A 5 x 1 DXT1 texture is two 4x4 blocks: 32 pixels decoded, 5 kept.
+    let t = texture(
+        Layout::U2022_3,
+        false,
+        "d",
+        5,
+        1,
+        format::DXT1,
+        &Pixels::Inline(&[0; 16]),
+        &[],
+    );
+    let file = serialized(22, "2022.3.62f1", false, 19, &[(7, TEXTURE_2D, t)]);
+    let a = Assets::from_serialized(SerializedFile::parse(file).unwrap(), "").unwrap();
+    a.decode_texture(7).unwrap();
+    assert_eq!(a.work_done(), CALL + 32);
+}
+
+#[test]
+fn a_decode_refused_after_opening_its_stream_is_charged_the_open() {
+    // Two textures over one range: the second opens the file, is refused the range, and is
+    // charged its steps each time it asks.
+    let dir = TempDir::new("openrefused");
+    dir.file("t.resS", &[7; 64]);
+    let a = Assets::open(dir.file(
+        "t.assets",
+        &textures_on(&[("t.resS", 0, 64), ("t.resS", 0, 64)]),
+    ))
+    .unwrap();
+    a.decode_texture(1).unwrap();
+    for n in 1..=3 {
+        assert!(matches!(a.decode_texture(2), Err(Error::Invalid(_))));
+        assert_eq!(a.work_done(), (CALL + FILE + 16) + n * (CALL + FILE));
+    }
+}
+
+#[test]
+fn every_way_of_reading_a_bundle_holds_it_to_the_file_size_limit() {
+    let mut b = bundle(
+        &BundleOpts::new(6, "2018.4.36f1"),
+        &[("CAB-a", &one_texture_file(), 4)],
+    );
+    let declared = b.len() as u64;
+    b.extend([0xee; 100]);
+    let dir = TempDir::new("filesize");
+    let limits = Limits::DEFAULT.with_max_file_size(declared);
+    let path = dir.file("x.bundle", &b);
+    for (how, got) in [
+        ("parse_with", Bundle::parse_with(&b, limits).err()),
+        ("open_with", Bundle::open_with(&path, limits).err()),
+        (
+            "from_bytes",
+            Assets::from_bytes(b.clone(), "", limits).err(),
+        ),
+    ] {
+        assert!(
+            matches!(
+                got,
+                Some(Error::LimitExceeded {
+                    kind: LimitKind::FileSize,
+                    ..
+                })
+            ),
+            "{how}: {got:?}"
+        );
+    }
+    assert!(Bundle::parse_with(&b, limits.with_max_file_size(declared + 100)).is_ok());
+}
+
+#[test]
+fn a_texture_version_or_unused_path_that_is_not_utf8() {
+    // A serialized file whose engine version is not UTF-8 is not a Unity file, as for a
+    // bundle.
+    let t = rgba_texture(Layout::U2022_3, "t", 4, 4, &Pixels::Inline(&rgba_4x4()));
+    let mut file = serialized(22, "2022.3.62f1", false, 19, &[(7, TEXTURE_2D, t.clone())]);
+    let at = file.windows(11).position(|w| w == b"2022.3.62f1").unwrap();
+    file[at + 10] = 0xff;
+    assert!(matches!(
+        SerializedFile::parse(file),
+        Err(Error::NotUnity(_))
+    ));
+    // An inline texture's stream path is never used: odd bytes in it are only shown.
+    let mut t = t;
+    let n = t.len();
+    // The empty path's length is the last four bytes; give it one byte, 0xff, padded.
+    t[n - 4..].copy_from_slice(&1u32.to_le_bytes());
+    t.extend([0xff, 0, 0, 0]);
+    let file = serialized(22, "2022.3.62f1", false, 19, &[(7, TEXTURE_2D, t)]);
+    let a = Assets::from_serialized(SerializedFile::parse(file).unwrap(), "").unwrap();
+    assert!(a.decode_texture(7).is_ok());
+}
+
+#[test]
+fn an_over_long_bundle_version_is_not_called_non_utf8() {
+    let o = BundleOpts::new(6, "2018.4.36f1");
+    let good = bundle(&o, &[("CAB-a", &one_texture_file(), 4)]);
+    let at = good.windows(11).position(|w| w == b"2018.4.36f1").unwrap();
+    let mut b = good[..at].to_vec();
+    b.extend(vec![b'1'; 5000]);
+    b.extend(&good[at + 11..]);
+    match Bundle::parse(&b) {
+        Err(e) => assert!(!e.to_string().contains("UTF-8"), "{e}"),
+        Ok(_) => panic!("parsed"),
+    }
+}
+
+#[test]
+fn a_bundle_directory_that_decompresses_short_is_refused() {
+    let mut o = BundleOpts::new(6, "2018.4.36f1");
+    o.info = 2;
+    let good = bundle(&o, &[("CAB-a", &one_texture_file(), 4)]);
+    assert!(Bundle::parse(&good).is_ok());
+    // The directory's stated size (after the declared size) grown by 8.
+    let at = good.windows(11).position(|w| w == b"2018.4.36f1").unwrap() + 12 + 8 + 4;
+    let mut bad = good;
+    let size = u32::from_be_bytes(bad[at..at + 4].try_into().unwrap());
+    bad[at..at + 4].copy_from_slice(&(size + 8).to_be_bytes());
+    assert!(
+        matches!(Bundle::parse(&bad), Err(Error::Invalid(_))),
+        "{:?}",
+        Bundle::parse(&bad).err()
+    );
+}
+
+#[test]
+fn mask_refusals_are_charged_what_was_reserved_by_then() {
+    // A tight 4x4 one-triangle sprite: decode CALL + 16, then the triangle's step, then four
+    // rows' steps.
+    let decode = CALL + 16;
+    // The triangle's step alone passes the mask limit: refused before anything is reserved.
+    let (_d, mut a, s) = one_sprite(tight(&TRIANGLE, 0), Limits::DEFAULT.with_max_mask_work(15));
+    match a.export(&s) {
+        Err(Error::LimitExceeded {
+            kind: LimitKind::MaskWork,
+            value,
+            ..
+        }) => assert_eq!(value, STEP),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(a.work_done(), decode);
+    // The triangle's step does not fit what is left of the total.
+    let (_d, mut a, s) = one_sprite(
+        tight(&TRIANGLE, 0),
+        Limits::DEFAULT.with_max_total_work(decode + STEP - 1),
+    );
+    match a.export(&s) {
+        Err(Error::LimitExceeded {
+            kind: LimitKind::TotalWork,
+            value,
+            ..
+        }) => assert_eq!(value, decode + STEP),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(a.work_done(), decode);
+    // The rows do not fit: the triangle's step is kept.
+    let (_d, mut a, s) = one_sprite(
+        tight(&TRIANGLE, 0),
+        Limits::DEFAULT.with_max_total_work(decode + STEP + 4 * STEP - 1),
+    );
+    match a.export(&s) {
+        Err(Error::LimitExceeded {
+            kind: LimitKind::TotalWork,
+            value,
+            ..
+        }) => assert_eq!(value, decode + STEP + 4 * STEP),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(a.work_done(), decode + STEP);
+}
+
+#[test]
+fn a_mesh_wholly_outside_its_image_gives_a_blank_image() {
+    let mesh = Mesh {
+        vertices: &[[10.0, 10.0], [14.0, 10.0], [10.0, 14.0]],
+        indices: &[0, 1, 2],
+        ..Mesh::BASE
+    };
+    let (_d, mut a, s) = one_sprite(tight(&mesh, 0), Limits::default());
+    let img = a.export(&s).unwrap();
+    assert_eq!((img.width, img.height), (4, 4));
+    assert!(img.rgba.iter().all(|&b| b == 0));
+}
+
+#[test]
+fn a_path_id_repeated_out_of_order_is_still_refused() {
+    let t = || rgba_texture(Layout::U2018_4, "t", 4, 4, &Pixels::Inline(&rgba_4x4()));
+    let file = file_2018(&[
+        (1, TEXTURE_2D, t()),
+        (2, TEXTURE_2D, t()),
+        (1, TEXTURE_2D, t()),
+    ]);
+    match SerializedFile::parse(file) {
+        Err(Error::Invalid(msg)) => assert!(msg.contains("path ID 1"), "{msg}"),
+        other => panic!("{:?}", other.err()),
+    }
+}
+
+#[test]
+fn a_lossy_dependency_path_leaves_the_next_one_whole() {
+    let tex = rgba_texture(Layout::U2022_3, "t", 4, 4, &Pixels::Inline(&rgba_4x4()));
+    let extras = Extras {
+        externals: vec!["cafQx.assets".into(), "b.assets".into()],
+        ..Extras::default()
+    };
+    let mut file = serialized_with(
+        22,
+        "2022.3.62f1",
+        false,
+        19,
+        &[(7, TEXTURE_2D, tex)],
+        &extras,
+    );
+    let at = file.windows(5).position(|w| w == b"cafQx").unwrap();
+    file[at + 3] = 0xe9;
+    let parsed = SerializedFile::parse(file).unwrap();
+    let paths: Vec<&str> = parsed.externals().iter().map(|e| e.path.as_str()).collect();
+    assert_eq!(paths, ["caf\u{fffd}x.assets", "b.assets"]);
+}
+
+#[test]
+fn a_bundle_player_version_with_odd_bytes_is_not_unity() {
+    let good = bundle(
+        &BundleOpts::new(6, "2018.4.36f1"),
+        &[("CAB-a", &one_texture_file(), 4)],
+    );
+    let at = good.windows(5).position(|w| w == b"5.x.x").unwrap();
+    let mut bad = good;
+    bad[at + 4] = 0x1b;
+    assert!(matches!(Bundle::parse(&bad), Err(Error::NotUnity(_))));
+}
+
+#[test]
+fn a_serialized_file_opened_alone_holds_to_the_file_size_limit() {
+    let dir = TempDir::new("serialsize");
+    let file = one_texture_file();
+    let path = dir.file("t.assets", &file);
+    let limit = file.len() as u64 - 1;
+    assert!(matches!(
+        SerializedFile::open_with(&path, Limits::DEFAULT.with_max_file_size(limit)),
+        Err(Error::LimitExceeded {
+            kind: LimitKind::FileSize,
+            ..
+        })
+    ));
+    assert!(
+        SerializedFile::open_with(&path, Limits::DEFAULT.with_max_file_size(limit + 1)).is_ok()
+    );
 }

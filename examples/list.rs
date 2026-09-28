@@ -1,6 +1,7 @@
 //! List a serialized file's objects:
 //! `cargo run --example list -- <file-or-bundle> [class-id]`.
 
+#[macro_use]
 mod common;
 
 use std::collections::BTreeMap;
@@ -19,7 +20,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .transpose()?;
     let assets = unity_bundle_assets::Assets::open(&path)?;
     let file = assets.file();
-    println!(
+    outln!(
         "format {} unity {} platform {} type trees {} externals {}",
         file.version(),
         common::printable(file.unity_version()),
@@ -30,10 +31,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // One line each, cut, and only so many: a file can name millions of long paths.
     let externals = file.externals();
     for e in externals.iter().take(common::MAX_REPORTED) {
-        println!("  external {}", cut(&common::printable(&e.path)));
+        outln!("  external {}", cut(&common::printable(&e.path)));
     }
     if externals.len() > common::MAX_REPORTED {
-        println!(
+        outln!(
             "  ({} more externals)",
             externals.len() - common::MAX_REPORTED
         );
@@ -42,7 +43,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     for o in file.objects() {
         *counts.entry(o.class_id()).or_insert(0) += 1;
         if Some(o.class_id()) == filter {
-            println!(
+            outln!(
                 "{:>20} {:>9} {}",
                 o.path_id(),
                 o.size(),
@@ -50,7 +51,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
     }
-    println!("{counts:?}");
+    // One class a line, and only so many: a file can hold millions of classes.
+    let classes = counts.len();
+    for (class, n) in counts.into_iter().take(common::MAX_REPORTED) {
+        outln!("class {class:>6}: {n}");
+    }
+    if classes > common::MAX_REPORTED {
+        outln!("({} more classes)", classes - common::MAX_REPORTED);
+    }
     Ok(())
 }
 

@@ -119,8 +119,8 @@ impl<'a> Texture2D<'a> {
 
     /// The first mip level's pixel data. Streamed data is read from `dir`, the folder holding
     /// the serialized file, and only from a `.resS` or `.resource` file directly inside it: a
-    /// regular file, not a symbolic link, with no other hard links (checked on Unix only), and
-    /// not named like a Windows device or an alternate data stream.
+    /// plain ASCII name, not named like a Windows device or an alternate data stream, of a
+    /// regular file, not a symbolic link, with no other hard links (checked on Unix only).
     ///
     /// This does no bookkeeping across textures: two textures naming the same bytes both read
     /// them. [`crate::Assets::decode_texture`] refuses that and counts the work.
@@ -130,12 +130,18 @@ impl<'a> Texture2D<'a> {
     /// For a format this crate does not decode, a stream path outside those rules, a file that
     /// cannot be read, or pixel data too short for the texture.
     pub fn data(&self, dir: &Path) -> Result<Cow<'a, [u8]>> {
-        self.data_claimed(dir, &mut |_, _, _| Ok(()))
+        self.data_claimed(dir, &mut || Ok(()), &mut |_, _, _| Ok(()))
     }
 
-    /// [`Texture2D::data`], calling `claim` with the stream range once it is known to be valid
-    /// and before any of it is read.
-    pub(crate) fn data_claimed(&self, dir: &Path, claim: Claim<'_>) -> Result<Cow<'a, [u8]>> {
+    /// [`Texture2D::data`], calling `opening` just before the stream file is looked for (its
+    /// name and the texture's size already checked), and `claim` with the stream range once it
+    /// is known to be valid and before any of it is read.
+    pub(crate) fn data_claimed(
+        &self,
+        dir: &Path,
+        opening: &mut dyn FnMut() -> Result<()>,
+        claim: Claim<'_>,
+    ) -> Result<Cow<'a, [u8]>> {
         use std::io::{Read, Seek, SeekFrom};
         let Some(stream) = &self.stream else {
             let want = self.wanted(self.image_data.len())?;
@@ -143,13 +149,15 @@ impl<'a> Texture2D<'a> {
         };
         if stream.path.starts_with("archive:") {
             return Err(Error::Unsupported(format!(
-                "texture {} streams from an asset bundle ({}); use Texture2D::data_in",
+                "texture {} streams from an asset bundle ({}), and this file was not opened \
+                 from one",
                 quoted(&self.name),
                 quoted(&stream.path)
             )));
         }
         let want = self.wanted(stream.size as usize)?;
         let path = stream_file(dir, &stream.path)?;
+        opening()?;
         // Stream files are read by range, not whole, so `max_file_size` does not apply: real
         // ones pass 2 GiB (a 2022.3 build's `sharedassets0.assets.resS` is 2.4 GB).
         let (mut file, len) = crate::file::open_regular(&path, crate::file::Chosen::ByData)?;
@@ -360,7 +368,12 @@ fn read_fields<'a>(r: &mut Reader<'a>, version: Version) -> Result<Texture2D<'a>
         u64::from(r.u32()?)
     };
     let size = r.u32()?;
-    let path = r.aligned_path()?;
+    // A path that names the stream must be UTF-8; one no stream uses is only kept.
+    let path = if image_data.is_empty() && size > 0 {
+        r.aligned_path()?
+    } else {
+        r.aligned_string()?
+    };
     let stream =
         Some(StreamingInfo { offset, size, path }).filter(|s| image_data.is_empty() && s.size > 0);
     // The last field ends the object. Bytes left over mean the layout was misread.
