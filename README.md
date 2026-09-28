@@ -2,29 +2,33 @@
 
 Read Unity serialized asset files (`*.assets`, `level*`) and asset bundles, and export their
 sprites and textures as RGBA images, in pure Rust. No .NET, no native libraries, no external
-tools.
+tools, no `unsafe`.
 
-```rust
-let mut assets = unity_bundle_assets::Assets::open("Game_Data/sharedassets0.assets".as_ref())?;
-for sprite in assets.sprites(|name| name.starts_with("Icon_"))? {
-    let image = assets.export(&sprite)?; // RGBA8, top row first
-    // hand image.rgba to the `image` crate, a GPU upload, ...
+```rust,ignore
+use unity_bundle_assets::Assets;
+
+let mut assets = Assets::open("Game_Data/sharedassets0.assets")?;
+let list = assets.sprites(|name| name.starts_with("Icon_"));
+for sprite in &list.sprites {
+    let image = assets.export(sprite)?; // RGBA8, top row first
+}
+for skipped in &list.skipped {
+    eprintln!("sprite {} not read: {}", skipped.path_id, skipped.error);
 }
 ```
 
 `sprites` returns sprites ordered by the texture that holds them, so `export` decodes each
-texture (a 4096x4096 atlas is 64 MB decoded) once.
+texture (a 4096x4096 atlas is 64 MB decoded) once. To use several threads, group sprites by
+`texture_id`, then per group call `decode_texture` once and `cut` for each sprite; both take
+`&self`.
 
-To use several threads, group sprites by `texture_id`, then per group call `decode_texture` once
-and `cut` for each sprite. Both take `&self`.
+`Assets::open` also takes an asset bundle holding one serialized file, which is the usual case,
+and textures can be listed and decoded directly:
 
-`Assets::open` also takes an asset bundle holding one serialized file, which is the usual case.
-Textures are listed and decoded directly:
-
-```rust
-let assets = unity_bundle_assets::Assets::open("assetbundles/characters".as_ref())?;
+```rust,ignore
+let assets = unity_bundle_assets::Assets::open("assetbundles/characters")?;
 for texture in assets.textures(|_| true) {
-    let image = assets.decode_texture(texture.path_id)?; // RGBA8, bottom row first, as stored
+    let image = assets.decode_texture(texture.path_id)?; // RGBA8, top row first
 }
 ```
 
@@ -33,47 +37,66 @@ and open each with `Assets::from_bundle`.
 
 ## What it handles
 
-- Serialized file format versions 17 to 22, little- or big-endian, with or without type
-  trees. Object layouts are hard-coded rather than read from type trees, because player
-  builds usually strip them.
+- Serialized file format versions 17 to 22, little- or big-endian. Object layouts are
+  hard-coded rather than read from type trees, because player builds usually strip them.
 - Asset bundles (`UnityFS`), with blocks stored plain or compressed with LZ4, LZ4HC or LZMA.
-- `Texture2D` from Unity 5.5 on, with pixels inline or streamed from a `.resS` file beside the
-  serialized file or inside the same bundle. Fields are gated by the exact engine release they
-  appeared in.
-- `Sprite` from Unity 2019.1 on, including sprites packed into a `SpriteAtlas`.
-- Packing rotation and flips, and tight packing (pixels outside the sprite's mesh are cleared).
+  A file whose engine version was stripped takes its bundle's.
+- `Texture2D` from Unity 5.5 through 6000.5, with pixels inline or streamed from a `.resS` file
+  beside the serialized file or inside the same bundle. Fields are gated by engine release,
+  checked against the engine's per-release type trees. Later releases are refused rather than
+  guessed at.
+- `Sprite` and `SpriteAtlas` from Unity 2019.1 through 6000.5.
+- Packing rotation and flips, and tight packing (pixels outside the sprite's mesh are cleared,
+  colour and alpha).
 - Texture formats Alpha8, RGB24, RGBA32, ARGB32, BGRA32, DXT1 (BC1), DXT5 (BC3).
 
-Exports match what AssetStudio produces: the sprite's texture rectangle, not padded out to
-its full rect. Alpha8 textures decode to white with the stored alpha (UnityPy gives black).
+Exports follow AssetStudio: the sprite's texture rectangle, not padded out to its full rect;
+Alpha8 as white with the stored alpha (UnityPy gives black); `Rotate90` packing undone
+counter-clockwise (UnityPy turns the other way, and no real sample here settles it).
 
 ## What it doesn't handle (yet)
 
+Each of these gives an error naming it, never a wrong image:
+
 - Encrypted bundles, the older `UnityWeb` / `UnityRaw` containers, and bundles whose textures
   stream from a different bundle.
-- `Sprite` before Unity 2019.1.
-- Crunch-compressed, BC4-7, ETC, ASTC and PVRTC textures. These return
-  `Error::Unsupported`, naming the format.
-- Textures that live in another serialized file.
-- Atlas `downscaleMultiplier` values other than 1.
+- `Sprite` and `SpriteAtlas` before Unity 2019.1; anything newer than 6000.5.
+- Every texture format not listed above, among them crunch-compressed, BC4-7, ETC, EAC, ASTC,
+  PVRTC, RGB565, ARGB4444, RGBA4444, R8, R16, RG16 and the half- and float-precision formats.
+- Textures swizzled for Nintendo Switch.
+- Sprites whose alpha is in a separate texture, sprites in a downscaled atlas, and tight-packed
+  sprites whose mesh uses a vertex layout other than float positions.
+- Textures and atlases that live in another serialized file.
+
+## Untrusted input
+
+Files are treated as hostile. Counts and lengths are checked against the bytes present before
+they size an allocation. What the data cannot bound is held to `Limits`, which a caller can
+lower: file size (2 GiB), decompressed bundle size (1 GiB), texture pixels (8192 x 8192),
+triangles per sprite (65,536) and per file (4M), and work spent masking one sprite. Streamed
+pixels are read only from a regular file directly beside the asset file, or from the same
+bundle: a stream path with a directory, a root or `..` in it is refused.
+
+Malformed input is meant to give an error rather than a panic. It is fuzzed for that, which is
+evidence, not proof.
 
 ## Tested against
 
-Mechabellum (Unity 2022.3.62f3, macOS build): all 9,436 sprites in `sharedassets0.assets`
-read. The 1,178 exported with name-prefix filters decoded and checked by eye.
+- A Unity 2022.3 macOS player build: all 9,436 sprites export. Against UnityPy, 8,880 are
+  pixel-identical, 555 differ only in the colour of fully transparent pixels (masking clears
+  it; UnityPy keeps the texel), and one differs in 8 pixels at a mask edge, where the two
+  rasterise a triangle's border differently.
+- 737 asset bundles from a Unity 5.6.6, 5.6.7 and 2018.4 (.2, .11, .36) game and its mods: all
+  open, and 15,193 textures export; the one failure is a dynamic font texture stored empty. On
+  a sample of 171 bundles, 3,042 of the 3,056 textures UnityPy could decode are pixel-identical
+  to its output, and the other 14 are the Alpha8 colour convention above, with identical alpha.
+  Four of those bundles repacked as LZMA export byte-identical PNGs.
+- The tests build serialized files and bundles byte by byte, since game files cannot ship with
+  the crate: `Texture2D` in the layouts of eleven engine releases from 5.6 to 6000.5, sprites
+  with every packing rotation, tight masks, atlases, big-endian files, every bundle container
+  variant, and hostile files for each of the limits above.
 
-737 asset bundles from a Unity 5.6.6, 5.6.7 and 2018.4 (.2, .11, .36) game and its mods: all
-open, and 15,193 textures export; the one failure is a dynamic font texture stored empty. On a
-sample of 171 bundles, 3,042 of 3,057 textures (DXT1, DXT5, RGBA32, RGB24, Alpha8) are
-pixel-identical to UnityPy's output; the other 14 are the Alpha8 colour convention above, with
-identical alpha. Four of those bundles repacked as LZMA export byte-identical PNGs.
-
-`tests/synthetic.rs` builds serialized files and bundles byte by byte, in the `Texture2D`
-layouts of eight engine releases from 5.6 to 2022.3, and reads them back end to end; game
-files cannot ship with the crate.
-
-The examples (`list`, `dump`, `survey`, `export`, `textures`) are the tools used to work out and
-check the layouts:
+The examples are the tools used to work out and check the layouts:
 
 ```sh
 cargo run --example list -- <file> [class-id]           # objects by class, with names
@@ -85,7 +108,7 @@ cargo run --release --example textures -- <file-or-bundle> <out-dir> [name-prefi
 
 ## Minimum Rust version
 
-1.82.
+1.83 for the library. The tests and examples use the `image` crate, which needs 1.88.
 
 ## License
 

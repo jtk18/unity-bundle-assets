@@ -1,6 +1,8 @@
 //! Export textures to PNG:
 //! `cargo run --release --example textures -- <file-or-bundle> <out-dir> [name-prefix...]`.
 
+mod common;
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let path = args
@@ -9,46 +11,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let out = std::path::PathBuf::from(args.next().ok_or("out dir")?);
     let prefixes: Vec<String> = args.collect();
     std::fs::create_dir_all(&out)?;
-    let assets = unity_bundle_assets::Assets::open(path.as_ref())?;
+    let assets = unity_bundle_assets::Assets::open(&path)?;
     let (mut ok, mut failed) = (0, 0);
     for texture in
         assets.textures(|n| prefixes.is_empty() || prefixes.iter().any(|p| n.starts_with(p)))
     {
-        let (path_id, name) = (texture.path_id, texture.name);
-        match assets.decode_texture(path_id) {
+        match assets.decode_texture(texture.path_id) {
             Ok(img) => {
-                // Names come from the file: keep them to one safe path component.
-                let safe: String = name
-                    .chars()
-                    .map(|c| {
-                        if c.is_ascii_alphanumeric() || "._-".contains(c) {
-                            c
-                        } else {
-                            '_'
-                        }
-                    })
-                    .collect();
-                // decode_texture gives Unity's bottom-up rows; PNG wants top-down.
-                let row = (img.width * 4) as usize;
-                let top_down: Vec<u8> = img
-                    .rgba
-                    .chunks_exact(row)
-                    .rev()
-                    .flatten()
-                    .copied()
-                    .collect();
-                image::save_buffer(
-                    out.join(format!("{safe}_{path_id}.png")),
-                    &top_down,
-                    img.width,
-                    img.height,
-                    image::ColorType::Rgba8,
-                )?;
+                let name = format!(
+                    "{}_{}.png",
+                    common::file_name(&texture.name),
+                    texture.path_id
+                );
+                common::save_png(&out.join(name), &img)?;
                 ok += 1;
             }
             Err(e) => {
                 failed += 1;
-                eprintln!("{name} ({path_id}): {e}");
+                eprintln!(
+                    "{} ({}): {e}",
+                    common::printable(&texture.name),
+                    texture.path_id
+                );
             }
         }
     }

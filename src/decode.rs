@@ -20,25 +20,53 @@ pub mod format {
     pub const DXT5: i32 = 12;
 }
 
-/// Bytes in the first mip level, or `None` for a format this crate does not decode.
+/// Bytes in the first mip level, or `None` for a format this crate does not decode or a size
+/// that does not fit in memory.
 pub fn mip0_size(format: i32, width: u32, height: u32) -> Option<usize> {
     let (w, h) = (width as usize, height as usize);
-    let blocks = w.div_ceil(4) * h.div_ceil(4);
-    Some(match format {
-        format::ALPHA8 => w * h,
-        format::RGB24 => w * h * 3,
-        format::RGBA32 | format::ARGB32 | format::BGRA32 => w * h * 4,
-        format::DXT1 => blocks * 8,
-        format::DXT5 => blocks * 16,
-        _ => return None,
-    })
+    let blocks = w.div_ceil(4).checked_mul(h.div_ceil(4))?;
+    let pixels = w.checked_mul(h)?;
+    match format {
+        format::ALPHA8 => Some(pixels),
+        format::RGB24 => pixels.checked_mul(3),
+        format::RGBA32 | format::ARGB32 | format::BGRA32 => pixels.checked_mul(4),
+        format::DXT1 => blocks.checked_mul(8),
+        format::DXT5 => blocks.checked_mul(16),
+        _ => None,
+    }
 }
 
 /// Decode the first mip level to RGBA8, rows in the order stored (bottom first, for Unity).
-/// Extra bytes (further mip levels) are ignored.
+/// Extra bytes (further mip levels) are ignored. Sizes are not limited here beyond what fits
+/// in memory; [`crate::Assets::decode_texture`] applies [`crate::Limits`].
 pub fn decode(format: i32, width: u32, height: u32, data: &[u8]) -> Result<Vec<u8>> {
-    let size = mip0_size(format, width, height)
-        .ok_or_else(|| Error::Unsupported(format!("texture format {format}")))?;
+    let known = matches!(
+        format,
+        format::ALPHA8
+            | format::RGB24
+            | format::RGBA32
+            | format::ARGB32
+            | format::BGRA32
+            | format::DXT1
+            | format::DXT5
+    );
+    if !known {
+        return Err(Error::UnsupportedTextureFormat {
+            texture: String::new(),
+            format,
+        });
+    }
+    let out_len = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|p| p.checked_mul(4))
+        .filter(|&n| n <= isize::MAX as usize);
+    let (Some(size), Some(_)) = (mip0_size(format, width, height), out_len) else {
+        return Err(Error::LimitExceeded {
+            what: "decoded texture size",
+            value: (width as u64 * height as u64).saturating_mul(4),
+            limit: isize::MAX as u64,
+        });
+    };
     let data = data
         .get(..size)
         .ok_or_else(|| Error::Invalid(format!("{} bytes of pixels, need {size}", data.len())))?;
@@ -214,5 +242,20 @@ mod tests {
         );
         assert!(decode(format::DXT1, 5, 3, &[0; 15]).is_err());
         assert!(decode(9999, 4, 4, &[0; 64]).is_err());
+    }
+
+    #[test]
+    fn test_huge_sizes_are_errors_not_panics() {
+        assert_eq!(mip0_size(format::RGBA32, u32::MAX, u32::MAX), None);
+        for f in [
+            format::ALPHA8,
+            format::RGB24,
+            format::RGBA32,
+            format::DXT1,
+            format::DXT5,
+        ] {
+            assert!(decode(f, u32::MAX, u32::MAX, &[]).is_err());
+            assert!(decode(f, 1 << 31, 1 << 31, &[]).is_err());
+        }
     }
 }

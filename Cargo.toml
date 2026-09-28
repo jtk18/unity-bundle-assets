@@ -2,12 +2,13 @@
 name = "unity-bundle-assets"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.82"
+rust-version = "1.83"
 description = "Read Unity serialized asset files and asset bundles, and export their sprites and textures as images, in pure Rust"
 license = "MIT"
 repository = "https://github.com/jtk18/unity-bundle-assets"
 keywords = ["unity", "assetbundle", "sprite", "texture", "unityfs"]
 categories = ["game-development", "parser-implementations"]
+exclude = ["deny.toml"]
 
 [dependencies]
 lzma-rs = "0.3"

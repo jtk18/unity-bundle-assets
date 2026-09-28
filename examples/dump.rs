@@ -1,4 +1,4 @@
-//! Hex-dump one object: `cargo run --example dump -- <file> <path-id> [max-bytes]`.
+//! Hex-dump one object: `cargo run --example dump -- <file-or-bundle> <path-id> [max-bytes]`.
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
@@ -7,13 +7,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok_or("usage: dump <file> <path-id> [max-bytes]")?;
     let id: i64 = args.next().ok_or("path id")?.parse()?;
     let max: usize = args.next().map(|s| s.parse()).transpose()?.unwrap_or(512);
-    let file = unity_bundle_assets::SerializedFile::open(path.as_ref())?;
+    let assets = unity_bundle_assets::Assets::open(&path)?;
+    let file = assets.file();
     let object = file.object(id).ok_or("no such object")?;
-    println!("class {} size {}", object.class_id, object.size);
-    for (i, chunk) in file.bytes(object)[..object.size.min(max)]
-        .chunks(16)
-        .enumerate()
-    {
+    println!("class {} size {}", object.class_id(), object.size());
+    let bytes = file.bytes(object).ok_or("object outside the file")?;
+    for (i, chunk) in bytes[..object.size().min(max)].chunks(16).enumerate() {
         let hex: Vec<String> = chunk.iter().map(|b| format!("{b:02x}")).collect();
         let text: String = chunk
             .iter()
