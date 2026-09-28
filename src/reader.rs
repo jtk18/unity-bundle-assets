@@ -149,6 +149,26 @@ impl<'a> Reader<'a> {
         Ok(s)
     }
 
+    /// As [`Reader::cstr`], but invalid UTF-8 becomes U+FFFD: for strings that are only
+    /// reported, never used to find anything.
+    pub fn cstr_lossy(&mut self) -> Result<String> {
+        let start = self.pos;
+        let mut strict = self.clone();
+        match strict.cstr() {
+            Ok(s) => {
+                *self = strict;
+                Ok(s)
+            }
+            Err(Error::Invalid(msg)) if msg.ends_with("is not UTF-8") => {
+                let rest = &self.data[start..];
+                let len = rest.iter().position(|&b| b == 0).unwrap_or(rest.len());
+                self.pos = start + len + 1;
+                Ok(text(&rest[..len]))
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// An array length, checked against the bytes left so a corrupt length fails cleanly
     /// instead of allocating gigabytes.
     pub fn len(&mut self, min_item_size: usize) -> Result<usize> {
@@ -164,17 +184,32 @@ impl<'a> Reader<'a> {
         Ok(n as usize)
     }
 
-    /// A length-prefixed string of at most [`MAX_STRING`] bytes, followed by alignment to 4
-    /// bytes.
+    /// A length-prefixed name of at most [`MAX_STRING`] bytes, followed by alignment to 4
+    /// bytes; invalid UTF-8 becomes U+FFFD.
     pub fn aligned_string(&mut self) -> Result<String> {
+        let bytes = self.aligned_bytes()?;
+        Ok(text(bytes))
+    }
+
+    /// A length-prefixed path, as [`Reader::aligned_string`] but refused unless UTF-8: a path
+    /// names a file, and a guessed one could name the wrong file.
+    pub fn aligned_path(&mut self) -> Result<String> {
+        let at = self.pos;
+        let bytes = self.aligned_bytes()?;
+        std::str::from_utf8(bytes)
+            .map(str::to_owned)
+            .map_err(|_| Error::Invalid(format!("path at byte {at} is not UTF-8")))
+    }
+
+    fn aligned_bytes(&mut self) -> Result<&'a [u8]> {
         let at = self.pos;
         let n = self.len(1)?;
         if n > MAX_STRING {
             return Err(Error::BadLength { at, len: n as i64 });
         }
-        let s = text(self.take(n)?);
+        let bytes = self.take(n)?;
         self.align(4);
-        Ok(s)
+        Ok(bytes)
     }
 
     /// A length-prefixed byte array followed by alignment to 4 bytes.

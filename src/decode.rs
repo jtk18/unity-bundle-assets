@@ -138,8 +138,9 @@ const fn widen(value: u16, max: u16) -> u8 {
     (value as u32 * 255 / max as u32) as u8
 }
 
-/// [`decode`], taking ownership of the pixels: RGBA32 data holding exactly the first mip is
-/// turned the right way up in place rather than copied.
+/// [`decode`], taking ownership of the pixels: four-byte data (RGBA32, BGRA32, ARGB32)
+/// holding at least the first mip is reordered and turned the right way up in place rather
+/// than copied, so decoding it needs no second buffer.
 pub(crate) fn decode_owned(
     format: i32,
     width: u32,
@@ -147,10 +148,16 @@ pub(crate) fn decode_owned(
     mut data: Vec<u8>,
 ) -> Result<Vec<u8>> {
     let size = mip0_size(format, width, height);
-    if format != format::RGBA32 || size.is_none_or(|n| data.len() < n) {
+    let four_bytes = matches!(format, format::RGBA32 | format::BGRA32 | format::ARGB32);
+    let Some(size) = size.filter(|&n| four_bytes && data.len() >= n) else {
         return decode(format, width, height, &data);
+    };
+    data.truncate(size);
+    match format {
+        format::BGRA32 => data.chunks_exact_mut(4).for_each(|p| p.swap(0, 2)),
+        format::ARGB32 => data.chunks_exact_mut(4).for_each(|p| p.rotate_left(1)),
+        _ => {}
     }
-    data.truncate(size.unwrap_or(0));
     let (h, row) = (height as usize, width as usize * 4);
     for i in 0..h / 2 {
         let (top, bottom) = data.split_at_mut((h - 1 - i) * row);

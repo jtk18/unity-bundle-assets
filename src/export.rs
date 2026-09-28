@@ -126,9 +126,9 @@ pub struct SkippedSprite {
 /// group sprites by [`Assets::texture_id`], then per group [`Assets::decode_texture`] once and
 /// [`Assets::cut`] each sprite; both take `&self`, and `Assets` is `Send + Sync`. Each thread
 /// then holds a decoded texture and the sprite cut from it, with its mask: at the default
-/// 16384 x 16384, beyond the open file, about 1 GiB more to decode one texture of that size
-/// and 2.25 GiB more to export a sprite from it. Lower [`Limits::max_texture_pixels`] to bound
-/// it.
+/// 16384 x 16384, beyond the open file, up to about 1.75 GiB more to decode one texture of
+/// that size and 2.25 GiB more to export a sprite from it. Lower
+/// [`Limits::max_texture_pixels`] to bound it.
 ///
 /// The work limit is spent and never given back: a long-running program that decodes the
 /// same textures again and again should raise [`Limits::max_total_work`].
@@ -313,8 +313,8 @@ impl Assets {
         &self.file
     }
 
-    /// Pixels decoded, cut and masked so far, counted against [`Limits::max_total_work`] and
-    /// shared with everything else opened from the same bundle.
+    /// Work done so far (see [`Limits::max_total_work`] for its units), counted against that
+    /// limit and shared with everything else opened from the same bundle.
     #[must_use]
     pub fn work_done(&self) -> u64 {
         self.shared.work()
@@ -523,11 +523,17 @@ impl Assets {
         // of it is read: a texture refused its range takes no budget, and a range is claimed
         // only by a texture whose work was reserved. Once reserved, the work is kept: reading
         // starts at once, and work started is never given back.
+        // Opening a stream file costs more than a call; see `FILE_STEP`.
+        let step = if matches!(self.streams, Streams::Dir(_)) {
+            FILE_STEP
+        } else {
+            CALL_STEP
+        };
         let mut claimed = false;
         let mut claim = |stream: StreamKey, start, end| {
             self.shared
                 .claim_stream(stream, start, end, &self.owner, path_id, || {
-                    self.reserve(pixels)
+                    self.reserve(step + pixels)
                 })?;
             claimed = true;
             Ok(())
@@ -538,7 +544,7 @@ impl Assets {
         };
         // Inline pixels claim nothing; they reserve here, with nothing done yet.
         if !claimed {
-            self.reserve(pixels)?;
+            self.reserve(CALL_STEP + pixels)?;
         }
         let (format, width, height) = (texture.format, texture.width, texture.height);
         let rgba = match data {
@@ -712,14 +718,15 @@ impl Assets {
         } else {
             (w, h)
         };
-        // The mask's work and the copy's, reserved together before either starts and kept
-        // from then on: work done is never given back.
+        // Planning the mask reserves its triangles and rows as it goes; the call, the
+        // mask's column tests and the copy are reserved together before any starts. Work
+        // reserved is kept: it is never given back.
         let mask = match triangles {
             Some(t) => Some(self.plan_mask(sprite, t, placement, sw, sh)?),
             None => None,
         };
-        let mask_work = mask.as_ref().map_or(0, |m| m.work);
-        self.reserve(mask_work + u64::from(sw) * u64::from(sh))?;
+        let columns = mask.as_ref().map_or(0, |m| m.columns);
+        self.reserve(CALL_STEP + columns + u64::from(sw) * u64::from(sh))?;
         let coverage = mask.map(|m| m.fill(sw, sh)).transpose()?;
 
         // The texel under sprite-space pixel (sx, sy): undo the rotation to get the crop
@@ -771,9 +778,10 @@ impl Assets {
 
     /// The mask for the `w` x `h` sprite-space image (rows bottom first): each triangle
     /// mapped into pixels, with the rows its box covers. Mesh vertices are in sprite units
-    /// around the pivot. The work, a step for each row of each triangle and a test for each
-    /// column of that row's span (see [`row_span`]), is counted here and held to
-    /// [`Limits::max_mask_work`]; the caller reserves it before [`Mask::fill`].
+    /// around the pivot. The work, a step for each triangle and each row it crosses and a
+    /// test for each column of that row's span (see [`row_span`]), is held to
+    /// [`Limits::max_mask_work`]. The steps are reserved here, before the triangles and rows
+    /// are worked out; the columns are left to the caller to reserve before [`Mask::fill`].
     #[expect(
         clippy::many_single_char_names,
         reason = "a triangle's corners a, b, c and its points p, as in the geometry"
@@ -791,9 +799,14 @@ impl Assets {
         let dx = sprite.rect.width * sprite.pivot[0] - placement.texture_rect_offset[0];
         let dy = sprite.rect.height * sprite.pivot[1] - placement.texture_rect_offset[1];
         let (wf, hf) = (w as f32, h as f32);
+        // Every triangle costs a step to map and test, with area or without, inside the
+        // image or not: held to the mask limit and reserved before any is looked at.
+        let limit = self.file.limits().max_mask_work;
+        let steps = triangles.len() as u64 * ROW_STEP;
+        Error::limit(LimitKind::MaskWork, steps, limit)?;
+        self.reserve(steps)?;
         // Triangles with area, mapped into pixels, with the pixel range each could touch.
         let mut boxes = Vec::with_capacity(triangles.len());
-        let limit = self.file.limits().max_mask_work;
         for t in triangles {
             let p = t.map(|[x, y]| [x * scale + dx, y * scale + dy]);
             // Far past any image (16384 pixels at most), f32 has no pixel precision left.
@@ -804,9 +817,10 @@ impl Assets {
                     name = quoted(name)
                 )));
             }
-            let [a, b, c] = p;
+            // In f64, as the inside test is: near FAR an f32 area cancels to noise.
+            let [a, b, c] = p.map(|[x, y]| [f64::from(x), f64::from(y)]);
             let area = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
-            if area.abs() < 1e-9 {
+            if area.abs() < FLAT_AREA {
                 continue;
             }
             let lo = |i: usize| p.iter().map(|q| q[i]).fold(f32::INFINITY, f32::min);
@@ -829,42 +843,51 @@ impl Assets {
                 name = quoted(name)
             )));
         }
-        // The rows alone, counted in constant time a triangle, before any span is worked out:
-        // held to the mask limit and to what is left of the total.
+        // Then a step for each row a triangle crosses, counted in constant time a triangle
+        // and reserved before any row is walked: walking them is the planning's cost, kept
+        // whether or not the mask is used.
         let rows: u64 = boxes
             .iter()
             .map(|(_, _, ys)| u64::from(ys.end - ys.start) * ROW_STEP)
             .sum();
-        Error::limit(LimitKind::MaskWork, rows, limit)?;
+        Error::limit(LimitKind::MaskWork, steps + rows, limit)?;
+        self.reserve(rows)?;
+        // Then the columns each row's span will test, stopping as soon as they pass the mask
+        // limit or what is left of the total. None is tested yet, so a refusal here charges
+        // nothing more; the caller reserves the columns before filling.
         let total = self.file.limits().max_total_work;
-        let done = self.shared.work();
-        Error::limit(LimitKind::TotalWork, done.saturating_add(rows), total)?;
-        // Then each row's span, stopping as soon as the total passes the limit. The spans
-        // worked out by then are charged even when the mask is refused, so asking again does
-        // not get them free.
-        let mut work = 0u64;
+        let left = total.saturating_sub(self.shared.work());
+        let mut columns = 0u64;
         for (p, xs, ys) in &boxes {
             for y in ys.clone() {
                 let span = row_span(p, y, xs.clone());
-                work += ROW_STEP + u64::from(span.end - span.start);
+                columns += u64::from(span.end - span.start);
+                let work = steps + rows + columns;
                 if work > limit {
-                    self.shared.spend(work, self.file.limits().max_total_work);
                     return Err(Error::LimitExceeded {
                         kind: LimitKind::MaskWork,
                         value: work,
                         limit,
                     });
                 }
+                if columns > left {
+                    return Err(Error::LimitExceeded {
+                        kind: LimitKind::TotalWork,
+                        value: self.shared.work().saturating_add(columns),
+                        limit: total,
+                    });
+                }
             }
         }
-        Ok(Mask { boxes, work })
+        Ok(Mask { boxes, columns })
     }
 }
 
 /// Triangles in pixel space, each with the pixel ranges its box covers.
 struct Mask {
     boxes: Vec<TriangleBox>,
-    work: u64,
+    /// The column tests filling it takes, not yet reserved.
+    columns: u64,
 }
 
 /// A triangle's corners in pixels, and the columns and rows its bounding box covers.
@@ -961,10 +984,23 @@ fn row_span(t: &[[f32; 2]; 3], y: u32, columns: std::ops::Range<u32>) -> std::op
     }
 }
 
-/// Mask work for one row of one triangle, besides a unit for each column tested: working out
-/// its span, which is done twice (to count the work, then to fill), costs about as much as
-/// sixteen column tests.
+/// Twice the area, in square pixels, under which a triangle counts as flat and is skipped:
+/// 2^-30, exact in f32 and f64 alike.
+const FLAT_AREA: f64 = 1.0 / (1u64 << 30) as f64;
+
+/// Mask work for each triangle (mapping it and testing its area, twice) and for each row it
+/// crosses, besides a unit for each column tested: working out a row's span, which is done
+/// twice (to count the columns, then to fill), costs about as much as sixteen column tests.
 const ROW_STEP: u64 = 16;
+
+/// Work for each decode and each cut, besides its pixels: a call's fixed cost (reading the
+/// object, allocating) is about that of 64 pixels, so a flood of tiny textures or sprites
+/// is held to the total like large ones.
+const CALL_STEP: u64 = 64;
+
+/// Work for a decode that reads its pixels from a stream file, instead of [`CALL_STEP`]:
+/// opening, checking and reading a file costs about 10 microseconds.
+const FILE_STEP: u64 = 8192;
 
 /// Farthest a mesh vertex may lie from the image's corner, in pixels: four times the largest
 /// texture. Much farther out, f32 rounding moves an edge by more than the column of slack
@@ -1002,9 +1038,10 @@ mod tests {
     }
 
     #[test]
-    fn test_a_mask_refused_for_the_total_is_never_built() {
+    fn test_a_mask_refused_for_the_total_is_never_filled() {
         use crate::test_common::*;
-        // A tight 4x4 sprite: decode 16, mask 77 (see the regression tests), copy 16.
+        // A tight 4x4 sprite: decode 64 + 16, mask 16 + 64 + 13 (a triangle, four rows, 13
+        // columns), cut 64 + 16.
         let tri = Mesh {
             vertices: &[[0.0, 0.0], [4.0, 0.0], [0.0, 4.0]],
             indices: &[0, 1, 2],
@@ -1043,7 +1080,7 @@ mod tests {
             19,
             &[(10, TEXTURE_2D, tex), (1, SPRITE, s)],
         );
-        for (limit, masks) in [(108, 0), (109, 1)] {
+        for (limit, masks) in [(252, 0), (253, 1)] {
             let file = SerializedFile::parse_with(
                 file.clone(),
                 Limits::DEFAULT.with_max_total_work(limit),

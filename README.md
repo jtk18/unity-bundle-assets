@@ -63,7 +63,9 @@ and open each with `Assets::from_bundle`.
 Exports follow AssetStudio where references disagree: the sprite's texture rectangle, not
 padded out to its full rect; Alpha8 as white with the stored alpha (UnityPy gives black);
 `Rotate90` packing undone counter-clockwise (UnityPy turns the other way, and no real sample
-here settles it). A tight sprite's mask keeps a pixel when the mesh covers any of four points
+here settles it); the mask's pixel grid starts at the texture rectangle's own origin, not at
+the whole pixel the cut-out starts from, so it can sit a fraction of a pixel off it. A tight
+sprite's mask keeps a pixel when the mesh covers any of four points
 at its quarter positions. Measured against UnityPy's polygon fill over two real files, that
 rule disagreed on 324 pixels; testing the pixel centre alone disagreed on 349, any overlap on
 344.
@@ -94,9 +96,10 @@ Files are treated as hostile:
 
 - Counts and lengths are checked against the bytes present, at each record's real minimum
   size, before they size an allocation. Every string read is at most 4 KiB of the file.
-  Versions and paths must be UTF-8, as Unity writes them; a name that is not has its bad
-  bytes shown as U+FFFD (at most three times its bytes as text). Error messages quote at most
-  64 characters of any name or path (escaped, so a few hundred bytes at most).
+  Versions and the paths used to find data (bundle entries, texture streams) must be UTF-8,
+  as Unity writes them; a name, or a dependency's path (which is only reported), that is not
+  has its bad bytes shown as U+FFFD (at most three times its bytes as text). Error messages
+  quote at most 64 characters of any name or path (escaped, so a few hundred bytes at most).
 - One blob cannot be decoded many times over: objects may not overlap or share an ID, bundle
   entries and a sprite's sub-meshes may not overlap, and a range of stream data may be read by
   one texture only. Ranges are compared by the bytes they reach (on Unix, the file's device and
@@ -114,32 +117,41 @@ Files are treated as hostile:
   (2 GiB); decompressed bundle size (1 GiB), which also counts the parsed directory and LZMA's
   working memory (its tables for every block, directory included, and its dictionary);
   objects (4M, across all the files of a bundle); pixels per texture (16384 x 16384);
-  triangles per sprite (65,536) and per `sprites` call (4M); mask work per sprite (2^29:
-  sixteen for each row a triangle crosses, which is what working out the row costs, and one
-  for each pixel of that row it might cover; mesh vertices must lie within 65,536 pixels);
-  and total work (2^34): every pixel decoded and copied, and every unit of mask work. Each
-  unit costs about 2 ns on an Apple silicon Mac, so the total is under a minute of CPU. It
-  is shared by every `Assets` opened from one `Bundle` (two `Assets::open` calls on one path
-  are two totals), and it is never given back: a long-running program that decodes the
-  same textures again and again should raise it. Work is reserved before it starts; a
-  request refused then, or data refused before it is read, costs nothing, and work once
-  started is kept (a mask refused partway is charged what counting it cost). Which of
-  several threads' requests are refused under the limit depends on their timing.
+  triangles per sprite (65,536) and per `sprites` call (4M); mask work per sprite (2^29) and
+  total work (2^34). Work is counted in units of about one pixel's: a unit for each pixel
+  decoded or copied and each column tested for a mask; 64 for each decode or cut, whatever
+  its size (8192 for a decode that opens a stream file); and 16 for each mesh triangle and
+  each row a triangle crosses, which is what working them out costs. Mesh vertices must lie
+  within 65,536 pixels of the image's corner, after pivot and offset. A unit costs about 2 ns
+  on an Apple silicon Mac, so the total is under a minute of CPU. It is shared by every
+  `Assets` opened from one `Bundle` (two `Assets::open` calls on one path are two totals),
+  and it is never given back: a long-running program that decodes the same textures again
+  and again should raise it. Work is reserved before it starts, and kept once reserved: a
+  request refused before it starts, or data refused before it is read, costs nothing, and a
+  mask refused after its triangles and rows were worked out is charged for those (not for
+  the columns it never tested). Which of several threads' requests are refused under the
+  limit depends on their timing.
 - `Assets` enforces all of that. Used directly, `Bundle` and `SerializedFile` apply their own
   limits, `Texture2D` refuses data too short for its size but claims no ranges (texture after
   texture may read the same bytes), and `decode::decode` applies none; a caller using them
   counts its own work.
 - The limits bound work, not peak memory. Opening a file holds the file (up to
   `max_file_size`) or a bundle's decompressed data (up to `max_decompressed`); a bundle is
-  decompressed whole when opened, and one parsed from bytes briefly holds both copies. On
-  top of that, at the default 16384 x 16384, decoding one texture holds up to about 1 GiB
-  more (the RGBA result, and a streamed texture's stored pixels while they are decoded), and
-  exporting a sprite from it up to about 2.25 GiB more (with the sprite and its mask); each
-  thread decoding and cutting in parallel holds about that much. `Assets::sprites` keeps an
-  entry, some 90 bytes, for each sprite it could not read, up to `max_objects`. LZMA can
+  decompressed whole when opened, and holds its compressed copy too until it is parsed. The
+  object table takes about 80 bytes an object (about 320 MB at `max_objects`), and each
+  opening of a bundle's file builds its own. On top of that, at the default 16384 x 16384,
+  decoding one texture holds up to about 1 GiB more for the RGBA result, and a streamed
+  texture's stored pixels while they are decoded, unless they are four bytes a pixel and
+  converted in place: up to 1.75 GiB in all (RGB24). Exporting a sprite holds up to about
+  2.25 GiB more (the decoded texture, the sprite and its mask); each thread decoding and
+  cutting in parallel holds about that much. `Assets::sprites` keeps an entry, some 250
+  bytes with its message, for each sprite it could not read, up to `max_objects`. LZMA can
   expand a 150 KB file to the full 1 GiB of decompressed data, and 40 KB of stream data can
-  make a 1 GiB texture. For files from strangers, lower `max_decompressed`,
-  `max_texture_pixels` and `max_total_work`.
+  make a 1 GiB texture. Allocations sized by the file fail as `Error::OutOfMemory` where the
+  crate makes them, but that is best effort: LZMA's own buffers, the object table and other
+  small growth abort on failure as usual, and an operating system that overcommits may
+  never refuse. For files from strangers, lower `max_decompressed`, `max_texture_pixels`
+  and `max_total_work`.
 - Streamed pixels are read only from the same bundle, or from a `.resS` / `.resource` file
   directly beside the asset file: one plain file name, a regular file, not a symbolic link,
   and not named like a Windows device however spelled (`CON`, `nul .resS`, `COM1`, ...) or an

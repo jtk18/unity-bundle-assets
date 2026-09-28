@@ -5,7 +5,11 @@ mod common;
 
 use std::collections::BTreeMap;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> std::process::ExitCode {
+    common::finish(run())
+}
+
+fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args_os().skip(1);
     let path = args
         .next()
@@ -16,17 +20,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let assets = unity_bundle_assets::Assets::open(&path)?;
     let file = assets.file();
     println!(
-        "format {} unity {} platform {} type trees {} externals [{}]",
+        "format {} unity {} platform {} type trees {} externals {}",
         file.version(),
         common::printable(file.unity_version()),
         file.target_platform(),
         file.has_type_trees(),
-        file.externals()
-            .iter()
-            .map(|e| common::printable(&e.path))
-            .collect::<Vec<_>>()
-            .join(", ")
+        file.externals().len()
     );
+    // One line each, cut, and only so many: a file can name millions of long paths.
+    let externals = file.externals();
+    for e in externals.iter().take(common::MAX_REPORTED) {
+        println!("  external {}", cut(&common::printable(&e.path)));
+    }
+    if externals.len() > common::MAX_REPORTED {
+        println!(
+            "  ({} more externals)",
+            externals.len() - common::MAX_REPORTED
+        );
+    }
     let mut counts = BTreeMap::new();
     for o in file.objects() {
         *counts.entry(o.class_id()).or_insert(0) += 1;
@@ -35,10 +46,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "{:>20} {:>9} {}",
                 o.path_id(),
                 o.size(),
-                common::printable(&file.name(o).unwrap_or_default())
+                cut(&common::printable(&file.name(o).unwrap_or_default()))
             );
         }
     }
     println!("{counts:?}");
     Ok(())
+}
+
+/// `s` cut to [`common::MAX_LINE`] characters.
+fn cut(s: &str) -> &str {
+    s.char_indices()
+        .nth(common::MAX_LINE)
+        .map_or(s, |(at, _)| &s[..at])
 }

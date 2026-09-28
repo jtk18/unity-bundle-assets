@@ -392,10 +392,13 @@ fn read_mesh(
     }
     // Unity gives each sub-mesh its own indices; letting them overlap would let a small index
     // buffer stand for many triangles.
-    let mut spans: Vec<(u32, u32)> = submeshes
+    let mut spans: Vec<(u64, u64)> = submeshes
         .iter()
         .filter(|sm| sm.topology == 0 && sm.index_count > 0)
-        .map(|sm| (sm.first_byte, sm.first_byte + sm.index_count * 2))
+        .map(|sm| {
+            let first = u64::from(sm.first_byte);
+            (first, first + u64::from(sm.index_count) * 2)
+        })
         .collect();
     spans.sort_unstable();
     if spans.windows(2).any(|w| w[1].0 < w[0].1) {

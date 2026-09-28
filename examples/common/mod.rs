@@ -101,6 +101,21 @@ pub fn save_png(
     Ok(())
 }
 
+/// End an example: print its error, if any, as one cleaned line (not `Debug`), and exit
+/// non-zero on failure.
+pub fn finish(result: Result<(), Box<dyn std::error::Error>>) -> std::process::ExitCode {
+    match result {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            let mut printed = 0;
+            report(&mut printed, || {
+                format!("error: {}", printable(&e.to_string()))
+            });
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
 /// Error lines printed per run before the rest are only counted, so a file with millions of
 /// broken objects cannot flood the terminal.
 pub const MAX_REPORTED: usize = 50;

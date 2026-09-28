@@ -612,9 +612,10 @@ fn limits_bound_meshes_masks_and_total_work() {
         })
     ));
 
-    // Decoding the 4x4 texture is 16 pixels of work, the cut 4 more.
+    // Decoding the 4x4 texture is a call (64) and 16 pixels of work, the cut a call and 4
+    // more.
     let one = with_texture(vec![(1, own("s", [1.0, 1.0, 2.0, 2.0], RECT))]);
-    let limits = Limits::DEFAULT.with_max_total_work(19);
+    let limits = Limits::DEFAULT.with_max_total_work(64 + 16 + 64 + 4 - 1);
     let (_d, mut a) = open_with(&one, "2022.3.62f1", limits);
     assert!(matches!(
         export_one(&mut a, "s"),
@@ -623,7 +624,7 @@ fn limits_bound_meshes_masks_and_total_work() {
             ..
         })
     ));
-    let limits = Limits::DEFAULT.with_max_total_work(20);
+    let limits = Limits::DEFAULT.with_max_total_work(64 + 16 + 64 + 4);
     let (_d, mut a) = open_with(&one, "2022.3.62f1", limits);
     assert!(export_one(&mut a, "s").is_ok());
 }

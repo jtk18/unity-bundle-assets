@@ -38,7 +38,8 @@
 //!
 //! - Counts and lengths are checked against the bytes present before they size an
 //!   allocation, and every string read is at most 4 KiB of the file (names at most three
-//!   times that as text, invalid UTF-8 shown as U+FFFD; versions and paths must be UTF-8).
+//!   times that as text, invalid UTF-8 shown as U+FFFD; versions and the paths used to find
+//!   data must be UTF-8).
 //!   Objects in a file, entries in a bundle, a sprite's sub-meshes, and the stream ranges
 //!   textures read may not overlap, so one blob cannot be decoded many times over; stream
 //!   ranges are compared by the bytes they reach (on Unix; by lower-cased ASCII name
@@ -48,8 +49,8 @@
 //!   pixels, sprite meshes, and the total work spent decoding, cutting and masking, shared by
 //!   everything opened from one file or bundle. Work is reserved before it starts and kept once
 //!   started. The limits bound work, not peak memory: at the default 16384 x 16384, beyond
-//!   the open file, about 1 GiB more to decode one texture of that size and 2.25 GiB more to
-//!   export a sprite from it.
+//!   the open file, up to about 1.75 GiB more to decode one texture of that size and 2.25 GiB
+//!   more to export a sprite from it.
 //! - Streamed pixels are read only from the same bundle, or from a `.resS` / `.resource` file
 //!   directly beside the asset file that is a regular file, not a symbolic link, not a Windows
 //!   device name, and (on Unix) has no other hard links.
@@ -278,7 +279,7 @@ impl std::fmt::Display for LimitKind {
             Self::SpriteTriangles => "sprite mesh triangles",
             Self::TotalTriangles => "sprite mesh triangles in this list",
             Self::MaskWork => "sprite mask work",
-            Self::TotalWork => "total pixel work",
+            Self::TotalWork => "total work",
         })
     }
 }
@@ -306,19 +307,22 @@ pub struct Limits {
     /// Default 4,194,304.
     pub max_objects: u64,
     /// Most pixels in one texture this crate will decode. Default 16384 x 16384, Unity's
-    /// own maximum: beyond the open file, about 1 GiB more to decode one texture of that
-    /// size and 2.25 GiB more to export a sprite from it.
+    /// own maximum: beyond the open file, up to about 1.75 GiB more to decode one texture of
+    /// that size and 2.25 GiB more to export a sprite from it.
     pub max_texture_pixels: u64,
     /// Most triangles in one sprite's mesh. Default 65,536.
     pub max_sprite_triangles: u64,
     /// Most triangles across the sprites one [`Assets::sprites`] call returns. Default
     /// 4,194,304.
     pub max_total_triangles: u64,
-    /// Most pixel tests spent masking one tight-packed sprite. Default 2^29, enough for a
-    /// two-triangle mesh over a 16384 x 16384 sprite.
+    /// Most work spent masking one tight-packed sprite: 16 units for each mesh triangle and
+    /// each row a triangle crosses, and one for each column tested. Default 2^29, enough for
+    /// a two-triangle mesh over a 16384 x 16384 sprite.
     pub max_mask_work: u64,
-    /// Most pixels decoded, cut and masked, all told, by one [`Assets`], or by every `Assets`
-    /// opened from one [`Bundle`]. Default 2^34.
+    /// Most work, all told, by one [`Assets`], or by every `Assets` opened from one
+    /// [`Bundle`], in units of about one pixel's: a unit for each pixel decoded or copied,
+    /// 64 for each decode or cut (8192 for a decode that opens a stream file), and the mask
+    /// work. Default 2^34, under a minute of CPU.
     pub max_total_work: u64,
 }
 
@@ -398,15 +402,22 @@ impl Default for Limits {
     }
 }
 
+/// Objects counted across a bundle's serialized files.
+#[derive(Debug, Default)]
+struct ObjectCount {
+    total: u64,
+    /// The entries (by offset) already counted: opening one again counts nothing more.
+    entries: HashSet<usize>,
+}
+
 /// Work done and stream ranges read, shared by everything opened from one file or bundle, so
 /// opening a bundle's files one by one does not multiply the budget.
 #[derive(Debug, Default)]
 pub(crate) struct Shared {
     work: AtomicU64,
     /// Objects in the serialized files opened from a bundle, held to
-    /// [`Limits::max_objects`] across all of them, and the entries (by offset) already
-    /// counted: opening one again counts nothing more.
-    objects: Mutex<(u64, HashSet<usize>)>,
+    /// [`Limits::max_objects`] across all of them.
+    objects: Mutex<ObjectCount>,
     /// Stream ranges already read, by the bytes they name (not by how a texture spelled the
     /// path to them): start -> the claim.
     streams: Mutex<HashMap<StreamKey, BTreeMap<u64, Claim>>>,
@@ -450,25 +461,14 @@ impl Shared {
         self.work.load(Ordering::Relaxed)
     }
 
-    /// Charge `amount` of work that was done although its request was refused, as far as
-    /// `limit` allows: the total never passes the limit, but repeating the refused request
-    /// uses it up.
-    pub fn spend(&self, amount: u64, limit: u64) {
-        let _ = self
-            .work
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |w| {
-                Some(w.saturating_add(amount).min(limit.max(w)))
-            });
-    }
-
     /// How many more objects the entry at `entry` may hold under `limit`: all of it for an
     /// entry already counted, what the others left otherwise.
     pub fn objects_left(&self, entry: usize, limit: u64) -> u64 {
         let counted = self.objects.lock().unwrap_or_else(PoisonError::into_inner);
-        if counted.1.contains(&entry) {
+        if counted.entries.contains(&entry) {
             limit
         } else {
-            limit.saturating_sub(counted.0)
+            limit.saturating_sub(counted.total)
         }
     }
 
@@ -480,13 +480,13 @@ impl Shared {
     )]
     pub fn count_objects(&self, entry: usize, n: u64, limit: u64) -> Result<()> {
         let mut counted = self.objects.lock().unwrap_or_else(PoisonError::into_inner);
-        if counted.1.contains(&entry) {
+        if counted.entries.contains(&entry) {
             return Ok(());
         }
-        let total = counted.0.saturating_add(n);
+        let total = counted.total.saturating_add(n);
         Error::limit(LimitKind::Objects, total, limit)?;
-        counted.0 = total;
-        counted.1.insert(entry);
+        counted.total = total;
+        counted.entries.insert(entry);
         Ok(())
     }
 

@@ -178,6 +178,14 @@ impl SerializedFile {
         let bytes = bundle.bytes(entry).ok_or_else(|| {
             Error::NotFound(format!("entry {} in this bundle", quoted(entry.path())))
         })?;
+        // A stream entry's bytes belong to the textures that claim them: read as a serialized
+        // file too, they could be decoded a second time, unclaimed.
+        if !entry.is_serialized() {
+            return Err(Error::Invalid(format!(
+                "entry {} is not marked as a serialized file",
+                quoted(entry.path())
+            )));
+        }
         // One limit on objects for the whole bundle: what the files opened from it before this
         // one left, checked before this one's table is built and counted after.
         let limits = bundle.limits();
@@ -510,7 +518,10 @@ fn parse(data: &[u8], limits: &Limits) -> Result<Parsed> {
         r.cstr()?; // always empty
         r.skip(16)?; // GUID
         r.i32()?; // type
-        externals.push(External { path: r.cstr()? });
+                  // Only reported, never opened: an odd byte here need not refuse the file.
+        externals.push(External {
+            path: r.cstr_lossy()?,
+        });
     }
 
     Ok(Parsed {

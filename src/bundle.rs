@@ -68,9 +68,10 @@ pub struct Bundle {
     unity_version: String,
     unity_revision: String,
     entries: Vec<Entry>,
-    /// Entry index by path, and by the file name after the last `/`; first one wins.
+    /// Entry index by path (no two entries share one), and by the file name after the last
+    /// `/` (`None` when two entries share it: the name alone names neither).
     by_path: HashMap<String, usize>,
-    by_name: HashMap<String, usize>,
+    by_name: HashMap<String, Option<usize>>,
     data: Vec<u8>,
     limits: Limits,
     /// Work done and stream ranges read, shared by every [`crate::Assets`] opened from here.
@@ -138,7 +139,11 @@ impl Bundle {
             declared_size,
         } = header(&mut head)?;
         // The bundle is the declared size; anything after it is not part of it.
-        let size = declared_len(declared_size, head.pos(), file.len() as u64)?;
+        let size = declared_len(
+            declared_size,
+            head.pos() + REST_OF_HEADER,
+            file.len() as u64,
+        )?;
         let file = &file[..size as usize];
         let mut r = Reader::new(file, true);
         header(&mut r)?;
@@ -308,11 +313,21 @@ impl Bundle {
             )?;
         }
 
+        // One entry to a path: with two, which one a path names would depend on how it is
+        // looked up. A file name two entries share names neither.
         let mut by_path = HashMap::with_capacity(entries.len());
         let mut by_name = HashMap::with_capacity(entries.len());
         for (i, e) in entries.iter().enumerate() {
-            by_path.entry(e.path.clone()).or_insert(i);
-            by_name.entry(file_name(&e.path).to_string()).or_insert(i);
+            if by_path.insert(e.path.clone(), i).is_some() {
+                return Err(Error::Invalid(format!(
+                    "bundle entry {} appears twice",
+                    quoted(&e.path)
+                )));
+            }
+            by_name
+                .entry(file_name(&e.path).to_string())
+                .and_modify(|v: &mut Option<usize>| *v = None)
+                .or_insert(Some(i));
         }
         Ok(Self {
             format,
@@ -373,7 +388,7 @@ impl Bundle {
     pub fn entry(&self, path: &str) -> Option<&Entry> {
         self.by_path
             .get(path)
-            .or_else(|| self.by_name.get(file_name(path)))
+            .or_else(|| self.by_name.get(file_name(path)).and_then(Option::as_ref))
             .map(|&i| &self.entries[i])
     }
 
@@ -447,8 +462,17 @@ fn header(r: &mut Reader<'_>) -> Result<Header> {
             "UnityFS container format {format} (supported: 6-8)"
         )));
     }
-    let unity_version = r.cstr()?;
-    let unity_revision = r.cstr()?;
+    // A version that is not UTF-8 is not a version, as one with other odd bytes is not.
+    let mut version = |what: &str| {
+        r.cstr().map_err(|e| match e {
+            Error::Invalid(_) => Error::NotUnity(format!(
+                "{what} engine version is not a version (not UTF-8)"
+            )),
+            e => e,
+        })
+    };
+    let unity_version = version("bundle player")?;
+    let unity_revision = version("bundle")?;
     check_version_string(&unity_version, "bundle player")?;
     check_version_string(&unity_revision, "bundle")?;
     let declared_size = r.i64()?;
@@ -466,8 +490,11 @@ fn header(r: &mut Reader<'_>) -> Result<Header> {
 pub(crate) fn check_head(head: &[u8], len: u64) -> Result<u64> {
     let mut r = Reader::new(head, true);
     let Header { declared_size, .. } = header(&mut r)?;
-    declared_len(declared_size, r.pos(), len)
+    declared_len(declared_size, r.pos() + REST_OF_HEADER, len)
 }
+
+/// The header's bytes after its declared size: the directory's two sizes and the flags.
+const REST_OF_HEADER: usize = 12;
 
 /// The bundle's length from its header's declared size: at least the `header` bytes already
 /// read, and no more than the `len` bytes there are. Unity writes the file's own size here.

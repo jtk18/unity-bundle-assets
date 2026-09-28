@@ -8,7 +8,7 @@ license = "MIT"
 repository = "https://github.com/jtk18/unity-bundle-assets"
 keywords = ["unity", "assetbundle", "sprite", "texture", "unityfs"]
 categories = ["game-development", "parser-implementations", "multimedia::images"]
-exclude = ["deny.toml"]
+exclude = [".gitignore", "deny.toml"]
 
 [dependencies]
 lzma-rs = "0.3"

@@ -4,9 +4,13 @@
 mod common;
 
 use std::collections::BTreeMap;
-use unity_bundle_assets::{Assets, Settings};
+use unity_bundle_assets::{Assets, Error, Settings};
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> std::process::ExitCode {
+    common::finish(run())
+}
+
+fn run() -> Result<(), Box<dyn std::error::Error>> {
     let path = std::env::args_os().nth(1).ok_or("usage: survey <file>")?;
     let assets = Assets::open(&path)?;
     let list = assets.sprites(|_| true);
@@ -60,8 +64,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// What kind of error this is, without the names in its message.
-fn kind(e: &unity_bundle_assets::Error) -> String {
-    let text = e.root().to_string();
-    text.split(':').next().unwrap_or_default().to_string()
+/// What kind of error this is, without the names and numbers in its message.
+fn kind(e: &Error) -> String {
+    match e.root() {
+        Error::Truncated(_) => "truncated".into(),
+        Error::BadLength { .. } => "bad length".into(),
+        Error::NotUnity(_) => "not a Unity file".into(),
+        Error::Unsupported(_) => "unsupported".into(),
+        Error::UnsupportedTextureFormat { format, .. } => format!("texture format {format}"),
+        Error::Encrypted => "encrypted".into(),
+        Error::LimitExceeded { kind, .. } => format!("limit {kind:?}"),
+        Error::NotFound(_) => "not found".into(),
+        Error::WrongClass { .. } => "wrong class".into(),
+        Error::EmptyTexture(_) => "empty texture".into(),
+        Error::Invalid(_) => "invalid".into(),
+        Error::OutOfMemory { .. } => "out of memory".into(),
+        Error::Io { error, .. } => format!("io {:?}", error.kind()),
+        _ => "other".into(),
+    }
 }

@@ -360,7 +360,7 @@ fn read_fields<'a>(r: &mut Reader<'a>, version: Version) -> Result<Texture2D<'a>
         u64::from(r.u32()?)
     };
     let size = r.u32()?;
-    let path = r.aligned_string()?;
+    let path = r.aligned_path()?;
     let stream =
         Some(StreamingInfo { offset, size, path }).filter(|s| image_data.is_empty() && s.size > 0);
     // The last field ends the object. Bytes left over mean the layout was misread.
