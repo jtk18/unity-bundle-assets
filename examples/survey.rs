@@ -51,9 +51,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         *by.entry((
             tex,
             settings.map(Settings::tight),
-            settings
-                .and_then(Settings::rotation)
-                .map_or_else(|| "?".into(), |r| format!("{r:?}")),
+            // Rotation counts only for packed sprites, as `Assets::cut` reads it.
+            settings.map_or_else(
+                || "?".into(),
+                |s| {
+                    if s.packed() {
+                        s.rotation()
+                            .map_or_else(|| "?".into(), |r| format!("{r:?}"))
+                    } else {
+                        "Unrotated".into()
+                    }
+                },
+            ),
             !sprite.atlas.is_null(),
         ))
         .or_insert(0) += 1;

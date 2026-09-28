@@ -22,7 +22,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or(512);
     let assets = unity_bundle_assets::Assets::open(&path)?;
     let file = assets.file();
-    let object = file.object(id).ok_or("no such object")?;
+    let object = file
+        .object(id)
+        .ok_or_else(|| format!("no object with path id {id}"))?;
     outln!("class {} size {}", object.class_id(), object.size());
     let bytes = file.bytes(object).ok_or("object outside the file")?;
     for (i, chunk) in bytes[..object.size().min(max)].chunks(16).enumerate() {

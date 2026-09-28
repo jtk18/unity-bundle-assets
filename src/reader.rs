@@ -192,9 +192,13 @@ impl<'a> Reader<'a> {
             .map_err(|_| Error::Invalid(format!("path at byte {at} is not UTF-8")))
     }
 
-    /// Step over a length-prefixed string without decoding it.
+    /// Step over a length-prefixed string without decoding it. Never held or shown, it is
+    /// bounded only by the bytes there are, not by [`MAX_STRING`].
     pub fn skip_string(&mut self) -> Result<()> {
-        self.aligned_bytes().map(|_| ())
+        let n = self.len(1)?;
+        self.take(n)?;
+        self.align(4);
+        Ok(())
     }
 
     fn aligned_bytes(&mut self) -> Result<&'a [u8]> {

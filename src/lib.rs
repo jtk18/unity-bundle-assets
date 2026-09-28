@@ -37,7 +37,7 @@
 //! Files are treated as hostile:
 //!
 //! - Counts and lengths are checked against the bytes present before they size an
-//!   allocation, and every string read is at most 4 KiB of the file (names at most three
+//!   allocation, and every string kept is at most 4 KiB of the file (names at most three
 //!   times that as text, invalid UTF-8 shown as U+FFFD; versions and the paths used to find
 //!   data must be UTF-8).
 //!   Objects in a file, entries in a bundle, a sprite's sub-meshes, and the stream ranges
@@ -49,7 +49,7 @@
 //!   pixels, sprite meshes, and the total work spent decoding, cutting and masking, shared by
 //!   everything opened from one file or bundle. Work is reserved before it starts and kept once
 //!   reserved. The limits bound work, not peak memory: at the default 16384 x 16384, beyond
-//!   the open file, up to about 1.75 GiB more to decode one texture of that size and 2.25 GiB
+//!   the open file, up to about 1.25 GiB more to decode one texture of that size and 2.25 GiB
 //!   more to export a sprite from it.
 //! - Streamed pixels are read only from the same bundle, or from a `.resS` / `.resource` file
 //!   directly beside the asset file that is a regular file, not a symbolic link, not a Windows
@@ -186,8 +186,9 @@ pub enum Error {
     /// Data that contradicts itself, or a layout this crate misread.
     #[error("invalid file: {0}")]
     Invalid(String),
-    /// An argument the caller built that contradicts itself, such as an [`Image`] whose
-    /// pixels do not match its size.
+    /// An argument the caller gave that contradicts itself: an [`Image`] whose pixels do not
+    /// match its size, or [`decode::decode`] data too short for its size or too large to
+    /// decode.
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
     /// Memory for data within the limits could not be had.
@@ -313,7 +314,7 @@ pub struct Limits {
     /// Default 4,194,304.
     pub max_objects: u64,
     /// Most pixels in one texture this crate will decode. Default 16384 x 16384, Unity's
-    /// own maximum: beyond the open file, up to about 1.75 GiB more to decode one texture of
+    /// own maximum: beyond the open file, up to about 1.25 GiB more to decode one texture of
     /// that size and 2.25 GiB more to export a sprite from it. Raising it does not admit
     /// larger textures: a side past 16384 is refused when the texture is read.
     pub max_texture_pixels: u64,
@@ -328,9 +329,11 @@ pub struct Limits {
     pub max_mask_work: u64,
     /// Most work decoding, masking and cutting by one [`Assets`], or by every `Assets` opened
     /// from one [`Bundle`], in units of about one pixel's: a unit for each pixel decoded
-    /// (whole 4x4 blocks for block formats) or copied (two for a quarter-turned sprite), 64
-    /// for each decode or cut asked for, refused or not, a unit for each byte of a texture
-    /// name past 64, 8192 more for each stream file opened, and the mask work. Opening and
+    /// (whole 4x4 blocks for block formats) or copied (three for a quarter-turned sprite), 64
+    /// for each decode or cut asked for, refused or not, a unit for each byte of a texture's
+    /// name and stream path past 64, 8192 more for each stream file opened (192 for a stream in
+    /// the same bundle), and the mask
+    /// work. Opening and
     /// listing are not counted. Default 2^34, under a minute of CPU.
     pub max_total_work: u64,
 }
@@ -568,8 +571,8 @@ pub(crate) fn quoted(s: &str) -> String {
     const SHOWN: usize = 64;
     let mut chars = s.char_indices();
     match chars.nth(SHOWN) {
-        Some((cut, _)) => format!("{:?}... ({} bytes)", &s[..cut], s.len()),
-        None => format!("{s:?}"),
+        Some((cut, _)) => format!("{}... ({} bytes)", escaped(&s[..cut]), s.len()),
+        None => escaped(s),
     }
 }
 
@@ -577,12 +580,43 @@ pub(crate) fn quoted(s: &str) -> String {
 /// file's name is.
 pub(crate) fn quoted_path(s: &str) -> String {
     const SHOWN: usize = 64;
-    let count = s.chars().count();
-    if count <= SHOWN {
-        return format!("{s:?}");
+    // Counted from the end, so a long path costs no more than a short one.
+    let mut from_end = s.char_indices().rev();
+    match (from_end.nth(SHOWN - 1), from_end.next()) {
+        (Some((cut, _)), Some(_)) => {
+            format!("({} bytes) ...{}", s.len(), escaped(&s[cut..]))
+        }
+        _ => escaped(s),
     }
-    let cut = s.char_indices().nth(count - SHOWN).map_or(0, |(i, _)| i);
-    format!("({} bytes) ...{:?}", s.len(), &s[cut..])
+}
+
+/// `s` in double quotes with everything but printable ASCII escaped, `\u{...}` for any other
+/// character: safe for any terminal, and a fixed small cost a character (Rust's `Debug`
+/// escaping looks each character up in Unicode tables, some 100 ns for many).
+fn escaped(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            ' '..='~' => out.push(c),
+            _ => {
+                out.push_str("\\u{");
+                let code = u32::from(c);
+                let digits = (32 - code.leading_zeros()).div_ceil(4).max(1);
+                for shift in (0..digits).rev() {
+                    out.push(char::from_digit((code >> (shift * 4)) & 0xf, 16).unwrap_or('0'));
+                }
+                out.push('}');
+            }
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// Longest engine version string accepted; real ones are under 20 bytes.
@@ -707,6 +741,33 @@ mod test_common;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_quoting_escapes_all_but_printable_ascii() {
+        assert_eq!(quoted("a\"b\\c"), r#""a\"b\\c""#);
+        assert_eq!(
+            quoted("\u{0}\u{1b}\u{e9}\u{fffd}\u{1f600}"),
+            r#""\u{0}\u{1b}\u{e9}\u{fffd}\u{1f600}""#
+        );
+        assert_eq!(quoted("\n\t\r"), r#""\n\t\r""#);
+        let long = "é".repeat(100);
+        assert_eq!(
+            quoted(&long),
+            format!("\"{}\"... (200 bytes)", r"\u{e9}".repeat(64))
+        );
+        // Paths keep their last 64 characters.
+        let path = format!("{}/file.resS", "d".repeat(100));
+        let got = quoted_path(&path);
+        assert!(
+            got.starts_with("(110 bytes) ...\"") && got.ends_with("/file.resS\""),
+            "{got}"
+        );
+        assert_eq!(got.len() - "(110 bytes) ...".len(), 64 + 2);
+        assert_eq!(
+            quoted_path(&"x".repeat(64)),
+            format!("\"{}\"", "x".repeat(64))
+        );
+    }
 
     #[test]
     fn test_quoted_keeps_the_start_and_quoted_path_the_end() {

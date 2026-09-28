@@ -244,8 +244,11 @@ pub(crate) fn read_limited(path: &Path, limit: u64, check: HeadCheck) -> Result<
 mod tests {
     use super::*;
 
+    /// A fresh folder for one test: anything an earlier run left under the same name (a
+    /// failed run, a reused process ID) is cleared first.
     fn dir(tag: &str) -> std::path::PathBuf {
         let d = std::env::temp_dir().join(format!("uba-file-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
     }

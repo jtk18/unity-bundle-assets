@@ -15,6 +15,8 @@ const PACKED: u32 = 0b01;
 const CALL: u64 = 64;
 const FILE: u64 = 8192;
 const STEP: u64 = 16;
+/// Work for a decode whose pixels stream from its own bundle: the crate's `BUNDLE_STEP`.
+const BUNDLE: u64 = 192;
 
 fn hex(s: &str) -> Vec<u8> {
     (0..s.len())
@@ -159,8 +161,12 @@ fn files_in_one_bundle_share_its_stream_ranges_and_budget() {
     assert!(first.decode_texture(1).is_ok());
     assert!(matches!(second.decode_texture(1), Err(Error::Invalid(_))));
 
-    // Different ranges, but one budget: a call and 16 pixels each, a call and 20 allowed.
-    let b = two_file_bundle(false, Limits::DEFAULT.with_max_total_work(CALL + 20));
+    // Different ranges, but one budget: the steps and 16 pixels each, the steps and 20
+    // allowed.
+    let b = two_file_bundle(
+        false,
+        Limits::DEFAULT.with_max_total_work(CALL + BUNDLE + 20),
+    );
     let first = Assets::from_bundle(b.clone(), "CAB-a").unwrap();
     let second = Assets::from_bundle(b, "CAB-b").unwrap();
     assert!(first.decode_texture(1).is_ok());
@@ -171,7 +177,7 @@ fn files_in_one_bundle_share_its_stream_ranges_and_budget() {
             ..
         })
     ));
-    assert_eq!(first.work_done(), CALL + 16);
+    assert_eq!(first.work_done(), CALL + BUNDLE + 16);
 }
 
 #[test]
@@ -960,8 +966,8 @@ fn every_spelling_of_a_bundle_stream_claims_the_same_bytes() {
     assert!(a.decode_texture(5).is_ok(), "the next range is fine");
     assert_eq!(
         a.work_done(),
-        5 * CALL + 2 * 16,
-        "a call each, pixels for two"
+        5 * (CALL + BUNDLE) + 2 * 16,
+        "a call and a bundle stream's step each, pixels for two"
     );
 }
 
@@ -4003,7 +4009,7 @@ fn a_long_name_costs_a_unit_a_byte_past_the_calls_share() {
 fn a_quarter_turn_costs_two_units_a_pixel() {
     // A 4x4 sprite over the whole 4x4 texture, packed with each rotation: the copy is a unit
     // a pixel, two for a quarter turn, which reads the texture down its columns.
-    for (rotation, per_pixel) in [(0u32, 1u64), (1, 1), (3, 1), (4, 2)] {
+    for (rotation, per_pixel) in [(0u32, 1u64), (1, 1), (3, 1), (4, 3)] {
         let r = [0.0, 0.0, 4.0, 4.0];
         let s = sprite(
             false,
@@ -4554,4 +4560,198 @@ fn an_atlas_from_before_2019_1_is_refused_when_read_directly() {
         unity_bundle_assets::SpriteAtlas::read(&file, object),
         Err(Error::Unsupported(_))
     ));
+}
+
+// Round 11.
+
+#[test]
+fn only_a_texture_is_charged_its_stated_name_and_never_past_its_bytes() {
+    // A sprite asked for as a texture: refused as the wrong class, charged its call only.
+    let mut sprite_bytes = tight(&TRIANGLE, 0);
+    sprite_bytes[..4].copy_from_slice(&4096u32.to_le_bytes());
+    // A texture whose name claims 4000 bytes in a much shorter object.
+    let mut tex = rgba_texture(Layout::U2022_3, "t", 1, 1, &Pixels::Inline(&[1, 2, 3, 4]));
+    tex[..4].copy_from_slice(&4000u32.to_le_bytes());
+    let file = serialized(
+        22,
+        "2022.3.62f1",
+        false,
+        19,
+        &[(1, SPRITE, sprite_bytes), (2, TEXTURE_2D, tex)],
+    );
+    let dir = TempDir::new("namelen");
+    let a = Assets::open(dir.file("t.assets", &file)).unwrap();
+    assert!(matches!(a.decode_texture(1), Err(Error::WrongClass { .. })));
+    assert_eq!(a.work_done(), CALL);
+    assert!(a.decode_texture(2).is_err());
+    let charged = a.work_done() - CALL;
+    let object = a.file().object(2).unwrap().size() as u64;
+    assert!(
+        charged < object,
+        "charged {charged} for a {object}-byte object"
+    );
+}
+
+#[test]
+fn an_image_comes_apart_as_it_was_built() {
+    let image = Image::new(2, 1, vec![1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
+    assert_eq!(image.clone().into_rgba(), [1, 2, 3, 4, 5, 6, 7, 8]);
+    assert_eq!(image.into_parts(), (2, 1, vec![1, 2, 3, 4, 5, 6, 7, 8]));
+}
+
+// Round 11: gaps the mutation run found.
+
+fn assets_2022(objects: &[(i64, i32, Vec<u8>)], limits: Limits) -> Assets {
+    let file = serialized(22, "2022.3.62f1", false, 19, objects);
+    Assets::from_serialized(SerializedFile::parse_with(file, limits).unwrap(), "").unwrap()
+}
+
+#[test]
+fn a_decode_whose_call_or_name_does_not_fit_is_refused() {
+    let tex = |name: &str| rgba_texture(Layout::U2022_3, name, 4, 4, &Pixels::Inline(&[1; 64]));
+    // 50 left: the 16 pixels would fit, the call's 64 does not.
+    let a = assets_2022(
+        &[(TEX, TEXTURE_2D, tex("t"))],
+        Limits::DEFAULT.with_max_total_work(50),
+    );
+    assert!(matches!(
+        a.decode_texture(TEX),
+        Err(Error::LimitExceeded {
+            kind: LimitKind::TotalWork,
+            ..
+        })
+    ));
+    assert_eq!(a.work_done(), 0);
+    // The call and pixels fit; the 1000-byte name's 936 past the call's share do not.
+    let a = assets_2022(
+        &[(TEX, TEXTURE_2D, tex(&"n".repeat(1000)))],
+        Limits::DEFAULT.with_max_total_work(CALL + 500),
+    );
+    assert!(matches!(
+        a.decode_texture(TEX),
+        Err(Error::LimitExceeded {
+            kind: LimitKind::TotalWork,
+            ..
+        })
+    ));
+    assert_eq!(a.work_done(), CALL);
+}
+
+#[test]
+fn a_long_stream_path_costs_a_unit_a_byte_past_the_calls_share() {
+    let dir = TempDir::new("longpath");
+    let path = format!("{}.resS", "p".repeat(195)); // 200 bytes
+    dir.file(&path, &[7; 64]);
+    let t = rgba_texture(Layout::U2022_3, "n", 4, 4, &streamed_owned(&path));
+    let file = serialized(22, "2022.3.62f1", false, 19, &[(7, TEXTURE_2D, t)]);
+    let a = Assets::open(dir.file("t.assets", &file)).unwrap();
+    a.decode_texture(7).unwrap();
+    // The call, the file, 16 pixels, and name and path (1 + 200) past the call's 64.
+    assert_eq!(a.work_done(), CALL + FILE + 16 + (1 + 200 - 64));
+}
+
+const fn streamed_owned(path: &str) -> Pixels<'_> {
+    Pixels::Streamed {
+        path,
+        offset: 0,
+        size: 64,
+    }
+}
+
+#[test]
+fn an_atlas_pointer_to_a_non_atlas_falls_back_to_the_own_texture() {
+    let r = [0.0, 0.0, 4.0, 4.0];
+    let t = rgba_texture(Layout::U2022_3, "t", 4, 4, &Pixels::Inline(&[5; 64]));
+    for atlas in [TEX, 999] {
+        let s = sprite(
+            false,
+            false,
+            "s",
+            r,
+            [0.0, 0.0],
+            1,
+            atlas,
+            TEX,
+            0,
+            r,
+            RECT,
+            1.0,
+            &Mesh::BASE,
+        );
+        let mut a = assets_2022(
+            &[(TEX, TEXTURE_2D, t.clone()), (1, SPRITE, s)],
+            Limits::DEFAULT,
+        );
+        let list = a.sprites(|_| true);
+        let got = a.export(&list.sprites[0]);
+        assert!(got.is_ok(), "atlas {atlas}: {got:?}");
+    }
+}
+
+#[test]
+fn disjoint_sub_meshes_listed_out_of_order_are_accepted() {
+    let mesh = Mesh {
+        vertices: &[[0.0, 0.0], [4.0, 0.0], [0.0, 4.0]],
+        indices: &[0, 1, 2, 0, 1, 2, 0, 1, 2],
+        index_count: Some(3),
+        extra_submeshes: &[(12, 3, 0), (6, 3, 0)],
+        ..Mesh::BASE
+    };
+    let a = assets_2022(&[(1, SPRITE, tight(&mesh, 0))], Limits::DEFAULT);
+    let list = a.sprites(|_| true);
+    assert!(list.skipped.is_empty(), "{:?}", list.skipped);
+    assert_eq!(list.sprites[0].triangles.as_ref().map(Vec::len), Some(3));
+}
+
+#[test]
+fn objects_listed_out_of_offset_order_are_accepted() {
+    let t = |n: &str| rgba_texture(Layout::U2022_3, n, 4, 4, &Pixels::Inline(&[5; 64]));
+    let mut file = serialized(
+        22,
+        "2022.3.62f1",
+        false,
+        19,
+        &[(1, TEXTURE_2D, t("a")), (2, TEXTURE_2D, t("b"))],
+    );
+    // Swap the two objects' start offsets in the table (each follows its 8-byte path ID).
+    let find = |f: &[u8], id: i64| f.windows(8).position(|w| w == id.to_le_bytes()).unwrap() + 8;
+    let (p1, p2) = (find(&file, 1), find(&file, 2));
+    let s1: [u8; 8] = file[p1..p1 + 8].try_into().unwrap();
+    let s2: [u8; 8] = file[p2..p2 + 8].try_into().unwrap();
+    assert_ne!(s1, s2);
+    file[p1..p1 + 8].copy_from_slice(&s2);
+    file[p2..p2 + 8].copy_from_slice(&s1);
+    let parsed = SerializedFile::parse(file).unwrap();
+    assert!(!parsed.has_type_trees());
+    let a = Assets::from_serialized(parsed, "").unwrap();
+    assert_eq!(a.texture(1).unwrap().name, "b");
+}
+
+#[test]
+fn a_flat_edges_ends_are_its_x_coordinates() {
+    let mesh = Mesh {
+        vertices: &[[40.0, 4.25], [50.0, 4.25], [10.0, 0.5]],
+        indices: &[0, 1, 2],
+        ..Mesh::BASE
+    };
+    let (_d, mut a, s) = tight_square(64, &mesh, Limits::default());
+    a.export(&s).unwrap();
+    assert_eq!(a.work_done(), 8472);
+}
+
+#[test]
+fn block_formats_are_charged_whole_blocks_in_height_too() {
+    let t = texture(
+        Layout::U2022_3,
+        false,
+        "d",
+        4,
+        5,
+        format::DXT1,
+        &Pixels::Inline(&[0; 16]),
+        &[],
+    );
+    let a = assets_2022(&[(7, TEXTURE_2D, t)], Limits::DEFAULT);
+    a.decode_texture(7).unwrap();
+    assert_eq!(a.work_done(), CALL + 32);
 }

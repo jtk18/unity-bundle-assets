@@ -16,7 +16,6 @@ use std::sync::{Arc, OnceLock, RwLock};
 
 /// An RGBA8 image, top row first.
 #[derive(Clone, PartialEq, Eq)]
-#[non_exhaustive]
 pub struct Image {
     width: u32,
     height: u32,
@@ -72,6 +71,12 @@ impl Image {
     #[must_use]
     pub fn into_rgba(self) -> Vec<u8> {
         self.rgba
+    }
+
+    /// Width, height and pixels, as [`Image::new`] takes them.
+    #[must_use]
+    pub fn into_parts(self) -> (u32, u32, Vec<u8>) {
+        (self.width, self.height, self.rgba)
     }
 
     fn check(&self) -> Result<()> {
@@ -147,7 +152,7 @@ pub struct SkippedSprite {
 /// group sprites by [`Assets::texture_id`], then per group [`Assets::decode_texture`] once and
 /// [`Assets::cut`] each sprite; both take `&self`, and `Assets` is `Send + Sync`. Each thread
 /// then holds a decoded texture and the sprite cut from it, with its mask: at the default
-/// 16384 x 16384, beyond the open file, up to about 1.75 GiB more to decode one texture of
+/// 16384 x 16384, beyond the open file, up to about 1.25 GiB more to decode one texture of
 /// that size and 2.25 GiB more to export a sprite from it. Lower
 /// [`Limits::max_texture_pixels`] to bound it.
 ///
@@ -426,9 +431,11 @@ impl Assets {
             list.skipped.push(SkippedSprite {
                 path_id: o.path_id(),
                 name,
-                error,
+                error: compact(error),
             });
         }
+        // Held as long as the list: no spare capacity in it or its messages.
+        list.skipped.shrink_to_fit();
         list.sprites.sort_by_cached_key(|s| self.texture_key(s));
         list
     }
@@ -482,13 +489,20 @@ impl Assets {
     /// The length an object's name states (its first field), as far as the file holds it: what
     /// reading the name will cost, known before it is read.
     fn name_len(&self, path_id: i64) -> u64 {
-        let stated = self
+        let Some(mut r) = self
             .file
             .object(path_id)
+            .filter(|o| o.class_id() == class::TEXTURE_2D)
             .and_then(|o| self.file.reader(o).ok())
-            .and_then(|mut r| r.i32().ok())
+        else {
+            return 0;
+        };
+        let stated = r
+            .i32()
+            .ok()
+            .and_then(|n| usize::try_from(n).ok())
             .unwrap_or(0);
-        u64::try_from(stated).map_or(0, |n| n.min(crate::reader::MAX_STRING as u64))
+        stated.min(crate::reader::MAX_STRING).min(r.remaining()) as u64
     }
 
     /// Where the sprite's pixels are: its atlas entry when it has one, its own render data
@@ -597,7 +611,14 @@ impl Assets {
             Streams::Dir(dir) => {
                 texture.data_claimed(dir, &mut || self.reserve(FILE_STEP), &mut claim)?
             }
-            Streams::Bundle(bundle) => texture.data_in_claimed(bundle, &mut claim)?,
+            // Finding a stream in a bundle (its entry by path, then the claim) costs its own
+            // step, kept whether the range is granted or not.
+            Streams::Bundle(bundle) => {
+                if texture.stream.is_some() {
+                    self.reserve(BUNDLE_STEP)?;
+                }
+                texture.data_in_claimed(bundle, &mut claim)?
+            }
         };
         // Inline pixels claim nothing; they reserve here, with nothing done yet.
         if !claimed {
@@ -609,7 +630,8 @@ impl Assets {
             Cow::Borrowed(b) => decode::decode(format, width, height, b),
         }
         .map_err(|e| match e {
-            // Sizes the file gave: the file's fault, not the caller's.
+            // `wanted` has checked the sizes already, so decode should not refuse them; if it
+            // ever did, they came from the file, and the fault is the file's.
             Error::Invalid(what) | Error::InvalidArgument(what) => {
                 Error::Invalid(format!("texture {}: {what}", quoted(&texture.name)))
             }
@@ -676,8 +698,11 @@ impl Assets {
     ///
     /// # Errors
     ///
-    /// When the image is inconsistent or does not contain the sprite's rect, the sprite uses
-    /// packing this crate does not undo, its mask cannot be built, or a limit is reached.
+    /// When the image does not contain the sprite's rect ([`Error::Invalid`], since the rect
+    /// may be the file's fault or the image the wrong one), the sprite uses packing this crate
+    /// does not undo, its mask cannot be built, or a limit is reached. A spent total is
+    /// [`Error::LimitExceeded`] from here, but inside [`Error::TextureUnreadable`] from
+    /// [`Assets::export`] when it is the decode that is refused; [`Error::root`] gives both.
     pub fn cut(&self, sprite: &Sprite, texture: &Image) -> Result<Image> {
         // Every cut costs its step, refused or not, before anything is read.
         self.reserve(CALL_STEP)?;
@@ -779,16 +804,17 @@ impl Assets {
         } else {
             (w, h)
         };
-        // Planning the mask reserves its triangles and rows as it goes; the call, the
-        // mask's column tests and the copy are reserved together before any starts. Work
-        // reserved is kept: it is never given back.
+        // The call's step was reserved on entry; planning the mask reserves its triangles and
+        // rows as it goes; the mask's column tests and the copy are reserved together before
+        // either starts. Work reserved is kept: it is never given back.
         let mask = match triangles {
             Some(t) => Some(self.plan_mask(sprite, t, placement, sw, sh)?),
             None => None,
         };
         let columns = mask.as_ref().map_or(0, |m| m.columns);
-        // A quarter turn reads the texture down its columns, at about twice the cost a pixel.
-        let per_pixel = if rotation == Rotation::Rotate90 { 2 } else { 1 };
+        // A quarter turn reads the texture down its columns, at two to three times the cost
+        // a pixel.
+        let per_pixel = if rotation == Rotation::Rotate90 { 3 } else { 1 };
         self.reserve(columns + per_pixel * u64::from(sw) * u64::from(sh))?;
         let coverage = mask.map(|m| m.fill(sw, sh)).transpose()?;
 
@@ -1066,16 +1092,36 @@ const CALL_STEP: u64 = 64;
 /// not the range is then refused.
 const FILE_STEP: u64 = 8192;
 
+/// Work for a decode whose pixels stream from its own bundle, besides [`CALL_STEP`]: finding
+/// the entry and claiming the range costs about 300 ns.
+const BUNDLE_STEP: u64 = 192;
+
 /// Farthest a mesh vertex may lie from the image's corner, in pixels: four times the largest
 /// texture. Much farther out, f32 rounding moves an edge by more than the column of slack
 /// each row's span allows (measured from about a million pixels); no real sprite comes near.
 const FAR: f32 = 65536.0;
 
-/// Where a pixel is sampled for the mask: at the quarter points. Of the rules measured
+/// Where a pixel is sampled for the mask: at the quarter points. Of the rules first measured
 /// against `UnityPy`'s polygon fill on real sprites (pixel centre only, any overlap, these four,
 /// two of five), keeping a pixel when any of these four is covered disagreed on the fewest
-/// pixels.
+/// pixels. A later check found any of the pixel's four corners a little closer still (0.85%
+/// of pixels against 0.88%), too small a gain to change the rule for.
 const SAMPLES: [(f64, f64); 4] = [(0.25, 0.25), (0.75, 0.25), (0.25, 0.75), (0.75, 0.75)];
+
+/// `e` with its message holding no spare capacity, for errors kept in long lists.
+fn compact(e: Error) -> Error {
+    let shrink = |mut s: String| {
+        s.shrink_to_fit();
+        s
+    };
+    match e {
+        Error::Invalid(s) => Error::Invalid(shrink(s)),
+        Error::Unsupported(s) => Error::Unsupported(shrink(s)),
+        Error::NotUnity(s) => Error::NotUnity(shrink(s)),
+        Error::NotFound(s) => Error::NotFound(shrink(s)),
+        e => e,
+    }
+}
 
 fn texture_id_of(sprite: &Sprite, placement: &Placement) -> Result<i64> {
     if placement.texture.is_null() {

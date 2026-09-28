@@ -63,16 +63,16 @@ impl Names {
     }
 }
 
-/// A string safe to print to a terminal: every character Rust's `Debug` would escape
-/// (control characters, and the invisible ones that reorder or hide text) is shown escaped;
-/// quotes and backslashes are left alone.
+/// A string safe to print to a terminal: printable ASCII as it is, everything else shown as
+/// `\u{...}`. Names from a file can hold characters that are blank, reorder text or look
+/// like others; no list of the harmful ones keeps up with Unicode, so none is trusted.
 pub fn printable(s: &str) -> String {
     s.chars()
         .flat_map(|c| {
-            if matches!(c, '"' | '\'' | '\\') {
+            if matches!(c, ' '..='~') {
                 vec![c]
             } else {
-                c.escape_debug().collect()
+                c.escape_unicode().collect()
             }
         })
         .collect()
@@ -96,13 +96,21 @@ pub fn save_png(
     // Flushed here, not on drop, so a disk that fills up at the end is an error, not a
     // silently truncated PNG.
     let mut out = std::io::BufWriter::new(file);
-    image::codecs::png::PngEncoder::new(&mut out).write_image(
-        image.rgba(),
-        image.width(),
-        image.height(),
-        image::ExtendedColorType::Rgba8,
-    )?;
-    std::io::Write::flush(&mut out)?;
+    let written = image::codecs::png::PngEncoder::new(&mut out)
+        .write_image(
+            image.rgba(),
+            image.width(),
+            image.height(),
+            image::ExtendedColorType::Rgba8,
+        )
+        .map_err(|e| e.to_string())
+        .and_then(|()| std::io::Write::flush(&mut out).map_err(|e| e.to_string()));
+    if let Err(e) = written {
+        // The file is ours (made new above) and damaged: remove it, so a rerun can write it.
+        drop(out);
+        let _ = std::fs::remove_file(path);
+        return Err(format!("{}: {e}", path.display()).into());
+    }
     Ok(())
 }
 
@@ -202,7 +210,10 @@ mod tests {
             let p = printable(bad);
             assert!(p.chars().all(|c| c.is_ascii_graphic()), "{bad:?} -> {p:?}");
         }
-        assert_eq!(printable("Icon \"x\" é"), "Icon \"x\" é");
+        assert_eq!(printable("Icon \"x\" é"), "Icon \"x\" \\u{e9}");
+        for blank in ["\u{3164}", "\u{115f}", "\u{2800}", "\u{5d0}"] {
+            assert!(printable(blank).starts_with("\\u{"), "{blank:?}");
+        }
     }
 
     #[test]

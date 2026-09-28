@@ -68,8 +68,10 @@ pub fn is_supported(format: i32) -> bool {
 ///
 /// # Errors
 ///
-/// For a format this crate does not decode, a size that cannot fit in memory, or data shorter
-/// than the first mip level.
+/// [`Error::UnsupportedTextureFormat`] for a format this crate does not decode;
+/// [`Error::InvalidArgument`] for a size that cannot fit in memory or data shorter than the
+/// first mip level (the arguments' fault, even when they came from a file);
+/// [`Error::OutOfMemory`] when the output cannot be allocated.
 pub fn decode(format: i32, width: u32, height: u32, data: &[u8]) -> Result<Vec<u8>> {
     if !is_supported(format) {
         return Err(Error::UnsupportedTextureFormat { name: None, format });
@@ -98,26 +100,8 @@ pub fn decode(format: i32, width: u32, height: u32, data: &[u8]) -> Result<Vec<u
             alpha_block(&b[..8], px);
         }),
         _ => {
-            let (bpp, convert): (usize, Convert) = match format {
-                format::ALPHA8 => (1, |s, d| d.copy_from_slice(&[255, 255, 255, s[0]])),
-                format::RGB24 => (3, |s, d| d.copy_from_slice(&[s[0], s[1], s[2], 255])),
-                format::RGBA32 => (4, |s, d| d.copy_from_slice(s)),
-                format::ARGB32 => (4, |s, d| d.copy_from_slice(&[s[1], s[2], s[3], s[0]])),
-                format::ARGB4444 => (2, |s, d| {
-                    let argb = nibbles(s);
-                    d.copy_from_slice(&[argb[1], argb[2], argb[3], argb[0]]);
-                }),
-                format::RGBA4444 => (2, |s, d| d.copy_from_slice(&nibbles(s))),
-                format::RGB565 => (2, |s, d| {
-                    let v = u16::from_le_bytes([s[0], s[1]]);
-                    d.copy_from_slice(&[
-                        widen(v >> 11, 31),
-                        widen((v >> 5) & 63, 63),
-                        widen(v & 31, 31),
-                        255,
-                    ]);
-                }),
-                _ => (4, |s, d| d.copy_from_slice(&[s[2], s[1], s[0], s[3]])), // BGRA32
+            let Some((bpp, convert)) = pixel_format(format) else {
+                return Err(Error::UnsupportedTextureFormat { name: None, format });
             };
             // Stored row y becomes output row h - 1 - y.
             for (y, src) in data.chunks_exact((w * bpp).max(1)).take(h).enumerate() {
@@ -146,32 +130,75 @@ const fn widen(value: u16, max: u16) -> u8 {
     (value as u32 * 255 / max as u32) as u8
 }
 
-/// [`decode`], taking ownership of the pixels: four-byte data (RGBA32, BGRA32, ARGB32)
-/// holding at least the first mip is reordered and turned the right way up in place rather
-/// than copied, so decoding it needs no second buffer.
+/// [`decode`], taking ownership of the pixels: data stored pixel by pixel (not in blocks)
+/// and holding at least the first mip is widened to RGBA8, from the last pixel back, and
+/// turned the right way up in its own buffer, so decoding it needs no second one. The
+/// buffer should have room for the result already, or growing it may copy it.
 pub(crate) fn decode_owned(
     format: i32,
     width: u32,
     height: u32,
     mut data: Vec<u8>,
 ) -> Result<Vec<u8>> {
+    let (w, h) = (width as usize, height as usize);
+    let out_len = w
+        .checked_mul(h)
+        .and_then(|p| p.checked_mul(4))
+        .filter(|&n| isize::try_from(n).is_ok());
     let size = mip0_size(format, width, height);
-    let four_bytes = matches!(format, format::RGBA32 | format::BGRA32 | format::ARGB32);
-    let Some(size) = size.filter(|&n| four_bytes && data.len() >= n) else {
+    let (Some((bpp, convert)), Some(size), Some(out_len)) = (pixel_format(format), size, out_len)
+    else {
         return decode(format, width, height, &data);
     };
-    data.truncate(size);
-    match format {
-        format::BGRA32 => data.chunks_exact_mut(4).for_each(|p| p.swap(0, 2)),
-        format::ARGB32 => data.chunks_exact_mut(4).for_each(|p| p.rotate_left(1)),
-        _ => {}
+    if data.len() < size {
+        return decode(format, width, height, &data);
     }
-    let (h, row) = (height as usize, width as usize * 4);
+    data.truncate(size);
+    data.try_reserve_exact(out_len - size)
+        .map_err(|_| Error::OutOfMemory {
+            bytes: out_len as u64,
+        })?;
+    data.resize(out_len, 0);
+    // From the last pixel back: pixel i's four output bytes start at 4i, at or after where
+    // its stored bytes and every later pixel's start, so nothing is overwritten unread.
+    let mut stored = [0u8; 4];
+    for i in (0..w * h).rev() {
+        stored[..bpp].copy_from_slice(&data[i * bpp..(i + 1) * bpp]);
+        convert(&stored[..bpp], &mut data[i * 4..(i + 1) * 4]);
+    }
+    let row = w * 4;
     for i in 0..h / 2 {
         let (top, bottom) = data.split_at_mut((h - 1 - i) * row);
         top[i * row..(i + 1) * row].swap_with_slice(&mut bottom[..row]);
     }
     Ok(data)
+}
+
+/// The stored bytes a pixel and the conversion to RGBA8 for a format stored pixel by pixel
+/// (not in blocks).
+fn pixel_format(format: i32) -> Option<(usize, Convert)> {
+    Some(match format {
+        format::ALPHA8 => (1, |s, d| d.copy_from_slice(&[255, 255, 255, s[0]])),
+        format::RGB24 => (3, |s, d| d.copy_from_slice(&[s[0], s[1], s[2], 255])),
+        format::RGBA32 => (4, |s, d| d.copy_from_slice(s)),
+        format::ARGB32 => (4, |s, d| d.copy_from_slice(&[s[1], s[2], s[3], s[0]])),
+        format::ARGB4444 => (2, |s, d| {
+            let argb = nibbles(s);
+            d.copy_from_slice(&[argb[1], argb[2], argb[3], argb[0]]);
+        }),
+        format::RGBA4444 => (2, |s, d| d.copy_from_slice(&nibbles(s))),
+        format::RGB565 => (2, |s, d| {
+            let v = u16::from_le_bytes([s[0], s[1]]);
+            d.copy_from_slice(&[
+                widen(v >> 11, 31),
+                widen((v >> 5) & 63, 63),
+                widen(v & 31, 31),
+                255,
+            ]);
+        }),
+        format::BGRA32 => (4, |s, d| d.copy_from_slice(&[s[2], s[1], s[0], s[3]])),
+        _ => return None,
+    })
 }
 
 /// Turns one stored pixel into RGBA8.
@@ -283,15 +310,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_four_byte_pixels_are_decoded_in_their_own_buffer() {
-        // Exactly the first mip, and with a mip tail after it: either way the result is the
-        // buffer given, not a copy (the memory figures rest on it).
-        for format in [format::RGBA32, format::BGRA32, format::ARGB32] {
+    fn test_pixel_formats_are_decoded_in_their_own_buffer() {
+        // Exactly the first mip, and with a mip tail after it, in a buffer with room for the
+        // result: the result is that buffer, not a copy (the memory figures rest on it).
+        for format in [
+            format::ALPHA8,
+            format::ARGB4444,
+            format::RGB24,
+            format::RGBA32,
+            format::ARGB32,
+            format::RGB565,
+            format::RGBA4444,
+            format::BGRA32,
+        ] {
+            let size = mip0_size(format, 5, 3).unwrap();
             for extra in [0, 12] {
-                let data: Vec<u8> = (0..(4 * 3 * 4 + extra) as u8).collect();
+                let mut data = Vec::with_capacity(5 * 3 * 4 + extra);
+                data.extend((0..size + extra).map(|i| (i * 37 % 251) as u8));
                 let at = data.as_ptr();
-                let want = decode(format, 4, 3, &data).unwrap();
-                let got = decode_owned(format, 4, 3, data).unwrap();
+                let want = decode(format, 5, 3, &data).unwrap();
+                let got = decode_owned(format, 5, 3, data).unwrap();
                 assert_eq!(got.as_ptr(), at, "format {format}, {extra} extra");
                 assert_eq!(got, want, "format {format}, {extra} extra");
             }

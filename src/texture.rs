@@ -175,9 +175,17 @@ impl<'a> Texture2D<'a> {
         claim(StreamKey::File(id), stream.offset, end)?;
         file.seek(SeekFrom::Start(stream.offset))
             .map_err(Error::io(&path))?;
+        // Room for the decoded RGBA too, when it can be widened in place: the stored pixels
+        // and the result are then one buffer, never two.
+        let rgba = self.width as usize * self.height as usize * 4;
+        let room = if crate::decode::is_block_format(self.format) {
+            want
+        } else {
+            want.max(rgba)
+        };
         let mut data = Vec::new();
-        data.try_reserve_exact(want)
-            .map_err(|_| Error::OutOfMemory { bytes: want as u64 })?;
+        data.try_reserve_exact(room)
+            .map_err(|_| Error::OutOfMemory { bytes: room as u64 })?;
         file.take(want as u64)
             .read_to_end(&mut data)
             .map_err(Error::io(&path))?;
