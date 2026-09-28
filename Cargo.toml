@@ -7,7 +7,7 @@ description = "Read Unity serialized asset files and asset bundles, and export t
 license = "MIT"
 repository = "https://github.com/jtk18/unity-bundle-assets"
 keywords = ["unity", "assetbundle", "sprite", "texture", "unityfs"]
-categories = ["game-development", "parser-implementations"]
+categories = ["game-development", "parser-implementations", "multimedia::images"]
 exclude = ["deny.toml"]
 
 [dependencies]

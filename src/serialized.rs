@@ -3,7 +3,7 @@
 
 use crate::bundle::{Bundle, Entry};
 use crate::reader::Reader;
-use crate::{version_numbers, Error, Limits, Result};
+use crate::{Error, Limits, Result, Version};
 
 use std::collections::HashMap;
 use std::ops::Range;
@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 /// Oldest format version read. Version 17 arrived with Unity 5.5.
 const MIN_VERSION: u32 = 17;
-/// Newest format version this crate was written against (Unity 2022.2 through 6000.5).
+/// Newest format version this crate was written against.
 const MAX_VERSION: u32 = 22;
 
 /// Unity class IDs this crate cares about, as returned by [`ObjectInfo::class_id`].
@@ -23,7 +23,7 @@ pub mod class {
     /// `Sprite`.
     pub const SPRITE: i32 = 213;
     /// `SpriteAtlas`.
-    pub const SPRITE_ATLAS: i32 = 687078895;
+    pub const SPRITE_ATLAS: i32 = 687_078_895;
 }
 
 /// One entry of the file's type table.
@@ -47,17 +47,20 @@ pub struct ObjectInfo {
 
 impl ObjectInfo {
     /// The object's ID within this file, used by references ([`crate::PPtr`]).
-    pub fn path_id(&self) -> i64 {
+    #[must_use]
+    pub const fn path_id(&self) -> i64 {
         self.path_id
     }
 
     /// Size of the object's data in bytes.
-    pub fn size(&self) -> usize {
+    #[must_use]
+    pub const fn size(&self) -> usize {
         self.size
     }
 
     /// The Unity class ID; see [`class`].
-    pub fn class_id(&self) -> i32 {
+    #[must_use]
+    pub const fn class_id(&self) -> i32 {
         self.class_id
     }
 }
@@ -80,8 +83,8 @@ enum Bytes {
 impl Bytes {
     fn as_slice(&self) -> &[u8] {
         match self {
-            Bytes::Owned(v) => v,
-            Bytes::InBundle(b, r) => &b.data_ref()[r.clone()],
+            Self::Owned(v) => v,
+            Self::InBundle(b, r) => &b.data_ref()[r.clone()],
         }
     }
 }
@@ -131,49 +134,69 @@ impl SerializedFile {
     /// Parse a serialized file from its bytes, with the default [`Limits`]. An asset bundle
     /// is refused with a message saying so; open those with [`crate::Assets::open`] or
     /// [`crate::Bundle::parse`].
-    pub fn parse(data: Vec<u8>) -> Result<SerializedFile> {
-        SerializedFile::parse_with(data, Limits::default())
+    ///
+    /// # Errors
+    ///
+    /// When the data is not a serialized file this crate reads, or contradicts itself.
+    pub fn parse(data: Vec<u8>) -> Result<Self> {
+        Self::parse_with(data, Limits::default())
     }
 
-    /// Parse a serialized file from its bytes under `limits`.
-    pub fn parse_with(data: Vec<u8>, limits: Limits) -> Result<SerializedFile> {
+    /// [`SerializedFile::parse`] under `limits`.
+    ///
+    /// # Errors
+    ///
+    /// As [`SerializedFile::parse`].
+    pub fn parse_with(data: Vec<u8>, limits: Limits) -> Result<Self> {
         let parsed = parse(&data)?;
-        Ok(SerializedFile::build(parsed, Bytes::Owned(data), limits))
+        Ok(Self::build(parsed, Bytes::Owned(data), limits))
     }
 
     /// Read and parse the file at `path`, with the default [`Limits`].
-    pub fn open(path: impl AsRef<std::path::Path>) -> Result<SerializedFile> {
-        let limits = Limits::default();
-        SerializedFile::parse_with(crate::export::read_file(path.as_ref(), &limits)?, limits)
+    ///
+    /// # Errors
+    ///
+    /// When the file cannot be read or is over the size limit, and as
+    /// [`SerializedFile::parse`].
+    pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self> {
+        Self::open_with(path, Limits::default())
+    }
+
+    /// [`SerializedFile::open`] under `limits`.
+    ///
+    /// # Errors
+    ///
+    /// As [`SerializedFile::open`].
+    pub fn open_with(path: impl AsRef<std::path::Path>, limits: Limits) -> Result<Self> {
+        let data = crate::file::read_limited(path.as_ref(), limits.max_file_size)?;
+        Self::parse_with(data, limits)
     }
 
     /// Parse the serialized file in a bundle entry, sharing the bundle's bytes. A file whose
     /// engine version was stripped takes the bundle's.
-    pub(crate) fn in_bundle(bundle: Arc<Bundle>, entry: &Entry) -> Result<SerializedFile> {
+    pub(crate) fn in_bundle(bundle: Arc<Bundle>, entry: &Entry) -> Result<Self> {
         let bytes = bundle
             .bytes(entry)
-            .ok_or_else(|| Error::NotFound(format!("entry {} in this bundle", entry.path())))?;
+            .ok_or_else(|| Error::NotFound(format!("entry {:?} in this bundle", entry.path())))?;
         let mut parsed = parse(bytes)?;
-        if version_numbers(&parsed.unity_version) == [0, 0, 0] {
+        if Version::parse(&parsed.unity_version).stripped() {
             parsed.unity_version = bundle.unity_revision().to_string();
         }
         let limits = bundle.limits();
-        let range = bundle.range_of(entry);
-        Ok(SerializedFile::build(
-            parsed,
-            Bytes::InBundle(bundle, range),
-            limits,
-        ))
+        let range = Bundle::range_of(entry);
+        Ok(Self::build(parsed, Bytes::InBundle(bundle, range), limits))
     }
 
-    fn build(p: Parsed, data: Bytes, limits: Limits) -> SerializedFile {
-        let mut index = HashMap::with_capacity(p.objects.len());
-        for (i, o) in p.objects.iter().enumerate() {
-            index.entry(o.path_id).or_insert(i);
-        }
-        SerializedFile {
+    fn build(p: Parsed, data: Bytes, limits: Limits) -> Self {
+        let index = p
+            .objects
+            .iter()
+            .enumerate()
+            .map(|(i, o)| (o.path_id, i))
+            .collect();
+        Self {
             version: p.version,
-            unity_numbers: version_numbers(&p.unity_version),
+            unity_numbers: Version::parse(&p.unity_version).numbers,
             unity_version: p.unity_version,
             target_platform: p.target_platform,
             big_endian: p.big_endian,
@@ -188,63 +211,75 @@ impl SerializedFile {
     }
 
     /// Format version, 17 to 22.
-    pub fn version(&self) -> u32 {
+    #[must_use]
+    pub const fn version(&self) -> u32 {
         self.version
     }
 
     /// The engine release that wrote the file, e.g. `2022.3.62f3`. In a bundle, a stripped
     /// version is replaced by the bundle's.
+    #[must_use]
     pub fn unity_version(&self) -> &str {
         &self.unity_version
     }
 
     /// The Unity version as numbers: `2022.3.62f3` is `[2022, 3, 62]`.
-    pub fn unity_version_numbers(&self) -> [u32; 3] {
+    #[must_use]
+    pub const fn unity_version_numbers(&self) -> [u32; 3] {
         self.unity_numbers
     }
 
     /// Unity's `BuildTarget` value.
-    pub fn target_platform(&self) -> i32 {
+    #[must_use]
+    pub const fn target_platform(&self) -> i32 {
         self.target_platform
     }
 
     /// Whether object data is big-endian.
-    pub fn big_endian(&self) -> bool {
+    #[must_use]
+    pub const fn big_endian(&self) -> bool {
         self.big_endian
     }
 
     /// Whether the file carries type trees. Layouts here are hard-coded either way.
-    pub fn has_type_trees(&self) -> bool {
+    #[must_use]
+    pub const fn has_type_trees(&self) -> bool {
         self.has_type_trees
     }
 
     /// The type table.
+    #[must_use]
     pub fn types(&self) -> &[SerializedType] {
         &self.types
     }
 
     /// Every object in the file, in file order.
+    #[must_use]
     pub fn objects(&self) -> &[ObjectInfo] {
         &self.objects
     }
 
     /// Other files this one references.
+    #[must_use]
     pub fn externals(&self) -> &[External] {
         &self.externals
     }
 
     /// The limits the file was parsed under.
-    pub fn limits(&self) -> Limits {
+    #[must_use]
+    pub const fn limits(&self) -> Limits {
         self.limits
     }
 
-    /// The object with this path ID (the first, if the file repeats one).
+    /// The object with this path ID.
+    #[must_use]
     pub fn object(&self, path_id: i64) -> Option<&ObjectInfo> {
         self.index.get(&path_id).map(|&i| &self.objects[i])
     }
 
     /// One object's raw bytes, or `None` for an object from another file that does not fit
     /// this one.
+    #[must_use]
     pub fn bytes(&self, object: &ObjectInfo) -> Option<&[u8]> {
         self.data
             .as_slice()
@@ -259,7 +294,8 @@ impl SerializedFile {
         Ok(Reader::new(bytes, self.big_endian))
     }
 
-    /// The object's `m_Name`, for classes that start with one (Texture2D, Sprite, ...).
+    /// The object's `m_Name`, for classes that start with one (`Texture2D`, Sprite, ...).
+    #[must_use]
     pub fn name(&self, object: &ObjectInfo) -> Option<String> {
         self.reader(object).ok()?.aligned_string().ok()
     }
@@ -280,22 +316,23 @@ fn parse(data: &[u8]) -> Result<Parsed> {
     }
     let mut r = Reader::new(data, true);
     let _metadata_size = r.u32()?;
-    let mut file_size = r.u32()? as u64;
+    let mut file_size = u64::from(r.u32()?);
     let version = r.u32()?;
-    let mut data_offset = r.u32()? as u64;
+    let mut data_offset = u64::from(r.u32()?);
     if !(MIN_VERSION..=MAX_VERSION).contains(&version) {
-        // Older Unity files have a plausible header too; anything else is not Unity at all.
-        return Err(
-            if (9..MIN_VERSION).contains(&version) && file_size == data.len() as u64 {
-                Error::Unsupported(format!(
+        // Older and newer Unity files have a plausible header too (a v22-style header leaves
+        // the old size field 0); anything else is not Unity at all.
+        let plausible = ((9..MIN_VERSION).contains(&version) && file_size == data.len() as u64)
+            || ((MAX_VERSION + 1..=40).contains(&version) && file_size == 0);
+        return Err(if plausible {
+            Error::Unsupported(format!(
                 "serialized file format version {version} (supported: {MIN_VERSION}-{MAX_VERSION})"
             ))
-            } else {
-                Error::NotUnity(format!(
-                    "no serialized-file header (format field {version})"
-                ))
-            },
-        );
+        } else {
+            Error::NotUnity(format!(
+                "no serialized-file header (format field {version})"
+            ))
+        });
     }
     let big_endian = r.u8()? != 0;
     r.skip(3)?;
@@ -336,7 +373,7 @@ fn parse(data: &[u8]) -> Result<Parsed> {
         let start = if version >= 22 {
             r.u64()?
         } else {
-            r.u32()? as u64
+            u64::from(r.u32()?)
         };
         let size = r.u32()? as usize;
         let type_index = r.i32()?;
@@ -356,6 +393,28 @@ fn parse(data: &[u8]) -> Result<Parsed> {
             size,
             class_id,
         });
+    }
+
+    // Unity never writes two objects over the same bytes, or two with one ID. Allowing either
+    // lets a small file name one large object many times over.
+    let mut spans: Vec<(usize, usize, i64)> = objects
+        .iter()
+        .filter(|o| o.size > 0)
+        .map(|o| (o.offset, o.offset + o.size, o.path_id))
+        .collect();
+    spans.sort_unstable();
+    for w in spans.windows(2) {
+        if w[1].0 < w[0].1 {
+            return Err(Error::Invalid(format!(
+                "objects {} and {} overlap",
+                w[0].2, w[1].2
+            )));
+        }
+    }
+    let mut ids: Vec<i64> = objects.iter().map(|o| o.path_id).collect();
+    ids.sort_unstable();
+    if let Some([id, _]) = ids.windows(2).find(|w| w[0] == w[1]) {
+        return Err(Error::Invalid(format!("two objects have path ID {id}")));
     }
 
     // Script references: which MonoScripts the MonoBehaviours use. Not needed here.

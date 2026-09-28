@@ -25,7 +25,7 @@ macro_rules! read_num {
 }
 
 impl<'a> Reader<'a> {
-    pub fn new(data: &'a [u8], big_endian: bool) -> Self {
+    pub const fn new(data: &'a [u8], big_endian: bool) -> Self {
         Reader {
             data,
             pos: 0,
@@ -33,7 +33,12 @@ impl<'a> Reader<'a> {
         }
     }
 
-    pub fn set_big_endian(&mut self, big_endian: bool) {
+    /// Bytes left after the cursor.
+    pub const fn remaining(&self) -> usize {
+        self.data.len().saturating_sub(self.pos)
+    }
+
+    pub const fn set_big_endian(&mut self, big_endian: bool) {
         self.big_endian = big_endian;
     }
 
@@ -52,7 +57,7 @@ impl<'a> Reader<'a> {
         self.take(n).map(|_| ())
     }
 
-    pub fn align(&mut self, to: usize) {
+    pub const fn align(&mut self, to: usize) {
         self.pos = self.pos.div_ceil(to) * to;
     }
 
@@ -91,7 +96,10 @@ impl<'a> Reader<'a> {
         let n = self.i32()?;
         let left = self.data.len() - self.pos;
         if n < 0 || (n as usize).saturating_mul(min_item_size.max(1)) > left {
-            return Err(Error::BadLength { at, len: n as i64 });
+            return Err(Error::BadLength {
+                at,
+                len: i64::from(n),
+            });
         }
         Ok(n as usize)
     }

@@ -123,6 +123,10 @@ pub enum Layout {
     U2019_3,
     /// 2019.4.9: plus m_IsPreProcessed.
     U2019_4,
+    /// 2020.1: plus m_MipsStripped; 64-bit stream offsets.
+    U2020_1,
+    /// 2020.2 to 2022.1: plus m_IsAlphaChannelOptional and m_PlatformBlob.
+    U2021_3,
     /// 2022.2 to 2023.1: mips stripped, alpha optional, platform blob, limit group name.
     U2022_3,
     /// 2023.2 on (Unity 6): 2022.3 without the fallback fields.
@@ -146,10 +150,10 @@ pub fn texture(
     o.string(name);
     match layout {
         U5_6 | U2017_1 => {}
-        U2018_4 | U2019_3 | U2019_4 => {
+        U2018_4 | U2019_3 | U2019_4 | U2020_1 => {
             o.i32(0).bool(false).align();
         }
-        U2022_3 => {
+        U2021_3 | U2022_3 => {
             o.i32(0).bool(false).bool(false).align();
         }
         U6000 => {
@@ -157,7 +161,7 @@ pub fn texture(
         }
     }
     o.i32(w).i32(h).i32(0);
-    if matches!(layout, U2022_3 | U6000) {
+    if matches!(layout, U2020_1 | U2021_3 | U2022_3 | U6000) {
         o.i32(0); // m_MipsStripped
     }
     o.i32(fmt).i32(1);
@@ -171,7 +175,7 @@ pub fn texture(
         U2019_3 => {
             o.bool(false).bool(false).bool(false).align().i32(0);
         }
-        U2019_4 => {
+        U2019_4 | U2020_1 | U2021_3 => {
             o.bool(false)
                 .bool(false)
                 .bool(false)
@@ -188,12 +192,12 @@ pub fn texture(
     o.i32(1).i32(2);
     o.zeros(if matches!(layout, U5_6) { 16 } else { 24 });
     o.i32(0).i32(1);
-    if matches!(layout, U2022_3 | U6000) {
+    if matches!(layout, U2021_3 | U2022_3 | U6000) {
         o.bytes(platform_blob);
     }
     o.bytes(px.inline());
     let (offset, size, path) = px.stream();
-    if matches!(layout, U2022_3 | U6000) {
+    if matches!(layout, U2020_1 | U2021_3 | U2022_3 | U6000) {
         o.u64(offset);
     } else {
         o.u32(offset as u32);
@@ -202,10 +206,30 @@ pub fn texture(
     o.buf
 }
 
-/// One sprite mesh triangle strip: positions in sprite units, and index triples.
+/// A sprite mesh: positions in sprite units, and index triples.
+#[derive(Clone, Copy)]
 pub struct Mesh<'a> {
     pub vertices: &'a [[f32; 2]],
     pub indices: &'a [u16],
+    /// Which vertex stream holds positions (the other holds UVs).
+    pub pos_stream: u8,
+    /// Written as the sub-mesh's base vertex, with that many unused vertices first.
+    pub base_vertex: u32,
+    /// A second sub-mesh of lines (topology 3) over `junk_triangle`, which must be ignored.
+    pub junk_lines: bool,
+    /// The position channel's vertex format: 0 float32, 1 float16.
+    pub pos_format: u8,
+}
+
+impl Mesh<'static> {
+    pub const BASE: Mesh<'static> = Mesh {
+        vertices: &[],
+        indices: &[],
+        pos_stream: 0,
+        base_vertex: 0,
+        junk_lines: false,
+        pos_format: 0,
+    };
 }
 
 /// A `Sprite` object, Unity 2019.1 to 6000.4 layout (`is_polygon`), or 6000.5 (without).
@@ -242,31 +266,85 @@ pub fn sprite(
     // m_RD
     o.pptr(0, texture).pptr(0, alpha_texture);
     o.i32(0); // secondaryTextures
-    let index_count = mesh.indices.len() as u32;
-    if index_count > 0 {
-        o.i32(1); // one sub-mesh
-        o.u32(0).u32(index_count).i32(0).u32(0).u32(0);
-        o.u32(mesh.vertices.len() as u32).zeros(24);
-    } else {
-        o.i32(0);
+    let b = mesh.base_vertex as usize;
+    // Unused vertices before the mesh's own, reached only through the base vertex; and, for
+    // `junk_lines`, a huge triangle after them.
+    let mut verts: Vec<[f32; 2]> = vec![[9e3, 9e3]; b];
+    verts.extend_from_slice(mesh.vertices);
+    let junk = verts.len() as u16;
+    if mesh.junk_lines {
+        verts.extend([[-1e4, -1e4], [1e4, -1e4], [0.0, 1e4]]);
     }
+    let index_count = mesh.indices.len() as u32;
     let mut ib = W::new(big);
     for &i in mesh.indices {
         ib.u16(i);
     }
+    let junk_at = ib.buf.len() as u32;
+    if mesh.junk_lines {
+        for i in [0u16, 1, 2] {
+            ib.u16(junk + i - b as u16);
+        }
+    }
+    let submeshes = u32::from(index_count > 0) + u32::from(mesh.junk_lines);
+    o.u32(submeshes);
+    if index_count > 0 {
+        o.u32(0)
+            .u32(index_count)
+            .i32(0)
+            .u32(mesh.base_vertex)
+            .u32(0);
+        o.u32(verts.len() as u32).zeros(24);
+    }
+    if mesh.junk_lines {
+        o.u32(junk_at).u32(3).i32(3).u32(mesh.base_vertex).u32(0);
+        o.u32(verts.len() as u32).zeros(24);
+    }
     o.bytes(&ib.buf);
-    o.u32(mesh.vertices.len() as u32);
-    // Channels: position in stream 0 (float32 x3), UV in stream 1.
-    o.i32(2).raw(&[0, 0, 0, 3]).raw(&[1, 0, 0, 2]);
+    o.u32(verts.len() as u32);
+    // Channel 0 is position (3 components), channel 1 UV (2 floats), in the streams asked.
+    let (ps, us) = if mesh.pos_stream == 0 {
+        (0u8, 1u8)
+    } else {
+        (1, 0)
+    };
+    o.i32(2)
+        .raw(&[ps, 0, mesh.pos_format, 3])
+        .raw(&[us, 0, 0, 2]);
     let mut vb = W::new(big);
-    for v in mesh.vertices {
-        vb.f32(v[0]).f32(v[1]).f32(0.0);
-    }
-    while vb.buf.len() % 16 != 0 {
-        vb.buf.push(0);
-    }
-    for _ in mesh.vertices {
-        vb.f32(0.0).f32(0.0);
+    let positions = |vb: &mut W| {
+        for v in &verts {
+            match mesh.pos_format {
+                0 => {
+                    vb.f32(v[0]).f32(v[1]).f32(0.0);
+                }
+                10 => {
+                    vb.u32(v[0] as u32).u32(v[1] as u32).u32(0);
+                }
+                _ => {
+                    vb.u16(0).u16(0).u16(0);
+                }
+            }
+        }
+    };
+    let uvs = |vb: &mut W| {
+        for _ in &verts {
+            vb.f32(0.0).f32(0.0);
+        }
+    };
+    let pad = |vb: &mut W| {
+        while vb.buf.len() % 16 != 0 {
+            vb.buf.push(0);
+        }
+    };
+    if ps == 0 {
+        positions(&mut vb);
+        pad(&mut vb);
+        uvs(&mut vb);
+    } else {
+        uvs(&mut vb);
+        pad(&mut vb);
+        positions(&mut vb);
     }
     o.bytes(&vb.buf);
     o.i32(0); // m_Bindpose
@@ -286,6 +364,16 @@ pub fn sprite(
 
 /// A `SpriteAtlas` object (2020.2 on) with one entry per `(key, texture, rect, settings)`.
 pub fn atlas(big: bool, entries: &[(i64, i64, [f32; 4], u32, f32)]) -> Vec<u8> {
+    atlas_with(big, true, entries)
+}
+
+/// A `SpriteAtlas` object; `secondary` for the 2020.2 layout, whose entries end in a list of
+/// secondary textures.
+pub fn atlas_with(
+    big: bool,
+    secondary: bool,
+    entries: &[(i64, i64, [f32; 4], u32, f32)],
+) -> Vec<u8> {
     let mut o = W::new(big);
     o.string("atlas");
     o.i32(0); // m_PackedSprites
@@ -299,9 +387,22 @@ pub fn atlas(big: bool, entries: &[(i64, i64, [f32; 4], u32, f32)]) -> Vec<u8> {
         o.zeros(16); // uvTransform
         o.f32(downscale);
         o.u32(settings);
-        o.i32(0); // secondaryTextures
+        if secondary {
+            o.i32(0); // secondaryTextures
+        }
     }
     o.buf
+}
+
+/// What else a serialized file's metadata carries.
+#[derive(Default)]
+pub struct Extras {
+    /// Type trees for every type (one node each), with type-tree dependencies from v21.
+    pub type_trees: bool,
+    /// A MonoBehaviour type, whose entry carries a script ID.
+    pub mono: bool,
+    pub scripts: usize,
+    pub externals: Vec<String>,
 }
 
 /// A serialized file holding `objects` as `(path_id, class_id, data)`, no type trees.
@@ -312,6 +413,18 @@ pub fn serialized(
     platform: i32,
     objects: &[(i64, i32, Vec<u8>)],
 ) -> Vec<u8> {
+    serialized_with(version, unity, big, platform, objects, &Extras::default())
+}
+
+/// [`serialized`] with the metadata sections the reader must step over.
+pub fn serialized_with(
+    version: u32,
+    unity: &str,
+    big: bool,
+    platform: i32,
+    objects: &[(i64, i32, Vec<u8>)],
+    extras: &Extras,
+) -> Vec<u8> {
     let header_len = if version >= 22 { 48 } else { 20 };
     let mut classes: Vec<i32> = Vec::new();
     for (_, c, _) in objects {
@@ -319,13 +432,28 @@ pub fn serialized(
             classes.push(*c);
         }
     }
+    if extras.mono {
+        classes.push(114);
+    }
     let mut m = W::new(big);
     m.raw(unity.as_bytes()).raw(&[0]);
     m.i32(platform);
-    m.bool(false); // no type trees
+    m.bool(extras.type_trees);
     m.i32(classes.len() as i32);
     for c in &classes {
-        m.i32(*c).bool(false).u16(0xffff).zeros(16);
+        m.i32(*c).bool(false).u16(0xffff);
+        if *c == 114 {
+            m.raw(&[0x5c; 16]); // script ID
+        }
+        m.raw(&[0xab; 16]); // type hash
+        if extras.type_trees {
+            let node = if version >= 19 { 32 } else { 24 };
+            m.i32(2).i32(8); // two nodes, eight bytes of strings
+            m.raw(&vec![0x3c; 2 * node]).raw(b"Base\0ab\0");
+            if version >= 21 {
+                m.i32(2).i32(5).i32(6); // two dependencies
+            }
+        }
     }
     m.i32(objects.len() as i32);
     let mut start = 0u64;
@@ -345,16 +473,33 @@ pub fn serialized(
         starts.push(start);
         start = (start + data.len() as u64).div_ceil(8) * 8;
     }
-    m.i32(0).i32(0); // scripts, externals
+    m.i32(extras.scripts as i32);
+    for i in 0..extras.scripts {
+        m.i32(i as i32);
+        while (header_len + m.buf.len()) % 4 != 0 {
+            m.buf.push(0);
+        }
+        m.i64(1000 + i as i64);
+    }
+    m.i32(extras.externals.len() as i32);
+    for path in &extras.externals {
+        m.raw(&[0])
+            .raw(&[0x9e; 16])
+            .i32(2)
+            .raw(path.as_bytes())
+            .raw(&[0]);
+    }
     let meta = m.buf;
 
     let data_offset = (header_len + meta.len()).div_ceil(16) * 16;
     let file_size = data_offset + start as usize;
+    // From v22 the 32-bit fields are left 0 and the 64-bit ones below carry the values.
+    let small = |v: usize| if version >= 22 { 0 } else { v as u32 };
     let mut out = Vec::new();
-    out.extend((meta.len() as u32).to_be_bytes());
-    out.extend((file_size as u32).to_be_bytes());
+    out.extend(small(meta.len()).to_be_bytes());
+    out.extend(small(file_size).to_be_bytes());
     out.extend(version.to_be_bytes());
-    out.extend((data_offset as u32).to_be_bytes());
+    out.extend(small(data_offset).to_be_bytes());
     out.extend([big as u8, 0, 0, 0]);
     if version >= 22 {
         out.extend((meta.len() as u32).to_be_bytes());

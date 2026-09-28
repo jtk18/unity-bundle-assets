@@ -2,10 +2,12 @@
 //! the files stored in the decompressed block stream: usually one serialized file (`CAB-...`)
 //! and the `.resS` / `.resource` stream files its textures and audio point into.
 //!
-//! The layout follows UnityPy's `BundleFile` reader (MIT, see NOTICE).
+//! The layout follows `UnityPy`'s `BundleFile` reader (MIT, see NOTICE).
 
 use crate::reader::Reader;
-use crate::{version_numbers, Error, Limits, Result};
+use crate::{Error, LimitKind, Limits, Result, Version};
+
+use std::collections::HashMap;
 
 const SIGNATURE: &[u8] = b"UnityFS\0";
 
@@ -24,7 +26,7 @@ mod flags {
 const LZ4_MAX_RATIO: usize = 255;
 
 /// One file inside a bundle.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
     path: String,
     flags: u32,
@@ -34,22 +36,26 @@ pub struct Entry {
 
 impl Entry {
     /// The file's name in the bundle's directory, e.g. `CAB-<hash>` or `CAB-<hash>.resS`.
+    #[must_use]
     pub fn path(&self) -> &str {
         &self.path
     }
 
     /// Directory flags; bit 2 marks a serialized file.
-    pub fn flags(&self) -> u32 {
+    #[must_use]
+    pub const fn flags(&self) -> u32 {
         self.flags
     }
 
     /// Size in bytes.
-    pub fn size(&self) -> usize {
+    #[must_use]
+    pub const fn size(&self) -> usize {
         self.size
     }
 
     /// Whether this entry is a serialized file rather than a stream file.
-    pub fn is_serialized(&self) -> bool {
+    #[must_use]
+    pub const fn is_serialized(&self) -> bool {
         self.flags & flags::NODE_SERIALIZED != 0
     }
 }
@@ -60,6 +66,8 @@ pub struct Bundle {
     unity_version: String,
     unity_revision: String,
     entries: Vec<Entry>,
+    /// Entry index by path, and by `/` + the file name after the last `/`; first one wins.
+    by_path: HashMap<String, usize>,
     data: Vec<u8>,
     limits: Limits,
 }
@@ -68,32 +76,55 @@ impl std::fmt::Debug for Bundle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Bundle")
             .field("format", &self.format)
+            .field("unity_version", &self.unity_version)
             .field("unity_revision", &self.unity_revision)
-            .field("entries", &self.entries)
+            .field("entries", &self.entries.len())
             .field("bytes", &self.data.len())
             .finish()
     }
 }
 
 /// Whether `data` starts like an asset bundle.
+#[must_use]
 pub fn is_bundle(data: &[u8]) -> bool {
     data.starts_with(SIGNATURE)
 }
 
 impl Bundle {
     /// Read and parse the bundle at `path`, with the default [`Limits`].
-    pub fn open(path: impl AsRef<std::path::Path>) -> Result<Bundle> {
-        let limits = Limits::default();
-        Bundle::parse_with(&crate::export::read_file(path.as_ref(), &limits)?, limits)
+    ///
+    /// # Errors
+    ///
+    /// When the file cannot be read, is over a limit, or is not a bundle this crate reads.
+    pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self> {
+        Self::open_with(path, Limits::default())
+    }
+
+    /// [`Bundle::open`] under `limits`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Bundle::open`].
+    pub fn open_with(path: impl AsRef<std::path::Path>, limits: Limits) -> Result<Self> {
+        let data = crate::file::read_limited(path.as_ref(), limits.max_file_size)?;
+        Self::parse_with(&data, limits)
     }
 
     /// Parse a bundle from its bytes, decompressing every block, with the default [`Limits`].
-    pub fn parse(file: &[u8]) -> Result<Bundle> {
-        Bundle::parse_with(file, Limits::default())
+    ///
+    /// # Errors
+    ///
+    /// When the data is not a bundle this crate reads, or is over a limit.
+    pub fn parse(file: &[u8]) -> Result<Self> {
+        Self::parse_with(file, Limits::default())
     }
 
     /// Parse a bundle from its bytes under `limits`.
-    pub fn parse_with(file: &[u8], limits: Limits) -> Result<Bundle> {
+    ///
+    /// # Errors
+    ///
+    /// As [`Bundle::parse`].
+    pub fn parse_with(file: &[u8], limits: Limits) -> Result<Self> {
         if !is_bundle(file) {
             for other in ["UnityWeb", "UnityRaw", "UnityArchive"] {
                 if file.starts_with(other.as_bytes()) {
@@ -107,18 +138,26 @@ impl Bundle {
         let format = r.u32()?;
         let unity_version = r.cstr()?;
         let unity_revision = r.cstr()?;
-        let _size = r.i64()?;
+        let declared_size = r.i64()?;
         let info_compressed = r.u32()? as usize;
         let info_size = r.u32()? as usize;
         let flags = r.u32()?;
 
-        let revision = version_numbers(&unity_revision);
-        if revision == [0, 0, 0] && flags & flags::BLOCK_INFO_NEEDS_PADDING != 0 {
-            return Err(Error::Unsupported(format!(
-                "bundle flag 0x200 with engine version {unity_revision:?}: it means padding \
-                 after 2020.3.34 and encryption before, and the version is stripped"
-            )));
+        let revision = Version::parse(&unity_revision);
+        if revision.stripped() {
+            // Without the engine version the two flag sets cannot be told apart. Bits only
+            // the newer set defines are encryption either way; 0x200 is ambiguous.
+            if flags & (flags::ENCRYPTION_NEW & !flags::ENCRYPTION_OLD) != 0 {
+                return Err(Error::Encrypted);
+            }
+            if flags & flags::BLOCK_INFO_NEEDS_PADDING != 0 {
+                return Err(Error::Unsupported(format!(
+                    "bundle flag 0x200 with engine version {unity_revision:?}: it means padding \
+                     after 2020.3.34 and encryption before, and the version is stripped"
+                )));
+            }
         }
+        let revision = revision.numbers;
         // Engines before these used 0x200 for encryption; from them on it means padding.
         let new_flags = !(revision < [2020, 0, 0]
             || (revision[0] == 2020 && revision < [2020, 3, 34])
@@ -137,13 +176,17 @@ impl Bundle {
         }
 
         let budget = limits.max_decompressed;
-        check_limit("bundle directory size", info_size as u64, budget)?;
+        Error::limit(LimitKind::Decompressed, info_size as u64, budget)?;
         let info_bytes = if flags & flags::BLOCKS_INFO_AT_END != 0 {
-            let start = file
-                .len()
+            // The directory ends where the bundle does, which may be before the file does.
+            let end = usize::try_from(declared_size)
+                .ok()
+                .filter(|&n| n > 0 && n <= file.len())
+                .unwrap_or(file.len());
+            let start = end
                 .checked_sub(info_compressed)
-                .ok_or(Error::Truncated(file.len()))?;
-            &file[start..]
+                .ok_or(Error::Truncated(end))?;
+            &file[start..end]
         } else {
             r.take(info_compressed)?
         };
@@ -157,31 +200,42 @@ impl Bundle {
         let mut ir = Reader::new(&info, true);
         ir.skip(16)?; // hash of the uncompressed data
         let block_count = ir.len(10)?;
+        // The parsed directory costs more than its bytes; charge it at its in-memory size.
+        let mut charged = info_size as u64
+            + block_count as u64 * std::mem::size_of::<(usize, usize, u32)>() as u64;
+        Error::limit(LimitKind::Decompressed, charged, budget)?;
         let mut blocks = Vec::with_capacity(block_count);
         let mut total: u64 = 0;
         for _ in 0..block_count {
             let size = ir.u32()?;
             let compressed = ir.u32()?;
             let block_flags = ir.u16()?;
-            total += size as u64;
-            blocks.push((size as usize, compressed as usize, block_flags as u32));
+            total += u64::from(size);
+            blocks.push((size as usize, compressed as usize, u32::from(block_flags)));
         }
-        check_limit("bundle decompressed size", total + info_size as u64, budget)?;
+        charged += total;
+        Error::limit(LimitKind::Decompressed, charged, budget)?;
         let entry_count = ir.len(21)?;
+        charged += entry_count as u64 * (std::mem::size_of::<Entry>() + 16) as u64;
+        Error::limit(LimitKind::Decompressed, charged, budget)?;
         let mut entries = Vec::with_capacity(entry_count);
         for _ in 0..entry_count {
             let offset = ir.i64()?;
             let size = ir.i64()?;
             let flags = ir.u32()?;
             let path = ir.cstr()?;
+            charged += path.len() as u64;
+            Error::limit(LimitKind::Decompressed, charged, budget)?;
             let (Ok(offset), Ok(size)) = (usize::try_from(offset), usize::try_from(size)) else {
-                return Err(Error::Invalid(format!("entry {path} at {offset}+{size}")));
+                return Err(Error::Invalid(format!("entry {path:?} at {offset}+{size}")));
             };
             if offset
                 .checked_add(size)
                 .is_none_or(|end| end as u64 > total)
             {
-                return Err(Error::Invalid(format!("entry {path} runs past the bundle")));
+                return Err(Error::Invalid(format!(
+                    "entry {path:?} runs past the bundle"
+                )));
             }
             entries.push(Entry {
                 path,
@@ -205,43 +259,58 @@ impl Bundle {
             )?;
         }
 
-        Ok(Bundle {
+        let mut by_path = HashMap::with_capacity(entries.len() * 2);
+        for (i, e) in entries.iter().enumerate() {
+            by_path.entry(e.path.clone()).or_insert(i);
+        }
+        for (i, e) in entries.iter().enumerate() {
+            let name = e.path.rsplit('/').next().unwrap_or(&e.path);
+            by_path.entry(format!("/{name}")).or_insert(i);
+        }
+        Ok(Self {
             format,
             unity_version,
             unity_revision,
             entries,
+            by_path,
             data,
             limits,
         })
     }
 
     /// Container format version (6 for Unity 5.x-2019.3, 7 from 2019.4, 8 from 2022).
-    pub fn format(&self) -> u32 {
+    #[must_use]
+    pub const fn format(&self) -> u32 {
         self.format
     }
 
     /// The player version string, e.g. `5.x.x`.
+    #[must_use]
     pub fn unity_version(&self) -> &str {
         &self.unity_version
     }
 
     /// The engine release that built the bundle, e.g. `2018.4.36f1`.
+    #[must_use]
     pub fn unity_revision(&self) -> &str {
         &self.unity_revision
     }
 
     /// Every file in the bundle, in directory order.
+    #[must_use]
     pub fn entries(&self) -> &[Entry] {
         &self.entries
     }
 
     /// The limits the bundle was parsed under.
-    pub fn limits(&self) -> Limits {
+    #[must_use]
+    pub const fn limits(&self) -> Limits {
         self.limits
     }
 
     /// One entry's bytes, or `None` for an entry from another bundle that does not fit this
     /// one.
+    #[must_use]
     pub fn bytes(&self, entry: &Entry) -> Option<&[u8]> {
         self.data
             .get(entry.offset..entry.offset.checked_add(entry.size)?)
@@ -249,12 +318,13 @@ impl Bundle {
 
     /// The entry with this path, or else the first with this file name (stream paths look
     /// like `archive:/CAB-.../CAB-....resS`; the directory lists `CAB-....resS`).
+    #[must_use]
     pub fn entry(&self, path: &str) -> Option<&Entry> {
         let name = path.rsplit('/').next().unwrap_or(path);
-        self.entries
-            .iter()
-            .find(|e| e.path == path)
-            .or_else(|| self.entries.iter().find(|e| e.path == name))
+        self.by_path
+            .get(path)
+            .or_else(|| self.by_path.get(&format!("/{name}")))
+            .map(|&i| &self.entries[i])
     }
 
     pub(crate) fn data_ref(&self) -> &[u8] {
@@ -262,7 +332,7 @@ impl Bundle {
     }
 
     /// The byte range of an entry that [`Bundle::bytes`] has already accepted.
-    pub(crate) fn range_of(&self, entry: &Entry) -> std::ops::Range<usize> {
+    pub(crate) const fn range_of(entry: &Entry) -> std::ops::Range<usize> {
         entry.offset..entry.offset + entry.size
     }
 
@@ -270,13 +340,6 @@ impl Bundle {
     pub fn serialized_files(&self) -> impl Iterator<Item = &Entry> {
         self.entries.iter().filter(|e| e.is_serialized())
     }
-}
-
-fn check_limit(what: &'static str, value: u64, limit: u64) -> Result<()> {
-    if value > limit {
-        return Err(Error::LimitExceeded { what, value, limit });
-    }
-    Ok(())
 }
 
 /// Append one block, decompressed, to `out`. The block must produce exactly `size` bytes.
@@ -379,18 +442,15 @@ fn lz4_into(out: &mut Vec<u8>, data: &[u8], size: usize) -> Result<()> {
         if out.len() + matched > end {
             return Err(bad("output larger than the header says"));
         }
+        // The match may overlap the bytes it is producing. Its output repeats with period
+        // `offset` from `start`, so each pass can copy everything written since `start`,
+        // doubling the span: a one-byte run takes log2(length) copies, not length.
         let start = out.len() - offset;
-        if offset >= matched {
-            out.extend_from_within(start..start + matched);
-        } else {
-            // The match overlaps the bytes it is producing: copy one period at a time.
-            let mut left = matched;
-            while left > 0 {
-                let n = left.min(offset);
-                let from = out.len() - offset;
-                out.extend_from_within(from..from + n);
-                left -= n;
-            }
+        let mut left = matched;
+        while left > 0 {
+            let n = left.min(out.len() - start);
+            out.extend_from_within(start..start + n);
+            left -= n;
         }
     }
     if out.len() != end {
@@ -455,7 +515,8 @@ mod tests {
 
     #[test]
     fn test_lz4_refuses_impossible_ratio() {
-        assert!(lz4(&[0x00], 1 << 20).is_err());
+        let err = lz4(&[0x00], 1 << 20).unwrap_err().to_string();
+        assert!(err.contains("more output than LZ4 can encode"), "{err}");
     }
 
     #[test]

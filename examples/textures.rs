@@ -16,22 +16,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for texture in
         assets.textures(|n| prefixes.is_empty() || prefixes.iter().any(|p| n.starts_with(p)))
     {
-        match assets.decode_texture(texture.path_id) {
-            Ok(img) => {
-                let name = format!(
-                    "{}_{}.png",
-                    common::file_name(&texture.name),
-                    texture.path_id
-                );
-                common::save_png(&out.join(name), &img)?;
-                ok += 1;
-            }
+        let name = texture.name.as_deref().unwrap_or("");
+        let saved = assets
+            .decode_texture(texture.path_id)
+            .map_err(|e| e.to_string())
+            .and_then(|img| {
+                let file = format!("{}_{}.png", common::file_name(name), texture.path_id);
+                common::save_png(&out.join(file), &img).map_err(|e| e.to_string())
+            });
+        match saved {
+            Ok(()) => ok += 1,
             Err(e) => {
                 failed += 1;
                 eprintln!(
-                    "{} ({}): {e}",
-                    common::printable(&texture.name),
-                    texture.path_id
+                    "{} ({}): {}",
+                    common::printable(name),
+                    texture.path_id,
+                    common::printable(&e)
                 );
             }
         }

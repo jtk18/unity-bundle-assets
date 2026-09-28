@@ -5,7 +5,7 @@
 
 use crate::reader::Reader;
 use crate::serialized::{ObjectInfo, SerializedFile};
-use crate::{check_release, Error, Limits, Result};
+use crate::{check_release, Error, LimitKind, Result};
 
 use std::collections::HashMap;
 
@@ -22,15 +22,16 @@ pub struct PPtr {
 }
 
 impl PPtr {
-    fn read(r: &mut Reader) -> Result<PPtr> {
-        Ok(PPtr {
+    fn read(r: &mut Reader) -> Result<Self> {
+        Ok(Self {
             file_id: r.i32()?,
             path_id: r.i64()?,
         })
     }
 
     /// Whether this refers to no object.
-    pub fn is_null(&self) -> bool {
+    #[must_use]
+    pub const fn is_null(&self) -> bool {
         self.path_id == 0
     }
 }
@@ -45,8 +46,8 @@ pub struct RenderDataKey {
 }
 
 impl RenderDataKey {
-    fn read(r: &mut Reader) -> Result<RenderDataKey> {
-        Ok(RenderDataKey {
+    fn read(r: &mut Reader) -> Result<Self> {
+        Ok(Self {
             guid: r.take(16)?.try_into().unwrap(),
             id: r.i64()?,
         })
@@ -67,8 +68,8 @@ pub struct Rect {
 }
 
 impl Rect {
-    fn read(r: &mut Reader) -> Result<Rect> {
-        Ok(Rect {
+    fn read(r: &mut Reader) -> Result<Self> {
+        Ok(Self {
             x: r.f32()?,
             y: r.f32()?,
             width: r.f32()?,
@@ -84,8 +85,8 @@ pub struct Settings(pub u32);
 /// How a packed sprite was turned to fit its texture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Rotation {
-    /// Stored as drawn.
-    None,
+    /// Stored as drawn (Unity's `None`).
+    Unrotated,
     /// Mirrored left to right.
     FlipHorizontal,
     /// Mirrored top to bottom.
@@ -98,24 +99,27 @@ pub enum Rotation {
 
 impl Settings {
     /// Whether the sprite was packed, so rotation applies.
-    pub fn packed(self) -> bool {
+    #[must_use]
+    pub const fn packed(self) -> bool {
         self.0 & 1 != 0
     }
 
     /// Tight packing: the sprite's rectangle may hold pixels of its neighbours, and only its
     /// mesh says which pixels are its own.
-    pub fn tight(self) -> bool {
+    #[must_use]
+    pub const fn tight(self) -> bool {
         (self.0 >> 1) & 1 == 0
     }
 
-    /// The packing rotation. Values Unity does not define read as [`Rotation::None`].
-    pub fn rotation(self) -> Rotation {
+    /// The packing rotation. Values Unity does not define read as [`Rotation::Unrotated`].
+    #[must_use]
+    pub const fn rotation(self) -> Rotation {
         match (self.0 >> 2) & 0xf {
             1 => Rotation::FlipHorizontal,
             2 => Rotation::FlipVertical,
             3 => Rotation::Rotate180,
             4 => Rotation::Rotate90,
-            _ => Rotation::None,
+            _ => Rotation::Unrotated,
         }
     }
 }
@@ -159,34 +163,51 @@ pub struct Sprite {
     /// The sprite's own render data. For an atlased sprite, the texture here is null and
     /// the atlas's entry is the one to use.
     pub own: Placement,
-    /// Triangles of the sprite's mesh in sprite-local units, three points each.
-    pub triangles: Vec<[[f32; 2]; 3]>,
-    /// The mesh is in a vertex layout this crate does not read, so `triangles` is empty and a
-    /// tight-packed sprite cannot be masked.
-    pub mesh_unreadable: bool,
+    /// Triangles of the sprite's mesh in sprite-local units, three points each; `None` when
+    /// the mesh uses a vertex layout this crate does not read or refers to vertices it does
+    /// not hold, so a tight-packed sprite cannot be masked.
+    pub triangles: Option<Vec<[[f32; 2]; 3]>>,
 }
 
 impl Sprite {
-    /// Read a `Sprite` object, Unity 2019.1 through 6000.5.
-    pub fn read(file: &SerializedFile, object: &ObjectInfo) -> Result<Sprite> {
-        let v = file.unity_version_numbers();
-        check_release(file.unity_version(), v, "Sprite", OLDEST)?;
-        let mut r = file.reader(object)?;
-        read_sprite(
-            &mut r,
-            v,
-            file.big_endian(),
-            &file.limits(),
-            object.path_id(),
-        )
-        .map_err(|e| layout_error(e, "Sprite", object, file))
+    /// Read a `Sprite` object, Unity 2019.1 through 6000.4 (final and beta builds).
+    ///
+    /// # Errors
+    ///
+    /// For an engine release outside that range, an object that does not fit the layout, or a
+    /// mesh over [`crate::Limits::max_sprite_triangles`].
+    pub fn read(file: &SerializedFile, object: &ObjectInfo) -> Result<Self> {
+        Self::read_within(file, object, u64::MAX)
     }
+
+    /// [`Sprite::read`], refusing a mesh of more than `remaining` triangles before building
+    /// any of it; `remaining` is what is left of a list's total.
+    pub(crate) fn read_within(
+        file: &SerializedFile,
+        object: &ObjectInfo,
+        remaining: u64,
+    ) -> Result<Self> {
+        check_release(file.unity_version(), "Sprite", OLDEST)?;
+        let v = file.unity_version_numbers();
+        let limit = file.limits().max_sprite_triangles;
+        let budget = Budget { limit, remaining };
+        let mut r = file.reader(object)?;
+        read_sprite(&mut r, v, file.big_endian(), budget, object.path_id())
+            .map_err(|e| layout_error(e, "Sprite", object, file))
+    }
+}
+
+/// How many triangles a mesh may have: its own limit, and what is left of a list's.
+#[derive(Clone, Copy)]
+struct Budget {
+    limit: u64,
+    remaining: u64,
 }
 
 fn layout_error(e: Error, what: &str, object: &ObjectInfo, file: &SerializedFile) -> Error {
     match e {
         Error::Truncated(_) | Error::BadLength { .. } => Error::Invalid(format!(
-            "{what} {} from Unity {} does not fit the layout this crate knows ({e})",
+            "{what} {} from Unity {:?} does not fit the layout this crate knows ({e})",
             object.path_id(),
             file.unity_version()
         )),
@@ -198,7 +219,7 @@ fn read_sprite(
     r: &mut Reader,
     v: [u32; 3],
     big_endian: bool,
-    limits: &Limits,
+    budget: Budget,
     path_id: i64,
 ) -> Result<Sprite> {
     let name = r.aligned_string()?;
@@ -225,7 +246,7 @@ fn read_sprite(
         PPtr::read(r)?; // secondaryTextures
         r.aligned_string()?;
     }
-    let triangles = read_mesh(r, big_endian, limits)?;
+    let triangles = read_mesh(r, big_endian, budget)?;
     let bindposes = r.len(64)?;
     r.skip(bindposes * 64)?;
     let texture_rect = Rect::read(r)?;
@@ -251,13 +272,12 @@ fn read_sprite(
             settings,
             downscale,
         },
-        mesh_unreadable: triangles.is_none(),
-        triangles: triangles.unwrap_or_default(),
+        triangles,
     })
 }
 
 /// Bytes per component of each `VertexFormat` (Unity 2019 and on).
-fn component_size(format: u8) -> Option<usize> {
+const fn component_size(format: u8) -> Option<usize> {
     Some(match format {
         0 | 10 | 11 => 4,       // Float, UInt32, SInt32
         1 | 4 | 5 | 8 | 9 => 2, // Float16, UNorm16, SNorm16, UInt16, SInt16
@@ -267,12 +287,13 @@ fn component_size(format: u8) -> Option<usize> {
 }
 
 /// Reads the sprite mesh (sub-meshes, index buffer, vertex data) and returns its triangles,
-/// or `None` when its vertex layout is one this crate does not read. Positions are channel 0,
-/// float32; streams are laid out one after another, each padded to 16 bytes, as UnityPy does.
+/// or `None` when its vertex layout is one this crate does not read or an index points past
+/// its vertices. Positions are channel 0,
+/// float32; streams are laid out one after another, each padded to 16 bytes, as `UnityPy` does.
 fn read_mesh(
     r: &mut Reader,
     big_endian: bool,
-    limits: &Limits,
+    budget: Budget,
 ) -> Result<Option<Vec<[[f32; 2]; 3]>>> {
     struct SubMesh {
         first_byte: u32,
@@ -308,9 +329,11 @@ fn read_mesh(
 
     // Every index range must lie inside the index buffer, and the triangles they make are
     // capped before any is built.
-    let mut total = 0usize;
+    let mut total = 0u64;
     for sm in submeshes.iter().filter(|sm| sm.topology == 0) {
-        let end = (sm.first_byte as usize).checked_add(sm.index_count as usize * 2);
+        let end = (sm.index_count as usize)
+            .checked_mul(2)
+            .and_then(|n| n.checked_add(sm.first_byte as usize));
         if end.is_none_or(|end| end > indices.len()) {
             return Err(Error::Invalid(format!(
                 "sprite sub-mesh indices {}+{} run past the {}-byte index buffer",
@@ -319,17 +342,12 @@ fn read_mesh(
                 indices.len()
             )));
         }
-        total = total.saturating_add(sm.index_count as usize / 3);
+        total = total.saturating_add(u64::from(sm.index_count) / 3);
     }
-    if total > limits.max_sprite_triangles {
-        return Err(Error::LimitExceeded {
-            what: "sprite mesh triangles",
-            value: total as u64,
-            limit: limits.max_sprite_triangles as u64,
-        });
-    }
+    Error::limit(LimitKind::SpriteTriangles, total, budget.limit)?;
+    Error::limit(LimitKind::TotalTriangles, total, budget.remaining)?;
 
-    let Some(&(pos_stream, pos_offset, 0, dims @ 2..=4)) = channels.first() else {
+    let Some(&(pos_stream, pos_offset, 0, 2..=4)) = channels.first() else {
         return Ok(if total == 0 { Some(Vec::new()) } else { None });
     };
     // Stream layout: each stream's stride is the sum of its channels; streams follow one
@@ -355,9 +373,6 @@ fn read_mesh(
                 .unwrap_or(usize::MAX);
         }
     }
-    if stride < dims as usize * 4 {
-        return Ok(None);
-    }
     let f32_at = |b: &[u8]| {
         let b: [u8; 4] = b.try_into().unwrap();
         if big_endian {
@@ -374,27 +389,26 @@ fn read_mesh(
         let b = vertex_data.get(at..at.checked_add(8)?)?;
         Some([f32_at(&b[0..4]), f32_at(&b[4..8])])
     };
-    let mut triangles = Vec::with_capacity(total);
+    let mut triangles = Vec::with_capacity(usize::try_from(total).unwrap_or(0));
     for sm in submeshes.iter().filter(|sm| sm.topology == 0) {
         let start = sm.first_byte as usize;
-        let idx: Vec<usize> = indices[start..start + sm.index_count as usize * 2]
-            .chunks_exact(2)
-            .map(|c| {
+        let indices = &indices[start..start + sm.index_count as usize * 2];
+        for t in indices.chunks_exact(6) {
+            let mut corners = [[0f32; 2]; 3];
+            for (corner, c) in corners.iter_mut().zip(t.chunks_exact(2)) {
                 let i = if big_endian {
                     u16::from_be_bytes([c[0], c[1]])
                 } else {
                     u16::from_le_bytes([c[0], c[1]])
                 };
-                (i as usize).saturating_add(sm.base_vertex as usize)
-            })
-            .collect();
-        for t in idx.chunks_exact(3) {
-            if t.iter().any(|&i| i >= vertex_count) {
-                continue;
+                let i = usize::from(i) + sm.base_vertex as usize;
+                // A triangle that points past the vertices makes the whole mesh untrustworthy.
+                match (i < vertex_count).then(|| vertex(i)).flatten() {
+                    Some(p) => *corner = p,
+                    None => return Ok(None),
+                }
             }
-            if let (Some(a), Some(b), Some(c)) = (vertex(t[0]), vertex(t[1]), vertex(t[2])) {
-                triangles.push([a, b, c]);
-            }
+            triangles.push(corners);
         }
     }
     Ok(Some(triangles))
@@ -406,21 +420,31 @@ fn read_mesh(
 pub struct SpriteAtlas {
     /// `m_Name`.
     pub name: String,
-    /// Placement by sprite render-data key, in file order.
-    pub entries: Vec<(RenderDataKey, Placement)>,
+    entries: Vec<(RenderDataKey, Placement)>,
     index: HashMap<RenderDataKey, usize>,
 }
 
 impl SpriteAtlas {
-    /// Read a `SpriteAtlas` object, Unity 2019.1 through 6000.5.
-    pub fn read(file: &SerializedFile, object: &ObjectInfo) -> Result<SpriteAtlas> {
+    /// Read a `SpriteAtlas` object, Unity 2019.1 through 6000.4 (final and beta builds).
+    ///
+    /// # Errors
+    ///
+    /// For an engine release outside that range, or an object that does not fit the layout.
+    pub fn read(file: &SerializedFile, object: &ObjectInfo) -> Result<Self> {
+        check_release(file.unity_version(), "SpriteAtlas", OLDEST)?;
         let v = file.unity_version_numbers();
-        check_release(file.unity_version(), v, "SpriteAtlas", OLDEST)?;
         let mut r = file.reader(object)?;
         read_atlas(&mut r, v).map_err(|e| layout_error(e, "SpriteAtlas", object, file))
     }
 
+    /// Placement by sprite render-data key, in file order.
+    #[must_use]
+    pub fn entries(&self) -> &[(RenderDataKey, Placement)] {
+        &self.entries
+    }
+
     /// The placement filed under a sprite's render-data key (the first, if repeated).
+    #[must_use]
     pub fn placement(&self, key: &RenderDataKey) -> Option<Placement> {
         self.index.get(key).map(|&i| self.entries[i].1)
     }

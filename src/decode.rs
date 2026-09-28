@@ -1,10 +1,12 @@
-//! Pixel formats to RGBA8. Rows come out in the order Unity stores them: bottom row first.
+//! Pixel formats to RGBA8. Unity stores rows bottom first; decoding turns them the right way
+//! up, so output rows are top first, like every image this crate returns.
 
-use crate::{Error, Result};
+use crate::{Error, LimitKind, Result};
 
 /// The `TextureFormat` values this crate decodes.
 pub mod format {
-    /// Alpha only, one byte. Decodes to white with that alpha.
+    /// Alpha only, one byte. Decodes to white with that alpha, as `AssetStudio` does (`UnityPy`
+    /// gives black).
     pub const ALPHA8: i32 = 1;
     /// Red, green, blue, one byte each.
     pub const RGB24: i32 = 3;
@@ -22,6 +24,7 @@ pub mod format {
 
 /// Bytes in the first mip level, or `None` for a format this crate does not decode or a size
 /// that does not fit in memory.
+#[must_use]
 pub fn mip0_size(format: i32, width: u32, height: u32) -> Option<usize> {
     let (w, h) = (width as usize, height as usize);
     let blocks = w.div_ceil(4).checked_mul(h.div_ceil(4))?;
@@ -36,76 +39,87 @@ pub fn mip0_size(format: i32, width: u32, height: u32) -> Option<usize> {
     }
 }
 
-/// Decode the first mip level to RGBA8, rows in the order stored (bottom first, for Unity).
+/// Whether this crate decodes `format`.
+#[must_use]
+pub fn is_supported(format: i32) -> bool {
+    mip0_size(format, 4, 4).is_some()
+}
+
+/// Decode the first mip level, stored bottom row first as Unity does, to RGBA8 top row first.
+///
 /// Extra bytes (further mip levels) are ignored. Sizes are not limited here beyond what fits
 /// in memory; [`crate::Assets::decode_texture`] applies [`crate::Limits`].
+///
+/// # Errors
+///
+/// For a format this crate does not decode, a size that cannot fit in memory, or data shorter
+/// than the first mip level.
 pub fn decode(format: i32, width: u32, height: u32, data: &[u8]) -> Result<Vec<u8>> {
-    let known = matches!(
-        format,
-        format::ALPHA8
-            | format::RGB24
-            | format::RGBA32
-            | format::ARGB32
-            | format::BGRA32
-            | format::DXT1
-            | format::DXT5
-    );
-    if !known {
+    if !is_supported(format) {
         return Err(Error::UnsupportedTextureFormat {
-            texture: String::new(),
+            texture: None,
             format,
         });
     }
-    let out_len = (width as usize)
-        .checked_mul(height as usize)
+    let (w, h) = (width as usize, height as usize);
+    let out_len = w
+        .checked_mul(h)
         .and_then(|p| p.checked_mul(4))
-        .filter(|&n| n <= isize::MAX as usize);
-    let (Some(size), Some(_)) = (mip0_size(format, width, height), out_len) else {
+        .filter(|&n| isize::try_from(n).is_ok());
+    let (Some(size), Some(out_len)) = (mip0_size(format, width, height), out_len) else {
         return Err(Error::LimitExceeded {
-            what: "decoded texture size",
-            value: (width as u64 * height as u64).saturating_mul(4),
-            limit: isize::MAX as u64,
+            kind: LimitKind::TexturePixels,
+            value: u64::from(width) * u64::from(height),
+            limit: isize::MAX as u64 / 4,
         });
     };
     let data = data
         .get(..size)
         .ok_or_else(|| Error::Invalid(format!("{} bytes of pixels, need {size}", data.len())))?;
-    let (w, h) = (width as usize, height as usize);
-    Ok(match format {
-        format::ALPHA8 => data.iter().flat_map(|&a| [255, 255, 255, a]).collect(),
-        format::RGB24 => data
-            .chunks_exact(3)
-            .flat_map(|p| [p[0], p[1], p[2], 255])
-            .collect(),
-        format::RGBA32 => data.to_vec(),
-        format::ARGB32 => data
-            .chunks_exact(4)
-            .flat_map(|p| [p[1], p[2], p[3], p[0]])
-            .collect(),
-        format::BGRA32 => data
-            .chunks_exact(4)
-            .flat_map(|p| [p[2], p[1], p[0], p[3]])
-            .collect(),
-        format::DXT1 => blocks(data, w, h, 8, |b, out| {
-            color_block(b, out, true);
+    let mut out = vec![0u8; out_len];
+    match format {
+        format::DXT1 => blocks(data, &mut out, w, h, 8, |b, px| color_block(b, px, true)),
+        format::DXT5 => blocks(data, &mut out, w, h, 16, |b, px| {
+            color_block(&b[8..], px, false);
+            alpha_block(&b[..8], px);
         }),
-        format::DXT5 => blocks(data, w, h, 16, |b, out| {
-            color_block(&b[8..], out, false);
-            alpha_block(&b[..8], out);
-        }),
-        _ => unreachable!(),
-    })
+        _ => {
+            let (bpp, convert): (usize, Convert) = match format {
+                format::ALPHA8 => (1, |s, d| d.copy_from_slice(&[255, 255, 255, s[0]])),
+                format::RGB24 => (3, |s, d| d.copy_from_slice(&[s[0], s[1], s[2], 255])),
+                format::RGBA32 => (4, |s, d| d.copy_from_slice(s)),
+                format::ARGB32 => (4, |s, d| d.copy_from_slice(&[s[1], s[2], s[3], s[0]])),
+                _ => (4, |s, d| d.copy_from_slice(&[s[2], s[1], s[0], s[3]])), // BGRA32
+            };
+            // Stored row y becomes output row h - 1 - y.
+            for (y, src) in data.chunks_exact((w * bpp).max(1)).take(h).enumerate() {
+                let row = &mut out[(h - 1 - y) * w * 4..][..w * 4];
+                if format == format::RGBA32 {
+                    row.copy_from_slice(src);
+                } else {
+                    for (s, d) in src.chunks_exact(bpp).zip(row.chunks_exact_mut(4)) {
+                        convert(s, d);
+                    }
+                }
+            }
+        }
+    }
+    Ok(out)
 }
 
-/// Run `decode_block` over every 4x4 block and place its pixels.
+/// Turns one stored pixel into RGBA8.
+type Convert = fn(&[u8], &mut [u8]);
+
+/// Run `decode_block` over every 4x4 block and place its pixels, turning rows the right way
+/// up.
 fn blocks(
     data: &[u8],
+    out: &mut [u8],
     w: usize,
     h: usize,
     block_size: usize,
     decode_block: impl Fn(&[u8], &mut [[u8; 4]; 16]),
-) -> Vec<u8> {
-    let mut out = vec![0u8; w * h * 4];
+) {
     let bw = w.div_ceil(4);
     for (i, block) in data.chunks_exact(block_size).enumerate() {
         let (bx, by) = (i % bw * 4, i / bw * 4);
@@ -114,14 +128,13 @@ fn blocks(
         for (j, p) in px.iter().enumerate() {
             let (x, y) = (bx + j % 4, by + j / 4);
             if x < w && y < h {
-                out[(y * w + x) * 4..][..4].copy_from_slice(p);
+                out[((h - 1 - y) * w + x) * 4..][..4].copy_from_slice(p);
             }
         }
     }
-    out
 }
 
-fn rgb565(c: u16) -> [u8; 3] {
+const fn rgb565(c: u16) -> [u8; 3] {
     let r = (c >> 11) & 0x1f;
     let g = (c >> 5) & 0x3f;
     let b = c & 0x1f;
@@ -138,7 +151,9 @@ fn color_block(b: &[u8], out: &mut [[u8; 4]; 16], dxt1: bool) {
     let c0 = u16::from_le_bytes([b[0], b[1]]);
     let c1 = u16::from_le_bytes([b[2], b[3]]);
     let (p0, p1) = (rgb565(c0), rgb565(c1));
-    let mix = |a: u8, b: u8, wa: u16, wb: u16| ((a as u16 * wa + b as u16 * wb) / (wa + wb)) as u8;
+    let mix = |a: u8, b: u8, wa: u16, wb: u16| {
+        ((u16::from(a) * wa + u16::from(b) * wb) / (wa + wb)) as u8
+    };
     let mut palette = [[0u8; 4]; 4];
     palette[0] = [p0[0], p0[1], p0[2], 255];
     palette[1] = [p1[0], p1[1], p1[2], 255];
@@ -172,24 +187,24 @@ fn color_block(b: &[u8], out: &mut [[u8; 4]; 16], dxt1: bool) {
 
 /// BC3 alpha block: two endpoints and sixteen 3-bit indices.
 fn alpha_block(b: &[u8], out: &mut [[u8; 4]; 16]) {
-    let (a0, a1) = (b[0] as u16, b[1] as u16);
+    let (a0, a1) = (u16::from(b[0]), u16::from(b[1]));
     let mut palette = [0u8; 8];
-    palette[0] = a0 as u8;
-    palette[1] = a1 as u8;
+    palette[0] = b[0];
+    palette[1] = b[1];
     if a0 > a1 {
-        for i in 1..7 {
-            palette[i + 1] = (((7 - i as u16) * a0 + i as u16 * a1) / 7) as u8;
+        for i in 1..7u16 {
+            palette[i as usize + 1] = (((7 - i) * a0 + i * a1) / 7) as u8;
         }
     } else {
-        for i in 1..5 {
-            palette[i + 1] = (((5 - i as u16) * a0 + i as u16 * a1) / 5) as u8;
+        for i in 1..5u16 {
+            palette[i as usize + 1] = (((5 - i) * a0 + i * a1) / 5) as u8;
         }
         palette[6] = 0;
         palette[7] = 255;
     }
     let mut bits = 0u64;
     for (i, &byte) in b[2..8].iter().enumerate() {
-        bits |= (byte as u64) << (8 * i);
+        bits |= u64::from(byte) << (8 * i);
     }
     for (i, px) in out.iter_mut().enumerate() {
         px[3] = palette[(bits >> (i * 3)) as usize & 7];
@@ -200,6 +215,11 @@ fn alpha_block(b: &[u8], out: &mut [[u8; 4]; 16]) {
 mod tests {
     use super::*;
 
+    /// The output pixel for stored pixel (x, y), y counted from the bottom as stored.
+    fn at(out: &[u8], w: usize, h: usize, x: usize, y: usize) -> [u8; 4] {
+        out[((h - 1 - y) * w + x) * 4..][..4].try_into().unwrap()
+    }
+
     #[test]
     fn test_dxt1_block_endpoints_and_transparency() {
         // c0 = pure red, c1 = pure blue, c0 > c1: four opaque colours.
@@ -208,28 +228,61 @@ mod tests {
         // Indices: pixel 0 -> c0, pixel 1 -> c1, pixel 2 -> 2/3 c0 + 1/3 c1, rest 0.
         let block = [red[0], red[1], blue[0], blue[1], 0b10_01_00, 0, 0, 0];
         let out = decode(format::DXT1, 4, 4, &block).unwrap();
-        assert_eq!(&out[0..4], &[255, 0, 0, 255]);
-        assert_eq!(&out[4..8], &[0, 0, 255, 255]);
-        assert_eq!(&out[8..12], &[170, 0, 85, 255]);
+        assert_eq!(at(&out, 4, 4, 0, 0), [255, 0, 0, 255]);
+        assert_eq!(at(&out, 4, 4, 1, 0), [0, 0, 255, 255]);
+        assert_eq!(at(&out, 4, 4, 2, 0), [170, 0, 85, 255]);
 
-        // c0 <= c1 in DXT1: index 3 is transparent black.
-        let block = [blue[0], blue[1], red[0], red[1], 0b11, 0, 0, 0];
+        // c0 < c1 in DXT1: index 3 is transparent black, index 2 the midpoint.
+        let block = [blue[0], blue[1], red[0], red[1], 0b10_11, 0, 0, 0];
         let out = decode(format::DXT1, 4, 4, &block).unwrap();
-        assert_eq!(&out[0..4], &[0, 0, 0, 0]);
+        assert_eq!(at(&out, 4, 4, 0, 0), [0, 0, 0, 0]);
+        assert_eq!(at(&out, 4, 4, 1, 0), [127, 0, 127, 255]);
+        // c0 == c1 is the three-colour mode too.
+        let block = [red[0], red[1], red[0], red[1], 0b11, 0, 0, 0];
+        let out = decode(format::DXT1, 4, 4, &block).unwrap();
+        assert_eq!(at(&out, 4, 4, 0, 0), [0, 0, 0, 0]);
+        // In DXT5 the colour block always has four colours.
+        let mut block5 = [255u8; 16];
+        block5[8..].copy_from_slice(&[red[0], red[1], red[0], red[1], 0b11, 0, 0, 0]);
+        let out = decode(format::DXT5, 4, 4, &block5).unwrap();
+        assert_eq!(&at(&out, 4, 4, 0, 0)[..3], &[255, 0, 0]);
     }
 
     #[test]
-    fn test_dxt5_alpha_palette() {
-        // a0 = 255, a1 = 0 (eight-value ramp); pixel 0 -> a0, pixel 1 -> a1, pixel 2 -> index 2.
+    fn test_dxt5_alpha_palettes() {
+        // a0 = 255 > a1 = 0: eight-value ramp; pixel 0 -> a0, pixel 1 -> a1, pixel 2 -> 2.
         let mut block = [0u8; 16];
         block[0] = 255;
-        block[1] = 0;
         let bits: u64 = 1 << 3 | 2 << 6;
         block[2..8].copy_from_slice(&bits.to_le_bytes()[..6]);
         let out = decode(format::DXT5, 4, 4, &block).unwrap();
-        assert_eq!(out[3], 255);
-        assert_eq!(out[7], 0);
-        assert_eq!(out[11], (6 * 255 / 7) as u8);
+        assert_eq!(at(&out, 4, 4, 0, 0)[3], 255);
+        assert_eq!(at(&out, 4, 4, 1, 0)[3], 0);
+        assert_eq!(at(&out, 4, 4, 2, 0)[3], (6 * 255 / 7) as u8);
+        // a0 = 0 <= a1 = 255: six-value ramp, then index 6 is 0 and index 7 is 255.
+        let mut block = [0u8; 16];
+        block[1] = 255;
+        let bits: u64 = 2 | 6 << 3 | 7 << 6;
+        block[2..8].copy_from_slice(&bits.to_le_bytes()[..6]);
+        let out = decode(format::DXT5, 4, 4, &block).unwrap();
+        assert_eq!(at(&out, 4, 4, 0, 0)[3], 255 / 5);
+        assert_eq!(at(&out, 4, 4, 1, 0)[3], 0);
+        assert_eq!(at(&out, 4, 4, 2, 0)[3], 255);
+    }
+
+    #[test]
+    fn test_byte_formats_and_row_order() {
+        // 1x2 images: stored row 0 (bottom) then row 1 (top); output top first.
+        let rgba = decode(format::RGBA32, 1, 2, &[1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
+        assert_eq!(rgba, [5, 6, 7, 8, 1, 2, 3, 4]);
+        let argb = decode(format::ARGB32, 1, 2, &[1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
+        assert_eq!(argb, [6, 7, 8, 5, 2, 3, 4, 1]);
+        let bgra = decode(format::BGRA32, 1, 2, &[1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
+        assert_eq!(bgra, [7, 6, 5, 8, 3, 2, 1, 4]);
+        let rgb = decode(format::RGB24, 1, 2, &[1, 2, 3, 4, 5, 6]).unwrap();
+        assert_eq!(rgb, [4, 5, 6, 255, 1, 2, 3, 255]);
+        let a8 = decode(format::ALPHA8, 1, 2, &[9, 10]).unwrap();
+        assert_eq!(a8, [255, 255, 255, 10, 255, 255, 255, 9]);
     }
 
     #[test]

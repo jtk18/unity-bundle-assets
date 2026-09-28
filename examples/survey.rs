@@ -1,6 +1,8 @@
 //! Read every sprite and count them by texture format, packing, and atlas use:
 //! `cargo run --example survey -- <file>`.
 
+mod common;
+
 use std::collections::BTreeMap;
 use unity_bundle_assets::Assets;
 
@@ -9,13 +11,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let assets = Assets::open(&path)?;
     let list = assets.sprites(|_| true);
     for s in list.skipped.iter().take(5) {
-        eprintln!("sprite {}: {}", s.path_id, s.error);
+        eprintln!(
+            "sprite {}: {}",
+            s.path_id,
+            common::printable(&s.error.to_string())
+        );
     }
     let mut formats = BTreeMap::new();
     let mut by = BTreeMap::new();
     for sprite in &list.sprites {
         let tex = match assets.placement(sprite) {
-            Err(e) => format!("error: {e}"),
+            Err(e) => format!("error: {}", common::printable(&e.to_string())),
             Ok(p) if p.texture.file_id != 0 => format!("external {}", p.texture.file_id),
             Ok(p) => {
                 let t = formats.entry(p.texture.path_id).or_insert_with(|| {

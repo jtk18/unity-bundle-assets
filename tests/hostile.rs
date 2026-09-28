@@ -1,14 +1,15 @@
-//! Files built to hurt: stream paths that leave the folder, offsets that overflow, bombs, and
-//! callers handing back values from somewhere else. Each must give an error, not a panic, a
-//! hang, or someone else's bytes.
+//! Files built to hurt: stream paths that leave the folder, offsets that overflow, objects that
+//! alias, bombs, and callers handing back values from somewhere else. Each must give an error,
+//! not a panic, a hang, or someone else's bytes.
 
 mod common;
 use common::*;
-use unity_bundle_assets::{decode, Assets, Bundle, Error, Limits, SerializedFile};
+use unity_bundle_assets::{decode, Assets, Bundle, Error, LimitKind, Limits, SerializedFile};
 
 fn streamed_from(
-    dir: &TempDir,
+    dir: &std::path::Path,
     stream_path: &str,
+    format_: i32,
     offset: u64,
     size: u32,
 ) -> Result<Vec<u8>, Error> {
@@ -17,74 +18,151 @@ fn streamed_from(
         offset,
         size,
     };
-    let obj = texture(Layout::U2018_4, false, "t", 4, 4, format::ALPHA8, &px, &[]);
-    let path = dir.file(
-        "t.assets",
-        &serialized(17, "2018.4.36f1", false, 19, &[(7, TEXTURE_2D, obj)]),
-    );
+    let obj = texture(Layout::U2018_4, false, "t", 4, 4, format_, &px, &[]);
+    let path = dir.join("t.assets");
+    std::fs::write(
+        &path,
+        serialized(17, "2018.4.36f1", false, 19, &[(7, TEXTURE_2D, obj)]),
+    )
+    .unwrap();
     Assets::open(&path)?.decode_texture(7).map(|i| i.rgba)
 }
 
+fn alpha8(dir: &TempDir, stream_path: &str) -> Result<Vec<u8>, Error> {
+    streamed_from(&dir.0, stream_path, format::ALPHA8, 0, 16)
+}
+
 #[test]
-fn stream_paths_cannot_leave_the_folder() {
+fn stream_paths_must_be_stream_file_names_beside_the_file() {
     let outer = TempDir::new("outer");
-    outer.file("secret.bin", &[0xaa; 64]);
+    outer.file("secret.resS", &[0xaa; 64]);
     let dir = TempDir::new("inner");
-    let secret = outer.0.join("secret.bin");
+    dir.file(".netrc", &[0xaa; 64]);
+    let absolute = outer.0.join("secret.resS");
     let relative = format!(
-        "../{}/secret.bin",
+        "../{}/secret.resS",
         outer.0.file_name().unwrap().to_str().unwrap()
     );
     for path in [
-        secret.to_str().unwrap(),
+        absolute.to_str().unwrap(),
         relative.as_str(),
-        "sub/secret.bin",
-        "/etc/hosts",
+        "sub/x.resS",
+        ".netrc",
+        "t.assets",
         ".",
-        "..",
     ] {
-        match streamed_from(&dir, path, 0, 16) {
-            Err(Error::Unsupported(msg)) => {
-                assert!(msg.contains("not a file name"), "{path}: {msg}")
-            }
+        match alpha8(&dir, path) {
+            Err(Error::Unsupported(msg)) => assert!(msg.contains("not a .resS"), "{path}: {msg}"),
             other => panic!("{path}: {other:?}"),
         }
     }
-    // Control: the same file beside the asset is read.
+    // Control: a .resS beside the asset is read.
     dir.file("ok.resS", &[0xaa; 16]);
-    assert!(streamed_from(&dir, "ok.resS", 0, 16).is_ok());
+    assert!(alpha8(&dir, "ok.resS").is_ok());
+}
+
+#[cfg(unix)]
+#[test]
+fn stream_files_may_not_be_symbolic_links() {
+    let outer = TempDir::new("outer");
+    outer.file("secret.txt", &[0xaa; 64]);
+    let dir = TempDir::new("links");
+    std::os::unix::fs::symlink(outer.0.join("secret.txt"), dir.0.join("x.resS")).unwrap();
+    match alpha8(&dir, "x.resS") {
+        Err(Error::Unsupported(msg)) => assert!(msg.contains("regular"), "{msg}"),
+        other => panic!("{other:?}"),
+    }
 }
 
 #[test]
 fn streams_must_be_regular_files_holding_the_bytes_claimed() {
     let dir = TempDir::new("irregular");
     std::fs::create_dir(dir.0.join("a_dir.resS")).unwrap();
-    match streamed_from(&dir, "a_dir.resS", 0, 16) {
+    match alpha8(&dir, "a_dir.resS") {
         Err(Error::Unsupported(msg)) => assert!(msg.contains("regular"), "{msg}"),
         other => panic!("{other:?}"),
     }
-    // A socket: opening it would fail differently; it must be refused before that.
-    #[cfg(unix)]
-    {
-        let _sock = std::os::unix::net::UnixListener::bind(dir.0.join("sock.resS")).unwrap();
-        match streamed_from(&dir, "sock.resS", 0, 16) {
-            Err(Error::Unsupported(msg)) => assert!(msg.contains("regular"), "{msg}"),
-            other => panic!("{other:?}"),
-        }
-    }
     dir.file("short.resS", &[1; 8]);
+    assert!(matches!(alpha8(&dir, "short.resS"), Err(Error::Invalid(_))));
     assert!(matches!(
-        streamed_from(&dir, "short.resS", 0, 16),
+        streamed_from(&dir.0, "short.resS", format::ALPHA8, u64::MAX, 16),
         Err(Error::Invalid(_))
     ));
     assert!(matches!(
-        streamed_from(&dir, "short.resS", u64::MAX, 16),
+        streamed_from(&dir.0, "short.resS", format::ALPHA8, 0, u32::MAX),
         Err(Error::Invalid(_))
     ));
-    assert!(matches!(
-        streamed_from(&dir, "short.resS", 0, u32::MAX),
-        Err(Error::Invalid(_))
-    ));
+    // A missing stream file names itself.
+    match alpha8(&dir, "missing.resS") {
+        Err(Error::Io { path: Some(p), .. }) => assert!(p.ends_with("missing.resS")),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn sockets_are_refused_before_opening() {
+    // Under /tmp: a socket path must fit in a few dozen bytes.
+    let dir = std::path::PathBuf::from(format!("/tmp/uba-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let _sock = std::os::unix::net::UnixListener::bind(dir.join("s.resS")).unwrap();
+    let result = streamed_from(&dir, "s.resS", format::ALPHA8, 0, 16);
+    let _ = std::fs::remove_dir_all(&dir);
+    match result {
+        Err(Error::Unsupported(msg)) => assert!(msg.contains("regular"), "{msg}"),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn unsupported_formats_are_refused_before_any_read() {
+    // The stream file does not exist; a BC7 texture must fail on its format, not on I/O.
+    let dir = TempDir::new("fmt");
+    match streamed_from(&dir.0, "missing.resS", 25, 0, 16) {
+        Err(Error::UnsupportedTextureFormat { format: 25, .. }) => {}
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn objects_may_not_overlap_or_share_an_id() {
+    let tex = texture(
+        Layout::U2018_4,
+        false,
+        "t",
+        4,
+        4,
+        format::RGBA32,
+        &Pixels::Inline(&rgba_4x4()),
+        &[],
+    );
+    let file = serialized(
+        17,
+        "2018.4.36f1",
+        false,
+        19,
+        &[(7, TEXTURE_2D, tex.clone()), (8, TEXTURE_2D, tex.clone())],
+    );
+    assert!(SerializedFile::parse(file.clone()).is_ok());
+    // Point the second object at the first one's bytes.
+    let second = file
+        .windows(8)
+        .position(|w| w == 8i64.to_le_bytes())
+        .unwrap()
+        + 8;
+    let mut aliased = file.clone();
+    aliased[second..second + 4].copy_from_slice(&0u32.to_le_bytes());
+    match SerializedFile::parse(aliased) {
+        Err(Error::Invalid(msg)) => assert!(msg.contains("overlap"), "{msg}"),
+        other => panic!("{:?}", other.map(|_| ())),
+    }
+    // Give the second object the first one's ID.
+    let mut twins = file;
+    twins[second - 8..second].copy_from_slice(&7i64.to_le_bytes());
+    match SerializedFile::parse(twins) {
+        Err(Error::Invalid(msg)) => assert!(msg.contains("path ID 7"), "{msg}"),
+        other => panic!("{:?}", other.map(|_| ())),
+    }
 }
 
 #[test]
@@ -100,7 +178,6 @@ fn object_offsets_that_overflow_are_errors() {
         &[],
     );
     let mut file = serialized(22, "2022.3.62f1", false, 19, &[(7, TEXTURE_2D, obj)]);
-    // The object's start is the u64 after its path ID (7); set it near the top.
     let at = file
         .windows(8)
         .position(|w| w == 7i64.to_le_bytes())
@@ -111,7 +188,6 @@ fn object_offsets_that_overflow_are_errors() {
         SerializedFile::parse(file.clone()),
         Err(Error::Invalid(_))
     ));
-    // And the data offset in the header.
     file[32..40].copy_from_slice(&u64::MAX.to_be_bytes());
     assert!(SerializedFile::parse(file).is_err());
 }
@@ -139,12 +215,11 @@ fn decompression_is_held_to_the_limit() {
     opts.blocks = vec![1];
     let bomb = bundle(&opts, &[("data.resS", &big, 0)]);
     assert!(bomb.len() < big.len() / 4);
-    let mut limits = Limits::default();
-    limits.max_decompressed = 32 << 10;
+    let limits = Limits::DEFAULT.with_max_decompressed(32 << 10);
     assert!(matches!(
         Bundle::parse_with(&bomb, limits),
         Err(Error::LimitExceeded {
-            what: "bundle decompressed size",
+            kind: LimitKind::Decompressed,
             ..
         })
     ));
@@ -160,21 +235,21 @@ fn decompression_is_held_to_the_limit() {
 }
 
 #[test]
-fn lz4_blocks_cannot_claim_impossible_sizes() {
-    let mut opts = BundleOpts::new(6, "2018.4.36f1");
-    opts.blocks = vec![2];
-    let mut b = bundle(&opts, &[("data.resS", &[1, 2, 3], 0)]);
-    // Find the block table's uncompressed size (3) followed by the compressed size (4).
-    let at = b
-        .windows(8)
-        .position(|w| w == [0, 0, 0, 3, 0, 0, 0, 4])
-        .unwrap();
-    b[at..at + 4].copy_from_slice(&(512u32 << 20).to_be_bytes());
-    let err = Bundle::parse(&b).unwrap_err();
-    assert!(
-        matches!(err, Error::Invalid(_) | Error::LimitExceeded { .. }),
-        "{err:?}"
-    );
+fn the_directory_is_charged_at_its_parsed_size() {
+    // 2,000 empty entries: 21 bytes each on disk, far more once parsed.
+    let names: Vec<String> = (0..2000).map(|i| format!("e{i}")).collect();
+    let entries: Vec<(&str, &[u8], u32)> = names.iter().map(|n| (n.as_str(), &[][..], 0)).collect();
+    let b = bundle(&BundleOpts::new(6, "2018.4.36f1"), &entries);
+    let on_disk = 2000 * 21;
+    let limits = Limits::DEFAULT.with_max_decompressed(on_disk * 2);
+    assert!(matches!(
+        Bundle::parse_with(&b, limits),
+        Err(Error::LimitExceeded {
+            kind: LimitKind::Decompressed,
+            ..
+        })
+    ));
+    assert!(Bundle::parse(&b).is_ok());
 }
 
 #[test]
@@ -194,27 +269,52 @@ fn files_and_textures_over_the_limits_are_refused() {
         "t.assets",
         &serialized(17, "2018.4.36f1", false, 19, &[(7, TEXTURE_2D, obj)]),
     );
-    let mut limits = Limits::default();
-    limits.max_file_size = 16;
+    let limits = Limits::DEFAULT.with_max_file_size(16);
     assert!(matches!(
         Assets::open_with(&path, limits),
         Err(Error::LimitExceeded {
-            what: "file size",
+            kind: LimitKind::FileSize,
             ..
         })
     ));
-    let mut limits = Limits::default();
-    limits.max_texture_pixels = 15;
+    let limits = Limits::DEFAULT.with_max_texture_pixels(15);
     let a = Assets::open_with(&path, limits).unwrap();
     assert!(matches!(
         a.decode_texture(7),
         Err(Error::LimitExceeded {
-            what: "texture pixels",
+            kind: LimitKind::TexturePixels,
             ..
         })
     ));
-    // A directory is not a file to open.
+    // A directory is not a file to open, and a missing file names itself.
     assert!(Assets::open(&dir.0).is_err());
+    match Assets::open(dir.0.join("nope.assets")) {
+        Err(Error::Io { path: Some(p), .. }) => assert!(p.ends_with("nope.assets")),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn asset_files_the_caller_chose_may_be_symbolic_links() {
+    let dir = TempDir::new("assetlink");
+    let obj = texture(
+        Layout::U2018_4,
+        false,
+        "t",
+        4,
+        4,
+        format::RGBA32,
+        &Pixels::Inline(&rgba_4x4()),
+        &[],
+    );
+    let real = dir.file(
+        "real.assets",
+        &serialized(17, "2018.4.36f1", false, 19, &[(7, TEXTURE_2D, obj)]),
+    );
+    std::os::unix::fs::symlink(&real, dir.0.join("link.assets")).unwrap();
+    assert!(Assets::open(&real).is_ok());
+    assert!(Assets::open(dir.0.join("link.assets")).is_ok());
 }
 
 #[test]

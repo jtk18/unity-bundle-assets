@@ -1,9 +1,7 @@
 //! Export sprites to PNG: `cargo run --example export -- <file> <out-dir> [name-prefix...]`.
-//! A name used by more than one sprite gets its path ID appended after the first.
+//! A name used by more than one sprite (ignoring case) gets its path ID appended.
 
 mod common;
-
-use std::collections::HashSet;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
@@ -15,32 +13,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(&out)?;
     let mut assets = unity_bundle_assets::Assets::open(&path)?;
     let list = assets.sprites(|n| prefixes.is_empty() || prefixes.iter().any(|p| n.starts_with(p)));
-    let mut used = HashSet::new();
+    let mut names = common::Names::default();
     let (mut ok, mut failed) = (0, list.skipped.len());
     for skipped in &list.skipped {
         eprintln!(
             "{} ({}): {}",
             common::printable(skipped.name.as_deref().unwrap_or("?")),
             skipped.path_id,
-            skipped.error
+            common::printable(&skipped.error.to_string())
         );
     }
     for sprite in &list.sprites {
-        match assets.export(sprite) {
-            Ok(img) => {
-                let mut name = common::file_name(&sprite.name);
-                if !used.insert(name.clone()) {
-                    name = format!("{name}_{}", sprite.path_id);
-                }
-                common::save_png(&out.join(format!("{name}.png")), &img)?;
-                ok += 1;
-            }
+        let saved = assets
+            .export(sprite)
+            .map_err(|e| e.to_string())
+            .and_then(|img| {
+                let name = names.claim(&common::file_name(&sprite.name), sprite.path_id);
+                common::save_png(&out.join(format!("{name}.png")), &img).map_err(|e| e.to_string())
+            });
+        match saved {
+            Ok(()) => ok += 1,
             Err(e) => {
                 failed += 1;
                 eprintln!(
-                    "{} ({}): {e}",
+                    "{} ({}): {}",
                     common::printable(&sprite.name),
-                    sprite.path_id
+                    sprite.path_id,
+                    common::printable(&e)
                 );
             }
         }
