@@ -1,7 +1,9 @@
 //! A mutation fuzzer, std only: take well-formed files built by `common`, damage them in ways
-//! that matter to a parser (truncation, flipped bytes, boundary values in 32-bit fields), and
-//! run every public read over each. Any panic, or any input taking more than two seconds,
-//! fails the test; an input still running after twenty is saved and the process stopped.
+//! that matter to a parser (truncation, flipped bytes, boundary values in 32-bit fields,
+//! hostile floats, bytes inserted, removed or copied from elsewhere), and run every public read
+//! over each, one input in four under small limits. Any panic, work counted past the limit, or
+//! input taking more than a quarter second fails the test; an input still running after twenty
+//! seconds is saved and the process stopped.
 //! Failing inputs are saved under `target/tmp/fuzz-failures`.
 //!
 //! `UBA_FUZZ_ITERS` sets the number of mutations per seed (default 1,500) and
@@ -11,11 +13,16 @@
 mod common;
 use common::*;
 use std::io::Write;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
-use unity_bundle_assets::{Assets, Bundle, SerializedFile};
+use unity_bundle_assets::{decode, Assets, Bundle, Image, Limits, SpriteAtlas};
+
+/// Longer than this for one input is a failure. A seed takes about 50 us in a debug build;
+/// the margin is for a loaded machine, not for slow inputs.
+const SLOW: Duration = Duration::from_millis(250);
 
 /// What a seed is, and so which reads to run over it.
 enum Kind {
@@ -163,45 +170,89 @@ static OPENED: AtomicUsize = AtomicUsize::new(0);
 static DECODED: AtomicUsize = AtomicUsize::new(0);
 static EXPORTED: AtomicUsize = AtomicUsize::new(0);
 
-fn exercise_assets(mut a: Assets) {
+/// Every public read over one opened file: the `Assets` calls, and the lower layers directly
+/// (object readers, `Texture2D::data` / `data_in`, `decode`), then a check that the work
+/// counted stayed within the limit.
+fn exercise_assets(mut a: Assets, bundle: Option<&Bundle>, dir: &Path) {
     OPENED.fetch_add(1, Relaxed);
+    let limit = a.file().limits().max_total_work;
     for t in a.textures(|_| true) {
         if a.decode_texture(t.path_id).is_ok() {
             DECODED.fetch_add(1, Relaxed);
         }
+        if let Ok(texture) = a.texture(t.path_id) {
+            let data = bundle.map_or_else(
+                || texture.data(dir).map(|d| d.len()),
+                |b| texture.data_in(b).map(|d| d.len()),
+            );
+            if let Ok(len) = data {
+                let pixels = &vec![0; len.min(1 << 16)];
+                let _ = decode::decode(
+                    texture.format,
+                    texture.width.min(64),
+                    texture.height.min(64),
+                    pixels,
+                );
+            }
+        }
+    }
+    for o in a.file().objects() {
+        if o.class_id() == SPRITE_ATLAS {
+            let _ = SpriteAtlas::read(a.file(), o);
+        }
     }
     let list = a.sprites(|_| true);
+    let foreign = Image::new(3, 2, vec![9; 24]).unwrap();
     for s in &list.sprites {
         if a.export(s).is_ok() {
             EXPORTED.fetch_add(1, Relaxed);
         }
+        let _ = a.cut(s, &foreign);
+        let _ = a.placement(s);
+    }
+    assert!(
+        a.work_done() <= limit,
+        "work {} over the limit {limit}",
+        a.work_done()
+    );
+}
+
+/// Default limits, or small ones that the seeds' own work overruns.
+const fn limits(tight: bool) -> Limits {
+    if tight {
+        Limits::DEFAULT
+            .with_max_total_work(40)
+            .with_max_mask_work(12)
+            .with_max_decompressed(1 << 16)
+    } else {
+        Limits::DEFAULT
     }
 }
 
-fn exercise(kind: &Kind, data: &[u8]) {
+fn exercise(kind: &Kind, data: &[u8], tight: bool) {
+    let limits = limits(tight);
     match kind {
         Kind::Bundle => {
-            if let Ok(b) = Bundle::parse(data) {
+            if let Ok(b) = Bundle::parse_with(data, limits) {
                 let b = Arc::new(b);
                 let names: Vec<String> =
                     b.serialized_files().map(|e| e.path().to_string()).collect();
                 for n in names {
                     if let Ok(a) = Assets::from_bundle(b.clone(), &n) {
-                        exercise_assets(a);
+                        exercise_assets(a, Some(&b), Path::new(""));
                     }
                 }
             }
+            let _ = Assets::from_bytes(data.to_vec(), "", limits);
         }
         Kind::Serialized | Kind::Streamed(_) => {
-            if let Ok(f) = SerializedFile::parse(data.to_vec()) {
-                // A plain file gets an empty folder, so a mutated stream name finds nothing.
-                let dir = match kind {
-                    Kind::Streamed(dir) => dir.clone(),
-                    _ => EMPTY.with(PathBuf::clone),
-                };
-                if let Ok(a) = Assets::from_serialized(f, dir) {
-                    exercise_assets(a);
-                }
+            // A plain file gets an empty folder, so a mutated stream name finds nothing.
+            let dir = match kind {
+                Kind::Streamed(dir) => dir.clone(),
+                _ => EMPTY.with(PathBuf::clone),
+            };
+            if let Ok(a) = Assets::from_bytes(data.to_vec(), &dir, limits) {
+                exercise_assets(a, None, &dir);
             }
         }
     }
@@ -255,7 +306,45 @@ fn watchdog(running: Arc<Mutex<Running>>, done: Arc<AtomicBool>, limit: Duration
 
 fn mutate(original: &[u8], rnd: &mut impl FnMut() -> u64) -> Vec<u8> {
     let mut m = original.to_vec();
-    match rnd() % 4 {
+    match rnd() % 8 {
+        // Bytes inserted, removed, or copied from elsewhere in the file: shifts every offset
+        // after them, and repeats structures.
+        4 => {
+            let at = rnd() as usize % m.len();
+            let n = 1 + rnd() as usize % 16;
+            let bytes: Vec<u8> = (0..n).map(|_| rnd() as u8).collect();
+            m.splice(at..at, bytes);
+        }
+        5 => {
+            let at = rnd() as usize % m.len();
+            let n = (1 + rnd() as usize % 16).min(m.len() - at);
+            m.drain(at..at + n);
+        }
+        6 => {
+            let from = rnd() as usize % m.len();
+            let to = rnd() as usize % m.len();
+            let n = (1 + rnd() as usize % 64)
+                .min(m.len() - from)
+                .min(m.len() - to);
+            let chunk = m[from..from + n].to_vec();
+            m[to..to + n].copy_from_slice(&chunk);
+        }
+        // Floats that break arithmetic, where rects, pivots and vertices are.
+        7 => {
+            let k = (rnd() as usize % m.len()) & !3;
+            let v = [
+                f32::NAN,
+                f32::INFINITY,
+                -f32::INFINITY,
+                1e30,
+                -1e30,
+                f32::MIN_POSITIVE,
+                16384.5,
+            ][(rnd() % 7) as usize];
+            if k + 4 <= m.len() {
+                m[k..k + 4].copy_from_slice(&v.to_le_bytes());
+            }
+        }
         0 => m.truncate(rnd() as usize % m.len()),
         1 => {
             for _ in 0..=(rnd() % 8) {
@@ -318,7 +407,7 @@ fn mutated_files_never_panic_or_hang() {
     for seed in seeds(&stream_dir) {
         // Control: the unmutated seed must open and reach the decoders.
         let before = (OPENED.load(Relaxed), DECODED.load(Relaxed));
-        exercise(&seed.kind, &seed.data);
+        exercise(&seed.kind, &seed.data, false);
         let after = (OPENED.load(Relaxed), DECODED.load(Relaxed));
         assert!(
             after.0 > before.0 && after.1 > before.1,
@@ -335,8 +424,10 @@ fn mutated_files_never_panic_or_hang() {
                 r.since = Some(Instant::now());
             }
             let start = Instant::now();
-            let panicked = std::panic::catch_unwind(|| exercise(&seed.kind, &m)).is_err();
-            let slow = start.elapsed() > Duration::from_secs(2);
+            // One input in four under small limits, so the refusals are exercised too.
+            let tight = i % 4 == 3;
+            let panicked = std::panic::catch_unwind(|| exercise(&seed.kind, &m, tight)).is_err();
+            let slow = start.elapsed() > SLOW;
             running.lock().unwrap().since = None;
             if panicked || slow {
                 let path = failures_dir().join(format!("{}-{i}.bin", seed.name));

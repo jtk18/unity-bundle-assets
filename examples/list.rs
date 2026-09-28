@@ -14,7 +14,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let assets = unity_bundle_assets::Assets::open(&path)?;
     let file = assets.file();
     println!(
-        "format {} unity {} platform {} type trees {} externals {:?}",
+        "format {} unity {} platform {} type trees {} externals [{}]",
         file.version(),
         common::printable(file.unity_version()),
         file.target_platform(),
@@ -23,6 +23,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .iter()
             .map(|e| common::printable(&e.path))
             .collect::<Vec<_>>()
+            .join(", ")
     );
     let mut counts = BTreeMap::new();
     for o in file.objects() {

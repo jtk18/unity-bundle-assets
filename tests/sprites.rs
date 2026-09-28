@@ -10,7 +10,7 @@ use unity_bundle_assets::{Assets, Error, Image, LimitKind, Limits};
 
 const TEX: i64 = 10;
 const ATLAS: i64 = 30;
-/// SpriteSettings: packed, rectangle packing (not tight), rotation in bits 2-5.
+/// `SpriteSettings`: packed, rectangle packing (not tight), rotation in bits 2-5.
 const RECT: u32 = 0b10;
 const PACKED: u32 = 0b01;
 
@@ -304,7 +304,7 @@ fn releases_after_6000_4_are_refused() {
     );
     let objects = [
         (TEX, TEXTURE_2D, tex.clone()),
-        (1, SPRITE, tight(false, false, &TRIANGLE)),
+        (1, SPRITE, from_2023(tight(false, false, &TRIANGLE))),
     ];
     let (_d, a) = open_with(&objects, "6000.4.2f1", Limits::default());
     assert!(a.sprites(|_| true).skipped.is_empty());

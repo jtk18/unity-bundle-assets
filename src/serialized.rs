@@ -168,7 +168,7 @@ impl SerializedFile {
     ///
     /// As [`SerializedFile::open`].
     pub fn open_with(path: impl AsRef<std::path::Path>, limits: Limits) -> Result<Self> {
-        let data = crate::file::read_limited(path.as_ref(), limits.max_file_size)?;
+        let data = crate::file::read_limited(path.as_ref(), limits.max_file_size, check_head)?;
         Self::parse_with(data, limits)
     }
 
@@ -277,8 +277,9 @@ impl SerializedFile {
         self.index.get(&path_id).map(|&i| &self.objects[i])
     }
 
-    /// One object's raw bytes, or `None` for an object from another file that does not fit
-    /// this one.
+    /// One object's raw bytes, or `None` for an object that does not fit this file. An
+    /// [`ObjectInfo`] is not tied to the file it came from: one from another file that fits
+    /// reads this file's bytes at its offsets.
     #[must_use]
     pub fn bytes(&self, object: &ObjectInfo) -> Option<&[u8]> {
         self.data
@@ -313,20 +314,16 @@ impl SerializedFile {
     }
 }
 
-fn parse(data: &[u8], limits: &Limits) -> Result<Parsed> {
-    if crate::bundle::is_bundle(data) {
-        return Err(Error::Unsupported(
-            "this is an asset bundle (UnityFS), not a serialized file; open it with \
-             Assets::open or Bundle::parse"
-                .into(),
-        ));
-    }
-    for other in ["UnityWeb", "UnityRaw", "UnityArchive"] {
-        if data.starts_with(other.as_bytes()) {
-            return Err(Error::Unsupported(format!("{other} bundle container")));
-        }
-    }
-    let mut r = Reader::new(data, true);
+/// A serialized file's header, as far as it decides whether to read on.
+struct Header {
+    version: u32,
+    big_endian: bool,
+    data_offset: u64,
+}
+
+/// Read the header of a file of `len` bytes: a known format version, and a stated size that
+/// is the file's.
+fn header(r: &mut Reader<'_>, len: u64) -> Result<Header> {
     let _metadata_size = r.u32()?;
     let mut file_size = u64::from(r.u32()?);
     let version = r.u32()?;
@@ -334,7 +331,7 @@ fn parse(data: &[u8], limits: &Limits) -> Result<Parsed> {
     if !(MIN_VERSION..=MAX_VERSION).contains(&version) {
         // Older and newer Unity files have a plausible header too (a v22-style header leaves
         // the old size field 0); anything else is not Unity at all.
-        let plausible = ((9..MIN_VERSION).contains(&version) && file_size == data.len() as u64)
+        let plausible = ((9..MIN_VERSION).contains(&version) && file_size == len)
             || ((MAX_VERSION + 1..=40).contains(&version) && file_size == 0);
         return Err(if plausible {
             Error::Unsupported(format!(
@@ -354,10 +351,9 @@ fn parse(data: &[u8], limits: &Limits) -> Result<Parsed> {
         data_offset = r.u64()?;
         r.skip(8)?;
     }
-    if file_size != data.len() as u64 {
+    if file_size != len {
         return Err(Error::Invalid(format!(
-            "header says {file_size} bytes, file has {}",
-            data.len()
+            "header says {file_size} bytes, file has {len}"
         )));
     }
     if data_offset > file_size {
@@ -365,6 +361,46 @@ fn parse(data: &[u8], limits: &Limits) -> Result<Parsed> {
             "object data starts at {data_offset}, past the end of the file"
         )));
     }
+    Ok(Header {
+        version,
+        big_endian,
+        data_offset,
+    })
+}
+
+/// [`crate::file::HeadCheck`] for a serialized file: its header, from its first bytes, must
+/// state the file's own size; then the whole file is read.
+pub(crate) fn check_head(head: &[u8], len: u64) -> Result<u64> {
+    refuse_containers(head)?;
+    header(&mut Reader::new(head, true), len)?;
+    Ok(len)
+}
+
+/// Refuse bundle containers, which start with a signature instead of a header.
+fn refuse_containers(data: &[u8]) -> Result<()> {
+    if crate::bundle::is_bundle(data) {
+        return Err(Error::Unsupported(
+            "this is an asset bundle (UnityFS), not a serialized file; open it with \
+             Assets::open or Bundle::parse"
+                .into(),
+        ));
+    }
+    for other in ["UnityWeb", "UnityRaw", "UnityArchive"] {
+        if data.starts_with(other.as_bytes()) {
+            return Err(Error::Unsupported(format!("{other} bundle container")));
+        }
+    }
+    Ok(())
+}
+
+fn parse(data: &[u8], limits: &Limits) -> Result<Parsed> {
+    refuse_containers(data)?;
+    let mut r = Reader::new(data, true);
+    let Header {
+        version,
+        big_endian,
+        data_offset,
+    } = header(&mut r, data.len() as u64)?;
 
     r.set_big_endian(big_endian);
     let unity_version = r.cstr()?;
@@ -472,9 +508,9 @@ fn read_type(r: &mut Reader, version: u32, has_type_trees: bool) -> Result<Seria
     r.skip(16)?; // type hash
     if has_type_trees {
         let at = r.pos();
-        let nodes = r.len(24)?;
-        let strings = r.len(1)?;
         let node_size = if version >= 19 { 32 } else { 24 };
+        let nodes = r.len(node_size)?;
+        let strings = r.len(1)?;
         let skip = nodes
             .checked_mul(node_size)
             .and_then(|n| n.checked_add(strings))

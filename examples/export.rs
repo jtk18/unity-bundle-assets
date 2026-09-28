@@ -1,5 +1,10 @@
 //! Export sprites to PNG: `cargo run --example export -- <file> <out-dir> [name-prefix...]`.
 //! A name used by more than one sprite (ignoring case) gets its path ID appended.
+//!
+//! Files already in the output folder are never overwritten (each is reported instead), so
+//! export into an empty folder. The output is bounded only by the file's work limit: a small
+//! hostile file can ask for tens of gigabytes of PNG. Lower the limits, or watch the disk,
+//! when exporting files you did not make.
 
 mod common;
 
@@ -15,13 +20,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let list = assets.sprites(|n| prefixes.is_empty() || prefixes.iter().any(|p| n.starts_with(p)));
     let mut names = common::Names::default();
     let (mut ok, mut failed) = (0, list.skipped.len());
+    let mut printed = 0;
     for skipped in &list.skipped {
-        eprintln!(
+        let line = format!(
             "{} ({}): {}",
             common::printable(skipped.name.as_deref().unwrap_or("?")),
             skipped.path_id,
             common::printable(&skipped.error.to_string())
         );
+        common::report(&mut printed, &line);
     }
     for sprite in &list.sprites {
         let saved = assets
@@ -35,12 +42,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(()) => ok += 1,
             Err(e) => {
                 failed += 1;
-                eprintln!(
+                let line = format!(
                     "{} ({}): {}",
                     common::printable(&sprite.name),
                     sprite.path_id,
                     common::printable(&e)
                 );
+                common::report(&mut printed, &line);
             }
         }
     }

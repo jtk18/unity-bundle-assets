@@ -4,7 +4,7 @@
 mod common;
 
 use std::collections::BTreeMap;
-use unity_bundle_assets::Assets;
+use unity_bundle_assets::{Assets, Settings};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let path = std::env::args().nth(1).ok_or("usage: survey <file>")?;
@@ -20,7 +20,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut formats = BTreeMap::new();
     let mut by = BTreeMap::new();
     for sprite in &list.sprites {
-        let tex = match assets.placement(sprite) {
+        let placement = assets.placement(sprite);
+        let tex = match &placement {
             Err(e) => format!("error: {}", common::printable(&e.to_string())),
             Ok(p) if p.texture.file_id != 0 => format!("external {}", p.texture.file_id),
             Ok(p) => {
@@ -33,14 +34,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 format!("{t:?}")
             }
         };
-        let settings = assets
-            .placement(sprite)
-            .map(|p| p.settings)
-            .unwrap_or_default();
+        // Packing is unknown when the placement is: counted apart, not as defaults.
+        let settings = placement.as_ref().ok().map(|p| p.settings);
         *by.entry((
             tex,
-            settings.tight(),
-            format!("{:?}", settings.rotation()),
+            settings.map(Settings::tight),
+            format!("{:?}", settings.map(Settings::rotation)),
             !sprite.atlas.is_null(),
         ))
         .or_insert(0) += 1;

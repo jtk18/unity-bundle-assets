@@ -13,6 +13,7 @@ First release.
 - `Assets` lists and exports sprites and textures, top row first; the lower layers are public.
 - `Limits` bounds file size, decompression, object count, decoded pixels, sprite meshes, mask
   work and the total work done, shared by every `Assets` opened from one bundle.
-- Hostile input: records, bundle entries and streamed pixel ranges may not overlap; stream
-  files must be regular files beside the asset, with no links, device names or data streams,
-  opened without blocking.
+- Hostile input: records, bundle entries, sprite sub-meshes and streamed pixel ranges may not
+  overlap, whatever path spelling reaches them; strings are held to 4 KiB; files are checked
+  by header before they are read; stream files must be regular files beside the asset, with
+  no links, device names or data streams, opened without blocking.

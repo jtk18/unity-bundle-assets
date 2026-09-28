@@ -1,5 +1,10 @@
 //! Export textures to PNG:
 //! `cargo run --release --example textures -- <file-or-bundle> <out-dir> [name-prefix...]`.
+//!
+//! Files already in the output folder are never overwritten (each is reported instead), so
+//! export into an empty folder. The output is bounded only by the file's work limit: a small
+//! hostile file can ask for tens of gigabytes of PNG. Lower the limits, or watch the disk,
+//! when exporting files you did not make.
 
 mod common;
 
@@ -13,6 +18,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(&out)?;
     let assets = unity_bundle_assets::Assets::open(&path)?;
     let (mut ok, mut failed) = (0, 0);
+    let mut printed = 0;
     for texture in
         assets.textures(|n| prefixes.is_empty() || prefixes.iter().any(|p| n.starts_with(p)))
     {
@@ -28,12 +34,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(()) => ok += 1,
             Err(e) => {
                 failed += 1;
-                eprintln!(
+                let line = format!(
                     "{} ({}): {}",
                     common::printable(name),
                     texture.path_id,
                     common::printable(&e)
                 );
+                common::report(&mut printed, &line);
             }
         }
     }

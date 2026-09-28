@@ -5,7 +5,7 @@
 
 use crate::reader::Reader;
 use crate::serialized::{class, ObjectInfo, SerializedFile};
-use crate::{check_release, Error, LimitKind, Result};
+use crate::{check_release, Error, LimitKind, Result, Version};
 
 use std::collections::HashMap;
 
@@ -209,7 +209,8 @@ impl Sprite {
         let limit = file.limits().max_sprite_triangles;
         let budget = Budget { limit, remaining };
         let mut r = file.reader_for(object, class::SPRITE)?;
-        read_sprite(&mut r, file.big_endian(), budget, object.path_id())
+        let v = Version::parse(file.unity_version()).numbers;
+        read_sprite(&mut r, file.big_endian(), v, budget, object.path_id())
             .map_err(|e| layout_error(e, "Sprite", object, file))
     }
 }
@@ -232,7 +233,13 @@ fn layout_error(e: Error, what: &str, object: &ObjectInfo, file: &SerializedFile
     }
 }
 
-fn read_sprite(r: &mut Reader, big_endian: bool, budget: Budget, path_id: i64) -> Result<Sprite> {
+fn read_sprite(
+    r: &mut Reader,
+    big_endian: bool,
+    v: [u32; 3],
+    budget: Budget,
+    path_id: i64,
+) -> Result<Sprite> {
     let name = r.aligned_string()?;
     let rect = Rect::read(r)?;
     r.skip(8)?; // m_Offset
@@ -264,6 +271,34 @@ fn read_sprite(r: &mut Reader, big_endian: bool, budget: Budget, path_id: i64) -
     let settings = Settings(r.u32()?);
     r.skip(16)?; // uvTransform
     let downscale = r.f32()?;
+
+    // The rest is read only to check that the object ends where these fields do, so a
+    // misread layout is an error rather than wrong numbers.
+    for _ in 0..r.len(4)? {
+        let points = r.len(8)?; // m_PhysicsShape: outlines of Vector2f
+        r.skip(points * 8)?;
+    }
+    let bone_guid_and_colour = v >= [2021, 1, 0];
+    for _ in 0..r.len(if bone_guid_and_colour { 48 } else { 40 })? {
+        r.aligned_string()?; // name
+        if bone_guid_and_colour {
+            r.aligned_string()?; // guid
+        }
+        r.skip(12 + 16 + 4 + 4)?; // position, rotation, length, parentId
+        if bone_guid_and_colour {
+            r.skip(4)?; // color
+        }
+    }
+    if v >= [2023, 1, 0] {
+        let n = r.len(12)?;
+        r.skip(n * 12)?; // m_ScriptableObjects
+    }
+    if r.remaining() != 0 {
+        return Err(Error::Invalid(format!(
+            "sprite {name:?} has {} bytes after its last field; the layout is probably misread",
+            r.remaining()
+        )));
+    }
 
     Ok(Sprite {
         path_id,
@@ -352,6 +387,17 @@ fn read_mesh(
             )));
         }
         total = total.saturating_add(u64::from(sm.index_count) / 3);
+    }
+    // Unity gives each sub-mesh its own indices; letting them overlap would let a small index
+    // buffer stand for many triangles.
+    let mut spans: Vec<(u32, u32)> = submeshes
+        .iter()
+        .filter(|sm| sm.topology == 0 && sm.index_count > 0)
+        .map(|sm| (sm.first_byte, sm.first_byte + sm.index_count * 2))
+        .collect();
+    spans.sort_unstable();
+    if spans.windows(2).any(|w| w[1].0 < w[0].1) {
+        return Err(Error::Invalid("sprite sub-meshes share indices".into()));
     }
     Error::limit(LimitKind::SpriteTriangles, total, budget.limit)?;
     Error::limit(LimitKind::TotalTriangles, total, budget.remaining)?;

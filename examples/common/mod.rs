@@ -6,7 +6,8 @@
 use std::collections::HashSet;
 
 /// A name reduced to one safe path component: letters, digits, `.`, `_` and `-`, at most 100
-/// bytes, never empty, never `.` or `..`, and never a Windows device name.
+/// bytes, never empty, never `.` or `..`, never starting with `-` (which a later shell command
+/// would read as an option), and never a Windows device name.
 pub fn file_name(name: &str) -> String {
     let mut safe: String = name
         .chars()
@@ -24,7 +25,7 @@ pub fn file_name(name: &str) -> String {
         || (stem.len() == 4
             && (stem.starts_with("COM") || stem.starts_with("LPT"))
             && stem.as_bytes()[3].is_ascii_digit());
-    if safe.is_empty() || safe.chars().all(|c| c == '.') || device {
+    if safe.is_empty() || safe.chars().all(|c| c == '.') || safe.starts_with('-') || device {
         safe.insert(0, '_');
     }
     safe
@@ -66,23 +67,42 @@ pub fn printable(s: &str) -> String {
         .collect()
 }
 
-/// Write a top-down RGBA image as PNG.
+/// Write a top-down RGBA image as PNG to a new file. Anything already at `path` is left alone
+/// and reported: a file from an earlier run, or a link, FIFO or device someone placed there,
+/// which writing through would overwrite something else or hang. Creating the file only if it
+/// is new (`O_CREAT | O_EXCL`) refuses all of them in one step, with no gap between a check
+/// and the write.
 pub fn save_png(
     path: &std::path::Path,
     image: &unity_bundle_assets::Image,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Writing through a link left in the output folder would overwrite whatever it points at.
-    if path.is_symlink() {
-        return Err(format!("{} is a symbolic link", path.display()).into());
-    }
-    image::save_buffer(
-        path,
+    use image::ImageEncoder;
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    image::codecs::png::PngEncoder::new(std::io::BufWriter::new(file)).write_image(
         &image.rgba,
         image.width,
         image.height,
-        image::ColorType::Rgba8,
+        image::ExtendedColorType::Rgba8,
     )?;
     Ok(())
+}
+
+/// Error lines printed per run before the rest are only counted, so a file with millions of
+/// broken objects cannot flood the terminal.
+pub const MAX_REPORTED: usize = 50;
+
+/// Print one error line, or count it once [`MAX_REPORTED`] have been printed.
+pub fn report(printed: &mut usize, line: &str) {
+    if *printed < MAX_REPORTED {
+        eprintln!("{line}");
+    } else if *printed == MAX_REPORTED {
+        eprintln!("(further errors are counted, not printed)");
+    }
+    *printed += 1;
 }
 
 #[cfg(test)]
@@ -127,9 +147,32 @@ mod tests {
             ("com1.txt", "_com1.txt"),
             ("", "_"),
             ("..", "_.."),
+            ("-rf", "_-rf"),
         ] {
             assert_eq!(file_name(raw), want, "{raw:?}");
         }
         assert_eq!(file_name(&"x".repeat(300)).len(), 100);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_png_writes_only_new_files() {
+        let dir = std::env::temp_dir().join(format!("uba-save-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let image = unity_bundle_assets::Image::new(1, 1, vec![1, 2, 3, 4]).unwrap();
+        let canary = dir.join("canary");
+        std::fs::write(&canary, b"keep").unwrap();
+        std::os::unix::fs::symlink(&canary, dir.join("link.png")).unwrap();
+        std::fs::hard_link(&canary, dir.join("hard.png")).unwrap();
+        for taken in ["link.png", "hard.png"] {
+            assert!(save_png(&dir.join(taken), &image).is_err(), "{taken}");
+        }
+        assert_eq!(std::fs::read(&canary).unwrap(), b"keep");
+        assert!(save_png(&dir.join("new.png"), &image).is_ok());
+        assert!(
+            save_png(&dir.join("new.png"), &image).is_err(),
+            "no overwriting"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

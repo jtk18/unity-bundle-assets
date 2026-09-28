@@ -63,7 +63,7 @@ impl W {
         self.put(v.to_le_bytes(), v.to_be_bytes())
     }
     pub fn bool(&mut self, v: bool) -> &mut Self {
-        self.buf.push(v as u8);
+        self.buf.push(u8::from(v));
         self
     }
     pub fn raw(&mut self, b: &[u8]) -> &mut Self {
@@ -130,15 +130,15 @@ pub enum Layout {
     U2017_1,
     /// 2017.3 to 2018.1: plus the fallback fields.
     U2017_3,
-    /// 2018.2 to 2019.3.0: fallback fields, streaming mipmaps.
+    /// 2018.2 to 2019.3.0: fallback fields, streaming mip maps.
     U2018_4,
-    /// 2019.3.1 to 2019.4.8: plus m_IgnoreMasterTextureLimit.
+    /// 2019.3.1 to 2019.4.8: plus `m_IgnoreMasterTextureLimit`.
     U2019_3,
-    /// 2019.4.9: plus m_IsPreProcessed.
+    /// 2019.4.9: plus `m_IsPreProcessed`.
     U2019_4,
-    /// 2020.1: plus m_MipsStripped; 64-bit stream offsets.
+    /// 2020.1: plus `m_MipsStripped`; 64-bit stream offsets.
     U2020_1,
-    /// 2020.2 to 2022.1: plus m_IsAlphaChannelOptional and m_PlatformBlob.
+    /// 2020.2 to 2022.1: plus `m_IsAlphaChannelOptional` and `m_PlatformBlob`.
     U2021_3,
     /// 2022.2 to 2023.1: mips stripped, alpha optional, platform blob, limit group name.
     U2022_3,
@@ -198,7 +198,7 @@ pub fn texture(
         }
         U2022_3 | U6000 => {
             o.bool(false).bool(false).bool(false).align();
-            o.string(""); // m_MipmapLimitGroupName
+            o.string("LimitGroup"); // m_MipmapLimitGroupName
             o.bool(false).align().i32(0);
         }
     }
@@ -232,6 +232,19 @@ pub struct Mesh<'a> {
     pub junk_lines: bool,
     /// The position channel's vertex format: 0 float32, 1 float16.
     pub pos_format: u8,
+    /// Write the triangle sub-mesh twice, over the same indices.
+    pub repeat_submesh: bool,
+    /// The UV channel's vertex format (its two components take that format's size).
+    pub uv_format: u8,
+    /// Components of the position channel (x, y, then zeros).
+    pub pos_dims: u8,
+    /// Another channel in the position's stream, after it: `(format, dimension)`, filled
+    /// with zeros. A dimension of 0 marks an unused channel, which takes no bytes.
+    pub extra_channel: Option<(u8, u8)>,
+    /// More sub-meshes after the others, as `(first byte, index count, topology)`.
+    pub extra_submeshes: &'a [(u32, u32, i32)],
+    /// The main sub-mesh's index count, when not all of `indices`.
+    pub index_count: Option<u32>,
 }
 
 impl Mesh<'static> {
@@ -242,6 +255,12 @@ impl Mesh<'static> {
         base_vertex: 0,
         junk_lines: false,
         pos_format: 0,
+        repeat_submesh: false,
+        uv_format: 0,
+        pos_dims: 3,
+        extra_channel: None,
+        extra_submeshes: &[],
+        index_count: None,
     };
 }
 
@@ -281,6 +300,17 @@ pub fn sprite(
     )
 }
 
+/// Lists a sprite carries besides its mesh, empty in [`sprite`].
+#[derive(Default, Clone, Copy)]
+pub struct SpriteExtras<'a> {
+    pub atlas_tags: &'a [&'a str],
+    /// `(texture path ID, name)`.
+    pub secondary_textures: &'a [(i64, &'a str)],
+    pub bindposes: usize,
+    /// `m_PhysicsShape`: outlines of points.
+    pub outlines: &'a [&'a [[f32; 2]]],
+}
+
 /// [`sprite`] with pixels per unit and the texture rect's offset within the full rect.
 #[allow(clippy::too_many_arguments)]
 pub fn sprite_full(
@@ -300,6 +330,46 @@ pub fn sprite_full(
     pixels_per_unit: f32,
     rect_offset: [f32; 2],
 ) -> Vec<u8> {
+    sprite_ext(
+        big,
+        unity_6000_5,
+        name,
+        rect,
+        pivot,
+        key,
+        atlas,
+        texture,
+        alpha_texture,
+        texture_rect,
+        settings,
+        downscale,
+        mesh,
+        pixels_per_unit,
+        rect_offset,
+        &SpriteExtras::default(),
+    )
+}
+
+/// [`sprite_full`] with the lists in `extras`.
+#[allow(clippy::too_many_arguments)]
+pub fn sprite_ext(
+    big: bool,
+    unity_6000_5: bool,
+    name: &str,
+    rect: [f32; 4],
+    pivot: [f32; 2],
+    key: i64,
+    atlas: i64,
+    texture: i64,
+    alpha_texture: i64,
+    texture_rect: [f32; 4],
+    settings: u32,
+    downscale: f32,
+    mesh: &Mesh,
+    pixels_per_unit: f32,
+    rect_offset: [f32; 2],
+    extras: &SpriteExtras,
+) -> Vec<u8> {
     let mut o = W::new(big);
     o.string(name);
     o.rect(rect[0], rect[1], rect[2], rect[3]);
@@ -312,11 +382,17 @@ pub fn sprite_full(
     }
     o.align();
     o.raw(&[7; 16]).i64(key);
-    o.i32(0); // m_AtlasTags
+    o.i32(extras.atlas_tags.len() as i32); // m_AtlasTags
+    for tag in extras.atlas_tags {
+        o.string(tag);
+    }
     o.pptr(0, atlas);
     // m_RD
     o.pptr(0, texture).pptr(0, alpha_texture);
-    o.i32(0); // secondaryTextures
+    o.i32(extras.secondary_textures.len() as i32); // secondaryTextures
+    for &(texture, name) in extras.secondary_textures {
+        o.pptr(0, texture).string(name);
+    }
     let b = mesh.base_vertex as usize;
     // Unused vertices before the mesh's own, reached only through the base vertex; and, for
     // `junk_lines`, a huge triangle after them.
@@ -337,11 +413,11 @@ pub fn sprite_full(
             ib.u16(junk + i - b as u16);
         }
     }
-    let submeshes = u32::from(index_count > 0) + u32::from(mesh.junk_lines);
-    o.u32(submeshes);
-    if index_count > 0 {
+    let triangle_submeshes = u32::from(index_count > 0) * if mesh.repeat_submesh { 2 } else { 1 };
+    o.u32(triangle_submeshes + u32::from(mesh.junk_lines) + mesh.extra_submeshes.len() as u32);
+    for _ in 0..triangle_submeshes {
         o.u32(0)
-            .u32(index_count)
+            .u32(mesh.index_count.unwrap_or(index_count))
             .i32(0)
             .u32(mesh.base_vertex)
             .u32(0);
@@ -351,36 +427,53 @@ pub fn sprite_full(
         o.u32(junk_at).u32(3).i32(3).u32(mesh.base_vertex).u32(0);
         o.u32(verts.len() as u32).zeros(24);
     }
+    for &(first_byte, count, topology) in mesh.extra_submeshes {
+        o.u32(first_byte)
+            .u32(count)
+            .i32(topology)
+            .u32(mesh.base_vertex)
+            .u32(0);
+        o.u32(verts.len() as u32).zeros(24);
+    }
     o.bytes(&ib.buf);
     o.u32(verts.len() as u32);
-    // Channel 0 is position (3 components), channel 1 UV (2 floats), in the streams asked.
+    // Channel 0 is position, then any extra channel in the same stream, then UV (2
+    // components) in the other stream; streams in the order asked.
     let (ps, us) = if mesh.pos_stream == 0 {
         (0u8, 1u8)
     } else {
         (1, 0)
     };
-    o.i32(2)
-        .raw(&[ps, 0, mesh.pos_format, 3])
-        .raw(&[us, 0, 0, 2]);
+    let pos_bytes = usize::from(mesh.pos_dims) * vertex_format_size(mesh.pos_format);
+    let extra_bytes = mesh
+        .extra_channel
+        .map_or(0, |(f, d)| usize::from(d) * vertex_format_size(f));
+    o.i32(2 + i32::from(mesh.extra_channel.is_some()));
+    o.raw(&[ps, 0, mesh.pos_format, mesh.pos_dims]);
+    if let Some((format, dims)) = mesh.extra_channel {
+        o.raw(&[ps, pos_bytes as u8, format, dims]);
+    }
+    o.raw(&[us, 0, mesh.uv_format, 2]);
     let mut vb = W::new(big);
     let positions = |vb: &mut W| {
         for v in &verts {
+            let start = vb.buf.len();
             match mesh.pos_format {
                 0 => {
-                    vb.f32(v[0]).f32(v[1]).f32(0.0);
+                    vb.f32(v[0]).f32(v[1]);
                 }
                 10 => {
-                    vb.u32(v[0] as u32).u32(v[1] as u32).u32(0);
+                    vb.u32(v[0] as u32).u32(v[1] as u32);
                 }
-                _ => {
-                    vb.u16(0).u16(0).u16(0);
-                }
+                _ => {}
             }
+            let written = vb.buf.len() - start;
+            vb.zeros(pos_bytes.saturating_sub(written) + extra_bytes);
         }
     };
     let uvs = |vb: &mut W| {
         for _ in &verts {
-            vb.f32(0.0).f32(0.0);
+            vb.zeros(2 * vertex_format_size(mesh.uv_format));
         }
     };
     let pad = |vb: &mut W| {
@@ -398,7 +491,8 @@ pub fn sprite_full(
         positions(&mut vb);
     }
     o.bytes(&vb.buf);
-    o.i32(0); // m_Bindpose
+    o.i32(extras.bindposes as i32); // m_Bindpose
+    o.zeros(64 * extras.bindposes);
     o.rect(
         texture_rect[0],
         texture_rect[1],
@@ -410,7 +504,62 @@ pub fn sprite_full(
     o.u32(settings);
     o.zeros(16); // uvTransform
     o.f32(downscale);
+    o.i32(extras.outlines.len() as i32); // m_PhysicsShape
+    for outline in extras.outlines {
+        o.i32(outline.len() as i32);
+        for p in *outline {
+            o.f32(p[0]).f32(p[1]);
+        }
+    }
+    o.i32(0); // m_Bones
+    if unity_6000_5 {
+        o.i32(0); // m_ScriptableObjects, from 2023.1
+    }
     o.buf
+}
+
+/// Bytes per component of Unity's `VertexFormat`, written out from Unity's documentation
+/// rather than taken from the crate.
+pub const fn vertex_format_size(format: u8) -> usize {
+    match format {
+        1 | 4 | 5 | 8 | 9 => 2, // Float16, UNorm16, SNorm16, UInt16, SInt16
+        2 | 3 | 6 | 7 => 1,     // UNorm8, SNorm8, UInt8, SInt8
+        _ => 4,                 // Float32, UInt32, SInt32 (0, 10, 11); others unused
+    }
+}
+
+/// A sprite from [`sprite`] (2019.1 to 2022.3) with one bone; `guid_and_colour` for the
+/// layout from 2021.1, whose bones add both.
+pub fn with_bone(mut sprite: Vec<u8>, guid_and_colour: bool) -> Vec<u8> {
+    sprite.truncate(sprite.len() - 4); // m_Bones, empty
+    let mut o = W::le();
+    o.i32(1).string("bone");
+    if guid_and_colour {
+        o.string("guid");
+    }
+    o.zeros(12 + 16 + 4).i32(-1); // position, rotation, length, parentId
+    if guid_and_colour {
+        o.u32(0xffff_ffff); // color
+    }
+    sprite.extend(o.buf);
+    sprite
+}
+
+/// A sprite from [`sprite`] (2019.1 to 2022.3) in the layout of 2023.1 and later, which adds
+/// `m_ScriptableObjects` at the end.
+pub fn from_2023(sprite: Vec<u8>) -> Vec<u8> {
+    from_2023_with(sprite, 0)
+}
+
+/// [`from_2023`] with `n` scriptable objects.
+pub fn from_2023_with(mut sprite: Vec<u8>, n: i32) -> Vec<u8> {
+    let mut o = W::le();
+    o.i32(n);
+    for i in 0..n {
+        o.pptr(0, 900 + i64::from(i));
+    }
+    sprite.extend(o.buf);
+    sprite
 }
 
 /// A `SpriteAtlas` object (2020.2 on) with one entry per `(key, texture, rect, settings)`.
@@ -425,10 +574,27 @@ pub fn atlas_with(
     secondary: bool,
     entries: &[(i64, i64, [f32; 4], u32, f32)],
 ) -> Vec<u8> {
+    atlas_full(big, secondary, "atlas", &[], entries)
+}
+
+/// [`atlas_with`] with a name and its packed sprites, `(path ID, name)`.
+pub fn atlas_full(
+    big: bool,
+    secondary: bool,
+    name: &str,
+    packed: &[(i64, &str)],
+    entries: &[(i64, i64, [f32; 4], u32, f32)],
+) -> Vec<u8> {
     let mut o = W::new(big);
-    o.string("atlas");
-    o.i32(0); // m_PackedSprites
-    o.i32(0); // m_PackedSpriteNamesToIndex
+    o.string(name);
+    o.i32(packed.len() as i32); // m_PackedSprites
+    for &(id, _) in packed {
+        o.pptr(0, id);
+    }
+    o.i32(packed.len() as i32); // m_PackedSpriteNamesToIndex
+    for &(_, name) in packed {
+        o.string(name);
+    }
     o.i32(entries.len() as i32);
     for &(key, texture, r, settings, downscale) in entries {
         o.raw(&[7; 16]).i64(key);
@@ -452,7 +618,7 @@ pub fn atlas_with(
 pub struct Extras {
     /// Type trees for every type (one node each), with type-tree dependencies from v21.
     pub type_trees: bool,
-    /// A MonoBehaviour type, whose entry carries a script ID.
+    /// A `MonoBehaviour` type, whose entry carries a script ID.
     pub mono: bool,
     pub scripts: usize,
     pub externals: Vec<String>,
@@ -553,7 +719,7 @@ pub fn serialized_with(
     out.extend(small(file_size).to_be_bytes());
     out.extend(version.to_be_bytes());
     out.extend(small(data_offset).to_be_bytes());
-    out.extend([big as u8, 0, 0, 0]);
+    out.extend([u8::from(big), 0, 0, 0]);
     if version >= 22 {
         out.extend((meta.len() as u32).to_be_bytes());
         out.extend((file_size as u64).to_be_bytes());
@@ -667,6 +833,8 @@ pub struct BundleOpts {
     pub extra_flags: u32,
     /// Pad the header to 16 bytes even at format 6, as 2019.4.15 and later do.
     pub align_header: bool,
+    /// Zero bytes after the directory's entries, inside the directory.
+    pub info_padding: usize,
 }
 
 impl BundleOpts {
@@ -680,6 +848,7 @@ impl BundleOpts {
             padding_flag: false,
             extra_flags: 0,
             align_header: false,
+            info_padding: 0,
         }
     }
 }
@@ -693,7 +862,7 @@ fn compress(kind: u16, data: &[u8]) -> Vec<u8> {
     }
 }
 
-/// A UnityFS bundle holding `entries` as `(path, data, flags)`.
+/// A `UnityFS` bundle holding `entries` as `(path, data, flags)`.
 pub fn bundle(opts: &BundleOpts, entries: &[(&str, &[u8], u32)]) -> Vec<u8> {
     let stream: Vec<u8> = entries.iter().flat_map(|e| e.1.iter().copied()).collect();
     // Split the stream into as many blocks as `opts.blocks` names, evenly.
@@ -726,6 +895,7 @@ pub fn bundle(opts: &BundleOpts, entries: &[(&str, &[u8], u32)]) -> Vec<u8> {
         info.push(0);
         offset += data.len() as i64;
     }
+    info.resize(info.len() + opts.info_padding, 0);
     let info_c = compress(opts.info as u16, &info);
 
     let mut flags = 0x40 | opts.info | opts.extra_flags;

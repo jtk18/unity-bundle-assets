@@ -37,29 +37,29 @@
 //! Files are treated as hostile:
 //!
 //! - Counts and lengths are checked against the bytes present before they size an
-//!   allocation. Objects in a file, entries in a bundle, and the stream ranges textures read
-//!   may not overlap, so one blob cannot be decoded many times over.
+//!   allocation, and every string read is at most 4 KiB. Objects in a file, entries in a
+//!   bundle, a sprite's sub-meshes, and the stream ranges textures read may not overlap, so one
+//!   blob cannot be decoded many times over; stream ranges are compared by the bytes they
+//!   reach, however the path to them is spelled.
 //! - Sizes the data alone cannot bound are held to [`Limits`]: file size, decompressed bundle
-//!   size (the parsed directory included), object count, decoded pixels, sprite meshes, and
-//!   the total work spent decoding, cutting and masking, shared by everything opened from one
-//!   file or bundle. They bound work, not peak memory: at the default 16384 x 16384, one
-//!   decoded texture can hold 1 to 2 GiB and a sprite exported from it 2 to 3 GiB.
+//!   size (the parsed directory and LZMA's working memory included), object count, decoded
+//!   pixels, sprite meshes, and the total work spent decoding, cutting and masking, shared by
+//!   everything opened from one file or bundle. Work is reserved before it starts and kept once
+//!   started. The limits bound work, not peak memory: at the default 16384 x 16384, one decoded
+//!   texture can hold 1 to 2 GiB and a sprite exported from it up to 3 GiB.
 //! - Streamed pixels are read only from the same bundle, or from a `.resS` / `.resource` file
-//!   directly beside the asset file that is a regular file, not a symbolic link, and has no
-//!   other hard links.
+//!   directly beside the asset file that is a regular file, not a symbolic link, not a Windows
+//!   device name, and (on Unix) has no other hard links.
 //! - Strings from the file are quoted in error messages, so printing an error cannot send
 //!   control sequences to a terminal. The strings themselves (names, paths, versions) are
 //!   returned as found; escape them before printing.
 //!
-//! [`Limits`] are enforced by [`Assets`] and by the parsers ([`Bundle::parse_with`],
-//! [`SerializedFile::parse_with`]). The object readers and [`decode::decode`], used directly,
-//! do not track total work.
+//! [`Assets`] enforces every limit. Used directly, [`Bundle`] and [`SerializedFile`] apply
+//! their own, [`Texture2D`] refuses data too short for its size, and [`decode::decode`]
+//! applies none; none of them tracks total work.
 //!
 //! Malformed data is meant to give an [`Error`] rather than a panic. `tests/fuzz.rs` checks
 //! that over mutated files; it is evidence, not proof.
-
-#![forbid(unsafe_code)]
-#![warn(missing_docs, missing_debug_implementations)]
 
 mod bundle;
 pub mod decode;
@@ -160,6 +160,15 @@ pub enum Error {
         /// Why; shared by every sprite in the atlas.
         error: Arc<Self>,
     },
+    /// A texture [`Assets::export`] could not decode, which spoils the sprites cut from it.
+    #[error("texture {texture} could not be decoded: {error}")]
+    #[non_exhaustive]
+    TextureUnreadable {
+        /// The texture's path ID.
+        texture: i64,
+        /// Why; shared by every sprite exported from the texture.
+        error: Arc<Self>,
+    },
     /// A texture stored with no pixels, as dynamic font textures are; it is filled at run
     /// time.
     #[error("texture {0:?} is empty (0x0)")]
@@ -183,6 +192,17 @@ fn texture_label(name: Option<&str>) -> String {
 }
 
 impl Error {
+    /// The I/O error inside, if this is [`Error::Io`], for testing its kind (a missing
+    /// stream file is [`std::io::ErrorKind::NotFound`]). Errors carry no
+    /// [`std::error::Error::source`]: each message is complete on its own.
+    #[must_use]
+    pub const fn io_error(&self) -> Option<&std::io::Error> {
+        match self {
+            Self::Io { error, .. } => Some(error),
+            _ => None,
+        }
+    }
+
     pub(crate) fn io(path: &std::path::Path) -> impl FnOnce(std::io::Error) -> Self + '_ {
         move |error| Self::Io {
             path: path.to_path_buf(),
@@ -267,8 +287,8 @@ pub struct Limits {
     /// Most pixel tests spent masking one tight-packed sprite. Default 2^29, enough for a
     /// two-triangle mesh over a 16384 x 16384 sprite.
     pub max_mask_work: u64,
-    /// Most pixels decoded, cut and masked, all told, across everything opened from one file
-    /// or bundle. Default 2^34.
+    /// Most pixels decoded, cut and masked, all told, by one [`Assets`], or by every `Assets`
+    /// opened from one [`Bundle`]. Default 2^34.
     pub max_total_work: u64,
 }
 
@@ -353,15 +373,32 @@ impl Default for Limits {
 #[derive(Debug, Default)]
 pub(crate) struct Shared {
     work: AtomicU64,
-    /// Stream file or entry -> start -> (end, the texture that read it).
-    streams: Mutex<HashMap<String, Claims>>,
+    /// Stream ranges already read, by the bytes they name (not by how a texture spelled the
+    /// path to them): start -> the claim.
+    streams: Mutex<HashMap<StreamKey, BTreeMap<u64, Claim>>>,
 }
 
-/// One stream's claimed ranges: start -> (end, owner). The ranges never overlap.
-type Claims = BTreeMap<u64, (u64, String)>;
+/// What a stream range is a range of. Two spellings that reach the same bytes get one key.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum StreamKey {
+    /// The bundle's decompressed data; ranges are absolute offsets into it.
+    Bundle,
+    /// A file beside the asset file.
+    File(crate::file::FileId),
+}
+
+/// Who read a stream range.
+#[derive(Debug)]
+struct Claim {
+    end: u64,
+    /// The file the texture is in, shared by all its claims.
+    owner: Arc<str>,
+    texture: i64,
+}
 
 /// Work reserved against [`Limits::max_total_work`], given back when dropped unless kept:
-/// work that fails before it is done costs nothing.
+/// a request refused before its work starts costs nothing. Work that has started is kept.
+#[must_use = "dropping a reservation gives the work back"]
 pub(crate) struct Reservation<'a> {
     shared: &'a Shared,
     amount: u64,
@@ -405,29 +442,62 @@ impl Shared {
         self.work.load(Ordering::Relaxed)
     }
 
-    /// Record that `owner` reads `start..end` of `stream`, refusing a range another texture
-    /// already read any part of: one blob decoded many times over.
-    #[allow(clippy::significant_drop_tightening)] // the check and the insert are one step
-    pub fn claim_stream(&self, stream: &str, start: u64, end: u64, owner: &str) -> Result<()> {
+    /// Record that texture `texture` of `owner` reads `start..end` of `stream`, refusing a
+    /// range another texture already read any part of: one blob decoded many times over.
+    /// `Ok(true)` when the claim is new, `Ok(false)` when this texture already held it.
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "the check and the insert are one step"
+    )]
+    pub fn claim_stream(
+        &self,
+        stream: StreamKey,
+        start: u64,
+        end: u64,
+        owner: &Arc<str>,
+        texture: i64,
+    ) -> Result<bool> {
         let mut streams = self
             .streams
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let ranges = streams.entry(stream.to_string()).or_default();
-        if let Some((&s, (e, who))) = ranges.range(..end).next_back() {
-            let same = s == start && *e == end && who == owner;
-            if *e > start && !same {
+        let ranges = streams.entry(stream).or_default();
+        if let Some((&s, earlier)) = ranges.range(..end).next_back() {
+            let same = s == start
+                && earlier.end == end
+                && earlier.texture == texture
+                && earlier.owner == *owner;
+            if same {
+                return Ok(false);
+            }
+            if earlier.end > start {
                 return Err(Error::Invalid(format!(
-                    "{owner} streams bytes {start}..{end} of {stream:?}, which {who} already \
-                     read ({s}..{e})"
+                    "texture {texture} of {owner:?} streams bytes that texture {} of {:?} \
+                     already read",
+                    earlier.texture, earlier.owner
                 )));
             }
-            if same {
-                return Ok(());
-            }
         }
-        ranges.insert(start, (end, owner.to_string()));
-        Ok(())
+        ranges.insert(
+            start,
+            Claim {
+                end,
+                owner: owner.clone(),
+                texture,
+            },
+        );
+        Ok(true)
+    }
+
+    /// Withdraw a claim [`Shared::claim_stream`] just made, whose texture was then refused.
+    pub fn release_stream(&self, stream: &StreamKey, start: u64) {
+        let mut streams = self
+            .streams
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(ranges) = streams.get_mut(stream) {
+            ranges.remove(&start);
+        }
     }
 }
 
@@ -477,10 +547,11 @@ impl Version {
         let build = rest
             .get(kind.len_utf8()..)
             .unwrap_or("")
-            .chars()
-            .take_while(char::is_ascii_digit)
-            .collect::<String>()
-            .parse()
+            .bytes()
+            .take_while(u8::is_ascii_digit)
+            .try_fold(0u32, |n, d| {
+                n.checked_mul(10)?.checked_add(u32::from(d - b'0'))
+            })
             .unwrap_or(0);
         Self {
             numbers,
@@ -494,12 +565,14 @@ impl Version {
     }
 
     /// Whether this is at least `numbers` of type `kind` build `build`: alphas come before
-    /// betas, betas before every released build of the same numbers.
+    /// betas, then China builds, finals and patches, as `UnityPy` orders them.
     pub fn at_least(&self, numbers: [u32; 3], kind: char, build: u32) -> bool {
         let rank = |k: char| match k {
             'a' => 0,
             'b' => 1,
-            _ => 2,
+            'c' => 2,
+            'p' => 4,
+            _ => 3,
         };
         (self.numbers, rank(self.kind), self.build) >= (numbers, rank(kind), build)
     }
@@ -542,9 +615,31 @@ pub(crate) fn check_release(version: &str, what: &str, oldest: [u32; 3]) -> Resu
     }
 }
 
+/// The integration tests' file builders, for unit tests that need a whole file.
+#[cfg(test)]
+#[path = "../tests/common/mod.rs"]
+mod test_common;
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_version_parts_default_to_zero() {
+        assert_eq!(Version::parse("2018.4").numbers, [2018, 4, 0]);
+        assert_eq!(Version::parse("5").numbers, [5, 0, 0]);
+        assert!(Version::parse("").stripped());
+        assert!(Version::parse("0.0.0").stripped());
+        assert!(!Version::parse("2018.4").stripped());
+        for (text, build) in [
+            ("2022.3.1f12", 12),
+            ("2022.3.1f9", 9),
+            ("2022.3.1b123", 123),
+            ("2022.3.1", 0),
+        ] {
+            assert_eq!(Version::parse(text).build, build, "{text}");
+        }
+    }
 
     #[test]
     fn test_version_parse() {
@@ -560,6 +655,28 @@ mod tests {
 
     #[test]
     fn test_version_order() {
+        let order = [
+            "2022.3.1a9",
+            "2022.3.1b2",
+            "2022.3.1c1",
+            "2022.3.1f1",
+            "2022.3.1p1",
+            "2022.3.2a1",
+        ];
+        for w in order.windows(2) {
+            let later = Version::parse(w[1]);
+            let earlier = Version::parse(w[0]);
+            assert!(
+                later.at_least(earlier.numbers, earlier.kind, earlier.build),
+                "{w:?}"
+            );
+            assert!(
+                !earlier.at_least(later.numbers, later.kind, later.build),
+                "{w:?}"
+            );
+        }
+        assert_eq!(Version::parse("2022.3.99999999999f1").numbers[2], 0);
+        assert_eq!(Version::parse("2022.3.1f99999999999").build, 0);
         let at = |v: &str| Version::parse(v).at_least([2022, 2, 0], 'b', 3);
         assert!(!at("2022.2.0b2"));
         assert!(at("2022.2.0b3"));

@@ -32,7 +32,7 @@ const LZ4_MAX_RATIO: usize = 255;
 pub struct Entry {
     path: String,
     flags: u32,
-    offset: usize,
+    pub(crate) offset: usize,
     size: usize,
 }
 
@@ -111,7 +111,7 @@ impl Bundle {
     ///
     /// As [`Bundle::open`].
     pub fn open_with(path: impl AsRef<std::path::Path>, limits: Limits) -> Result<Self> {
-        let data = crate::file::read_limited(path.as_ref(), limits.max_file_size)?;
+        let data = crate::file::read_limited(path.as_ref(), limits.max_file_size, check_head)?;
         Self::parse_with(&data, limits)
     }
 
@@ -130,27 +130,13 @@ impl Bundle {
     ///
     /// As [`Bundle::parse`].
     pub fn parse_with(file: &[u8], limits: Limits) -> Result<Self> {
-        if !is_bundle(file) {
-            for other in ["UnityWeb", "UnityRaw", "UnityArchive"] {
-                if file.starts_with(other.as_bytes()) {
-                    return Err(Error::Unsupported(format!("{other} bundle container")));
-                }
-            }
-            return Err(Error::NotUnity("no UnityFS signature".into()));
-        }
         let mut r = Reader::new(file, true);
-        r.cstr()?;
-        let format = r.u32()?;
-        if !(6..=8).contains(&format) {
-            return Err(Error::Unsupported(format!(
-                "UnityFS container format {format} (supported: 6-8)"
-            )));
-        }
-        let unity_version = r.cstr()?;
-        let unity_revision = r.cstr()?;
-        check_version_string(&unity_version, "bundle player")?;
-        check_version_string(&unity_revision, "bundle")?;
-        let declared_size = r.i64()?;
+        let Header {
+            format,
+            unity_version,
+            unity_revision,
+            declared_size,
+        } = header(&mut r)?;
         let info_compressed = r.u32()? as usize;
         let info_size = r.u32()? as usize;
         let flags = r.u32()?;
@@ -228,9 +214,12 @@ impl Bundle {
         charged += total;
         Error::limit(LimitKind::Decompressed, charged, budget)?;
         let entry_count = ir.len(21)?;
-        // Each entry is held once and indexed twice (by path and by file name).
-        let per_entry =
-            std::mem::size_of::<Entry>() + 2 * (std::mem::size_of::<(String, usize)>() + 16);
+        // Each entry is held once and indexed twice (by path and by file name). A hash map's
+        // table is rounded up to a power of two over 8/7 of its entries, up to about 2.3
+        // buckets an entry with a control byte each; and each of the three copies of the path
+        // carries the allocator's overhead, charged here at 32 bytes.
+        let bucket = std::mem::size_of::<(String, usize)>() + 1;
+        let per_entry = std::mem::size_of::<Entry>() + 2 * (bucket * 7 / 3) + 3 * 32;
         charged += entry_count as u64 * per_entry as u64;
         Error::limit(LimitKind::Decompressed, charged, budget)?;
         let mut entries = Vec::with_capacity(entry_count);
@@ -286,6 +275,16 @@ impl Bundle {
             })?;
         for (size, compressed, block_flags) in blocks {
             let block = r.take(compressed)?;
+            if block_flags & flags::COMPRESSION_MASK == 1 {
+                // LZMA's working memory is not part of its output: a table sized by the
+                // header's lc and lp for every block, and a dictionary as large as the output
+                // or the header's dictionary size, whichever is smaller. Held one block at a
+                // time, and charged against what the output leaves of the limit; the tables
+                // also add up, since many tiny blocks cost their setup many times over.
+                let (tables, dictionary) = lzma_memory(block, size)?;
+                charged += tables;
+                Error::limit(LimitKind::Decompressed, charged + dictionary, budget)?;
+            }
             decompress_into(
                 &mut data,
                 block,
@@ -313,7 +312,8 @@ impl Bundle {
         })
     }
 
-    /// Container format version (6 for Unity 5.x-2019.3, 7 from 2019.4, 8 from 2022).
+    /// Container format version: 6 for Unity 5.x to 2019.4, then 7 and 8 in later releases
+    /// (the release that introduced each is not pinned here).
     #[must_use]
     pub const fn format(&self) -> u32 {
         self.format
@@ -343,8 +343,9 @@ impl Bundle {
         self.limits
     }
 
-    /// One entry's bytes, or `None` for an entry from another bundle that does not fit this
-    /// one.
+    /// One entry's bytes, or `None` for an entry that does not fit this bundle. An [`Entry`]
+    /// is not tied to the bundle it came from: one from another bundle that fits reads this
+    /// bundle's bytes at its offsets.
     #[must_use]
     pub fn bytes(&self, entry: &Entry) -> Option<&[u8]> {
         self.data
@@ -404,6 +405,77 @@ fn decompress_into(out: &mut Vec<u8>, data: &[u8], size: usize, compression: u32
             "bundle compression {other} (supported: none, LZMA, LZ4, LZ4HC)"
         ))),
     }
+}
+
+/// A bundle's header, up to its declared size.
+struct Header {
+    format: u32,
+    unity_version: String,
+    unity_revision: String,
+    declared_size: i64,
+}
+
+fn header(r: &mut Reader<'_>) -> Result<Header> {
+    let file = r.rest();
+    if !is_bundle(file) {
+        for other in ["UnityWeb", "UnityRaw", "UnityArchive"] {
+            if file.starts_with(other.as_bytes()) {
+                return Err(Error::Unsupported(format!("{other} bundle container")));
+            }
+        }
+        return Err(Error::NotUnity("no UnityFS signature".into()));
+    }
+    r.cstr()?;
+    let format = r.u32()?;
+    if !(6..=8).contains(&format) {
+        return Err(Error::Unsupported(format!(
+            "UnityFS container format {format} (supported: 6-8)"
+        )));
+    }
+    let unity_version = r.cstr()?;
+    let unity_revision = r.cstr()?;
+    check_version_string(&unity_version, "bundle player")?;
+    check_version_string(&unity_revision, "bundle")?;
+    let declared_size = r.i64()?;
+    Ok(Header {
+        format,
+        unity_version,
+        unity_revision,
+        declared_size,
+    })
+}
+
+/// [`crate::file::HeadCheck`] for a bundle: its header, from its first bytes, must be one
+/// this crate reads; then the file is read up to the size the header declares (anything
+/// after that is not the bundle's).
+pub(crate) fn check_head(head: &[u8], len: u64) -> Result<u64> {
+    let Header { declared_size, .. } = header(&mut Reader::new(head, true))?;
+    Ok(u64::try_from(declared_size)
+        .ok()
+        .filter(|&n| n > 0 && n <= len)
+        .unwrap_or(len))
+}
+
+/// The working memory an LZMA block needs, `(tables, dictionary)` in bytes, from its
+/// properties header: `lc`, `lp` and `pb` within LZMA2's bounds (Unity writes lc 3, lp 0,
+/// pb 2), and a dictionary no larger than the output needs (a vector grown to it may hold
+/// twice that).
+fn lzma_memory(block: &[u8], size: usize) -> Result<(u64, u64)> {
+    let header = block
+        .get(..5)
+        .ok_or_else(|| Error::Invalid("LZMA block shorter than its 5-byte header".into()))?;
+    let props = u32::from(header[0]);
+    let (lc, lp, pb) = (props % 9, props / 9 % 5, props / 45);
+    if pb > 4 || lc + lp > 4 {
+        return Err(Error::Unsupported(format!(
+            "LZMA block with lc {lc}, lp {lp}, pb {pb} (lc + lp above 4 or pb above 4)"
+        )));
+    }
+    let dictionary = u64::from(u32::from_le_bytes(
+        header[1..5].try_into().unwrap_or([0; 4]),
+    ));
+    let tables = 2 * (0x300u64 << (lc + lp)) + 4096;
+    Ok((tables, 2 * dictionary.min(size as u64)))
 }
 
 /// Unity's LZMA: the 5-byte properties header, then the raw stream, with no size field. The
@@ -557,6 +629,15 @@ mod tests {
     }
 
     #[test]
+    fn test_lz4_says_how_much_it_made() {
+        // "abc", a match of 6: 9 bytes, not the 12 claimed.
+        let err = lz4(&[0x32, b'a', b'b', b'c', 3, 0, 0x00], 12)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("gave 9 bytes, header says 12"), "{err}");
+    }
+
+    #[test]
     fn test_lz4_shortest_match_from_one_byte() {
         // "a", then the shortest match (4) at offset 1: every copy pass has one byte to copy
         // from at first.
@@ -569,8 +650,9 @@ mod tests {
     fn test_lz4_refuses_impossible_ratio() {
         let err = lz4(&[0x00], 1 << 20).unwrap_err().to_string();
         assert!(err.contains("more output than LZ4 can encode"), "{err}");
-        // At the bound the claim is allowed through (and then fails on the real length).
-        let at_bound = LZ4_MAX_RATIO + 16;
+        // At the bound (255 to 1, plus 16) the claim is allowed through (and then fails on
+        // the real length).
+        let at_bound = 255 + 16;
         let err = lz4(&[0x00], at_bound).unwrap_err().to_string();
         assert!(!err.contains("more output than LZ4 can encode"), "{err}");
         let err = lz4(&[0x00], at_bound + 1).unwrap_err().to_string();

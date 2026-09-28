@@ -3,6 +3,11 @@
 
 use crate::{Error, Result};
 
+/// Longest string read from a file: names, paths, versions. Real ones are well under 1 KiB;
+/// the cap keeps every string the crate holds or quotes in an error small, whatever the file
+/// says.
+pub const MAX_STRING: usize = 4096;
+
 #[derive(Clone)]
 pub struct Reader<'a> {
     data: &'a [u8],
@@ -36,6 +41,11 @@ impl<'a> Reader<'a> {
     /// The cursor's offset.
     pub const fn pos(&self) -> usize {
         self.pos
+    }
+
+    /// The bytes after the cursor.
+    pub fn rest(&self) -> &'a [u8] {
+        &self.data[self.pos.min(self.data.len())..]
     }
 
     /// Bytes left after the cursor.
@@ -82,13 +92,24 @@ impl<'a> Reader<'a> {
         Ok(self.u8()? != 0)
     }
 
-    /// A NUL-terminated string, as used in serialized-file metadata.
+    /// A NUL-terminated string, as used in serialized-file metadata, of at most
+    /// [`MAX_STRING`] bytes.
     pub fn cstr(&mut self) -> Result<String> {
         let rest = &self.data[self.pos.min(self.data.len())..];
         let len = rest
             .iter()
+            .take(MAX_STRING + 1)
             .position(|&b| b == 0)
-            .ok_or(Error::Truncated(self.pos))?;
+            .ok_or_else(|| {
+                if rest.len() > MAX_STRING {
+                    Error::Invalid(format!(
+                        "string at byte {} is longer than {MAX_STRING} bytes",
+                        self.pos
+                    ))
+                } else {
+                    Error::Truncated(self.pos)
+                }
+            })?;
         let s = String::from_utf8_lossy(&rest[..len]).into_owned();
         self.pos += len + 1;
         Ok(s)
@@ -109,9 +130,14 @@ impl<'a> Reader<'a> {
         Ok(n as usize)
     }
 
-    /// A length-prefixed string followed by alignment to 4 bytes.
+    /// A length-prefixed string of at most [`MAX_STRING`] bytes, followed by alignment to 4
+    /// bytes.
     pub fn aligned_string(&mut self) -> Result<String> {
+        let at = self.pos;
         let n = self.len(1)?;
+        if n > MAX_STRING {
+            return Err(Error::BadLength { at, len: n as i64 });
+        }
         let s = String::from_utf8_lossy(self.take(n)?).into_owned();
         self.align(4);
         Ok(s)
@@ -123,5 +149,45 @@ impl<'a> Reader<'a> {
         let bytes = self.take(n)?;
         self.align(4);
         Ok(bytes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_strings_stop_at_4_kib() {
+        let at_most = |n: usize, nul: bool| {
+            let mut data = vec![b'x'; n];
+            if nul {
+                data.push(0);
+            }
+            Reader::new(&data, false).cstr().map(|s| s.len())
+        };
+        assert_eq!(at_most(MAX_STRING, true).unwrap(), MAX_STRING);
+        assert!(matches!(
+            at_most(MAX_STRING + 1, true),
+            Err(Error::Invalid(_))
+        ));
+        // Unterminated: cut short when the data ends first, too long when it does not.
+        assert!(matches!(
+            at_most(MAX_STRING, false),
+            Err(Error::Truncated(0))
+        ));
+        assert!(matches!(
+            at_most(MAX_STRING + 1, false),
+            Err(Error::Invalid(_))
+        ));
+        let prefixed = |n: usize| {
+            let mut data = (n as i32).to_le_bytes().to_vec();
+            data.extend(vec![b'x'; n]);
+            Reader::new(&data, false).aligned_string().map(|s| s.len())
+        };
+        assert_eq!(prefixed(MAX_STRING).unwrap(), MAX_STRING);
+        assert!(matches!(
+            prefixed(MAX_STRING + 1),
+            Err(Error::BadLength { at: 0, .. })
+        ));
     }
 }

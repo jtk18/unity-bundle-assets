@@ -49,8 +49,10 @@ and open each with `Assets::from_bundle`.
   A file whose engine version was stripped takes its bundle's.
 - `Texture2D` from Unity 5.5 through 6000.4, final and beta builds, with pixels inline or
   streamed from a `.resS` file beside the serialized file or inside the same bundle. Fields are
-  gated by engine release, checked against the engine's per-release type trees.
-- `Sprite` and `SpriteAtlas` from Unity 2019.1 through 6000.4.
+  gated by engine release, checked against the per-release type trees UnityPy ships, which
+  run to the 6000.4 betas.
+- `Sprite` and `SpriteAtlas` from Unity 2019.1 through 6000.4. Every object read must end
+  where its last field does, so a layout misread is an error rather than wrong numbers.
 - Packing rotation and flips, and tight packing (pixels outside the sprite's mesh are cleared,
   colour and alpha).
 - Texture formats Alpha8, RGB24, RGBA32, ARGB32, BGRA32, DXT1 (BC1), DXT5 (BC3).
@@ -74,39 +76,58 @@ Each of these gives an error naming it:
 - Every texture format not listed above, among them crunch-compressed, BC4-7, ETC, EAC, ASTC,
   PVRTC, RGB565, ARGB4444, RGBA4444, R8, R16, RG16 and the half- and float-precision formats.
 - Textures from files built for consoles (PlayStation, Xbox, Switch, Wii U, 3DS), whose GPU
-  tiling this crate does not undo.
+  tiling this crate does not undo. This is a list of known console platforms: a file for a
+  console Unity adds later would be decoded as if untiled.
 - Sprites whose alpha is in a separate texture, sprites in a downscaled atlas, and tight-packed
   sprites whose mesh this crate cannot read.
-- Textures and atlases that live in another serialized file.
+- Textures and atlases that live in another serialized file, and sprites that find their atlas
+  only by tag at run time (no atlas reference in the file).
+- Textures whose smaller mip levels were stripped from the build.
 
 ## Untrusted input
 
 Files are treated as hostile:
 
 - Counts and lengths are checked against the bytes present, at each record's real minimum
-  size, before they size an allocation. Objects may not overlap or share an ID, bundle entries
-  may not overlap, and a range of a stream file may be read by one texture only, so one blob
-  cannot be decoded many times over.
+  size, before they size an allocation. Every string read (names, paths, versions) is at most
+  4 KiB, so nothing the crate holds or quotes in an error grows with a lying length.
+- One blob cannot be decoded many times over: objects may not overlap or share an ID, bundle
+  entries and a sprite's sub-meshes may not overlap, and a range of stream data may be read by
+  one texture only. Ranges are compared by the bytes they reach, not by how the path to them
+  is spelled; a texture may not stream from a serialized file.
+- A file is checked by its header before the rest is read, and a bundle is read only up to
+  the size its header declares.
 - Sizes the data alone cannot bound are held to `Limits`, which a caller can lower: file size
-  (2 GiB), decompressed bundle size counting the parsed directory (1 GiB), objects per file
-  (4M), pixels per texture (16384 x 16384), triangles per sprite (65,536) and per `sprites`
-  call (4M), mask work per sprite (2^29), and total work (2^34): every pixel decoded, masked
-  and copied. The total is shared by every `Assets` opened from one `Bundle`, and work that
-  fails or is refused is not charged. The lower layers (`SerializedFile`, `Texture2D`,
-  `decode`) apply the per-item limits but keep no total; a caller using them directly counts
-  its own.
+  (2 GiB); decompressed bundle size (1 GiB), which also counts the parsed directory and LZMA's
+  working memory (its tables for every block, and its dictionary); objects per file (4M);
+  pixels per texture (16384 x 16384); triangles per sprite (65,536) and per `sprites` call
+  (4M); mask work per sprite (2^29); and total work (2^34): every pixel decoded, masked and
+  copied. The total is shared by every `Assets` opened from one `Bundle` (two `Assets::open`
+  calls on one path are two totals). Work is reserved before it starts; a request refused
+  then, or data refused before it is read, costs nothing, and work once started is kept.
+- `Assets` enforces all of that. Used directly, `Bundle` and `SerializedFile` apply their own
+  limits, `Texture2D` refuses data too short for its size, and `decode::decode` applies none;
+  a caller using them counts its own work.
 - The limits bound work, not peak memory. At the default 16384 x 16384, decoding one texture
   can hold 1 to 2 GiB (the stored pixels and the RGBA result), and exporting a sprite from it
-  2 to 3 GiB. Lower `max_texture_pixels` where that matters.
+  up to 3 GiB; each thread decoding and cutting in parallel holds about that much. LZMA can
+  expand a 150 KB file to the full 1 GiB of decompressed data. A bundle is decompressed whole
+  when it is opened, and one parsed from bytes briefly holds both the file and its
+  decompressed copy. Lower `max_texture_pixels` and `max_decompressed` where that matters.
 - Streamed pixels are read only from the same bundle, or from a `.resS` / `.resource` file
-  directly beside the asset file: a regular file, not a symbolic link, with no other hard
-  links, and not named like a Windows device (`CON`, `NUL`, `COM1`, ...) or an alternate data
-  stream (`:`). Files are opened without blocking and without taking a controlling terminal,
-  and on Unix the file opened must be the one checked. On Windows a file swapped in between
-  the check and the open is not detected.
+  directly beside the asset file: one plain file name, a regular file, not a symbolic link,
+  and not named like a Windows device however spelled (`CON`, `nul .resS`, `COM1`, ...) or an
+  alternate data stream (`:`). Files are opened without blocking and without taking a
+  controlling terminal (on Unix targets whose flag values the crate knows; elsewhere a FIFO
+  put in place between check and open can block it). On Unix the file opened must be the one
+  checked and have no other hard links. On Windows neither a file swapped in between check and open nor a hard link is
+  detected. The folder itself is looked up by path for each texture, so whoever can rename
+  folders on the way to it while a program runs can point the next read elsewhere.
 - Strings from the file are quoted in error messages, so printing an error cannot send control
   sequences to a terminal. Strings the API returns (names, paths) are the file's raw text:
   escape them before printing.
+- `ObjectInfo` and `Entry` values are not tied to the file they came from: given to another
+  file's readers they read that file's bytes at their offsets.
 
 Malformed input is meant to give an error rather than a panic. `tests/fuzz.rs` checks that
 over mutated files (set `UBA_FUZZ_ITERS` to run longer); it is evidence, not proof.
@@ -118,9 +139,11 @@ over mutated files (set `UBA_FUZZ_ITERS` to run longer); it is evidence, not pro
   BC7). Against UnityPy, 8,878 sprites are pixel-identical, 557 differ only in the colour of
   fully transparent pixels (masking clears it; UnityPy keeps the texel), and one differs in 2
   pixels at a mask edge. Exporting every sprite and decoding every texture of that file takes
-  4.6 s and 0.96 GB of memory on an Apple silicon Mac. In its `resources.assets`, 174 of 176 sprites
-  export (two use a texture in another file); 164 match UnityPy up to transparent colour and
-  10 differ at mask edges, in 1 to 136 pixels each.
+  4.6 s and 0.96 GB of memory on an Apple silicon Mac. In its `resources.assets`, 174 of 176
+  sprites export (two use a texture in another file); 164 match UnityPy up to transparent
+  colour and 10 differ at mask edges, in 1 to 136 pixels each. Across all 145 of the build's
+  asset files and bundles, 5,983 textures decode; the 75 that do not are 43 empty, 21 BC7, 10
+  RGBAFloat and one RHalf.
 - 737 asset bundles from a Unity 5.6.6, 5.6.7 and 2018.4 (.2, .11, .36) game and its mods: all
   open, and 15,193 textures export; the one failure is a dynamic font texture stored empty. On
   a sample of 171 bundles, 3,042 of the 3,056 textures UnityPy could decode are pixel-identical
@@ -130,6 +153,9 @@ over mutated files (set `UBA_FUZZ_ITERS` to run longer); it is evidence, not pro
   the crate: `Texture2D` in the layouts of fifteen engine releases from 5.6 to 6000.4, every
   metadata section, sprites with every packing rotation, mesh layout and mask case, atlases,
   big-endian files, every bundle container variant and flag, and hostile files for each limit.
+  Real files cover only 5.6, 2018.4 and 2022.3; the version gates between and after rest on
+  the type trees and on those built files, written from the same reading of them. No real
+  file here has a rotated or flipped sprite.
 
 The examples are the tools used to work out and check the layouts:
 
@@ -143,8 +169,10 @@ cargo run --release --example textures -- <file-or-bundle> <out-dir> [name-prefi
 
 ## Minimum Rust version
 
-1.83 for the library (its `crc` dependency sets that floor). The tests and examples use the
-`image` crate, which needs 1.88.
+1.83 for the library, set by its `crc` dependency and by its own `const fn`s that take
+`&mut self`. Checked with Clippy's `incompatible_msrv` and by building on 1.85, the oldest
+toolchain at hand; not yet built on 1.83 itself. The tests and examples use the `image`
+crate, which needs 1.88.
 
 ## License
 

@@ -7,12 +7,12 @@ use crate::decode;
 use crate::serialized::{class, SerializedFile};
 use crate::sprite::{Placement, Rotation, Sprite, SpriteAtlas};
 use crate::texture::{is_console_platform, Texture2D};
-use crate::{Error, LimitKind, Limits, Reservation, Result, Shared};
+use crate::{Error, LimitKind, Limits, Reservation, Result, Shared, StreamKey};
 
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, RwLock};
 
 /// An RGBA8 image, top row first.
 #[derive(Clone, PartialEq, Eq)]
@@ -99,6 +99,10 @@ impl std::fmt::Debug for SpriteList {
         f.debug_struct("SpriteList")
             .field("sprites", &self.sprites.len())
             .field("skipped", &self.skipped.len())
+            .field(
+                "first_skipped",
+                &self.skipped.first().map(|s| (s.path_id, &s.error)),
+            )
             .finish()
     }
 }
@@ -121,20 +125,23 @@ pub struct SkippedSprite {
 /// Single-threaded: call [`Assets::export`] on sprites from [`Assets::sprites`]. Parallel:
 /// group sprites by [`Assets::texture_id`], then per group [`Assets::decode_texture`] once and
 /// [`Assets::cut`] each sprite; both take `&self`, and `Assets` is `Send + Sync`. Each thread
-/// then holds a decoded texture, up to 1 GiB at the default limits.
+/// then holds a decoded texture and the sprite cut from it: up to about 2 GiB at the default
+/// limits, more while a mask is built. Lower [`Limits::max_texture_pixels`] to bound it.
 ///
-/// Everything opened from one file or bundle shares one [`Limits::max_total_work`].
+/// One `Assets` has one [`Limits::max_total_work`], shared with every `Assets` opened from the
+/// same [`Bundle`]. Under that limit, which of several threads is refused depends on timing.
 pub struct Assets {
     file: SerializedFile,
     streams: Streams,
-    /// This file, as named in errors about stream ranges.
-    owner: String,
-    /// Atlases by path ID, read when first needed; one that fails to read is kept as its
-    /// error, so it spoils only the sprites packed into it.
-    atlases: HashMap<i64, OnceLock<std::result::Result<SpriteAtlas, Arc<Error>>>>,
-    /// The most recently decoded texture. Sprites sharing an atlas decode it once when
-    /// exported in texture order (see [`Assets::sprites`]).
-    cache: Option<(i64, Image)>,
+    /// This file (or its folder, when only that is known), as named in errors about stream
+    /// ranges.
+    owner: Arc<str>,
+    /// Atlases read so far, by path ID; one that fails to read is kept as its error, so it
+    /// spoils only the sprites packed into it. Only atlases a sprite asks for are held.
+    atlases: RwLock<HashMap<i64, Arc<AtlasResult>>>,
+    /// The most recently decoded texture, or why it could not be. Sprites sharing an atlas
+    /// decode it once when exported in texture order (see [`Assets::sprites`]).
+    cache: Option<(i64, std::result::Result<Image, Arc<Error>>)>,
     shared: Arc<Shared>,
 }
 
@@ -142,12 +149,14 @@ impl std::fmt::Debug for Assets {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Assets")
             .field("file", &self.file)
-            .field("atlases", &self.atlases.len())
+            .field("atlases", &self.atlases.read().map_or(0, |a| a.len()))
             .field("cached_texture", &self.cache.as_ref().map(|(id, _)| id))
             .field("work_done", &self.shared.work())
             .finish_non_exhaustive()
     }
 }
+
+type AtlasResult = std::result::Result<SpriteAtlas, Arc<Error>>;
 
 /// Where streamed texture data lives.
 enum Streams {
@@ -185,17 +194,29 @@ impl Assets {
     /// As [`Assets::open`].
     pub fn open_with(path: impl AsRef<Path>, limits: Limits) -> Result<Self> {
         let path = path.as_ref();
-        let data = crate::file::read_limited(path, limits.max_file_size)?;
-        Self::from_bytes(data, folder_of(path), limits)
+        let data = crate::file::read_limited(path, limits.max_file_size, |head, len| {
+            if bundle::is_bundle(head) {
+                bundle::check_head(head, len)
+            } else {
+                crate::serialized::check_head(head, len)
+            }
+        })?;
+        let mut assets = Self::from_bytes(data, folder_of(path), limits)?;
+        if matches!(assets.streams, Streams::Dir(_)) {
+            assets.owner = path.display().to_string().into();
+        }
+        Ok(assets)
     }
 
     /// Open a serialized file or single-file bundle from its bytes. A serialized file's
-    /// streamed textures are read from `stream_dir`.
+    /// streamed textures are read from `stream_dir`; a bundle's come from the bundle, and
+    /// `stream_dir` is not used.
     ///
     /// # Errors
     ///
     /// As [`Assets::open`].
     pub fn from_bytes(data: Vec<u8>, stream_dir: impl AsRef<Path>, limits: Limits) -> Result<Self> {
+        Error::limit(LimitKind::FileSize, data.len() as u64, limits.max_file_size)?;
         if !bundle::is_bundle(&data) {
             let file = SerializedFile::parse_with(data, limits)?;
             return Self::from_serialized(file, stream_dir);
@@ -240,7 +261,7 @@ impl Assets {
         Ok(Self::new(
             file,
             Streams::Bundle(bundle),
-            entry.path().to_string(),
+            entry.path().into(),
             shared,
         ))
     }
@@ -259,7 +280,7 @@ impl Assets {
             dir
         };
         let dir = std::path::absolute(dir).map_err(Error::io(dir))?;
-        let owner = dir.display().to_string();
+        let owner = dir.display().to_string().into();
         Ok(Self::new(
             file,
             Streams::Dir(dir),
@@ -268,18 +289,12 @@ impl Assets {
         ))
     }
 
-    fn new(file: SerializedFile, streams: Streams, owner: String, shared: Arc<Shared>) -> Self {
-        let atlases = file
-            .objects()
-            .iter()
-            .filter(|o| o.class_id() == class::SPRITE_ATLAS)
-            .map(|o| (o.path_id(), OnceLock::new()))
-            .collect();
+    fn new(file: SerializedFile, streams: Streams, owner: Arc<str>, shared: Arc<Shared>) -> Self {
         Self {
             file,
             streams,
             owner,
-            atlases,
+            atlases: RwLock::default(),
             cache: None,
             shared,
         }
@@ -303,17 +318,25 @@ impl Assets {
             .reserve(amount, self.file.limits().max_total_work)
     }
 
-    /// The atlas with this path ID, read on first use.
-    fn atlas(&self, id: i64) -> Option<&std::result::Result<SpriteAtlas, Arc<Error>>> {
-        self.atlases.get(&id).map(|cell| {
-            cell.get_or_init(|| {
-                self.file
-                    .object(id)
-                    .ok_or_else(|| Error::NotFound(format!("atlas {id}")))
-                    .and_then(|o| SpriteAtlas::read(&self.file, o))
-                    .map_err(Arc::new)
-            })
-        })
+    /// The atlas with this path ID, read on first use; `None` when this file has no atlas
+    /// object with that ID. Two threads asking at once may both read it; one result is kept.
+    fn atlas(&self, id: i64) -> Option<Arc<AtlasResult>> {
+        use std::sync::PoisonError;
+        if let Some(atlas) = self
+            .atlases
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&id)
+        {
+            return Some(atlas.clone());
+        }
+        let object = self
+            .file
+            .object(id)
+            .filter(|o| o.class_id() == class::SPRITE_ATLAS)?;
+        let read = Arc::new(SpriteAtlas::read(&self.file, object).map_err(Arc::new));
+        let mut atlases = self.atlases.write().unwrap_or_else(PoisonError::into_inner);
+        Some(atlases.entry(id).or_insert(read).clone())
     }
 
     /// Every sprite whose name passes `keep`, ordered by the texture holding its pixels so
@@ -363,7 +386,7 @@ impl Assets {
         if sprite.atlas.is_null() || sprite.atlas.file_id != 0 {
             return own;
         }
-        match self.atlas(sprite.atlas.path_id) {
+        match self.atlas(sprite.atlas.path_id).as_deref() {
             Some(Ok(atlas)) => atlas
                 .placement(&sprite.render_data_key)
                 .map(|p| p.texture.path_id)
@@ -423,7 +446,7 @@ impl Assets {
             };
         }
         let id = sprite.atlas.path_id;
-        match self.atlas(id) {
+        match self.atlas(id).as_deref() {
             Some(Ok(atlas)) => match atlas.placement(&sprite.render_data_key) {
                 Some(p) => Ok(p),
                 None if own_texture => Ok(sprite.own),
@@ -472,16 +495,35 @@ impl Assets {
                 format: texture.format,
             });
         }
-        let reservation = self.reserve(pixels)?;
-        if let Some(stream) = &texture.stream {
-            let owner = format!("texture {path_id} of {:?}", self.owner);
-            let end = stream.offset.saturating_add(u64::from(stream.size));
-            self.shared
-                .claim_stream(&stream.path, stream.offset, end, &owner)?;
-        }
+        // A streamed texture claims its range, then reserves its work, before any of it is
+        // read: a texture refused its range takes no budget, and one refused the budget gives
+        // its range back, so which textures succeed does not depend on thread timing.
+        let mut reservation = None;
+        let mut claim = |stream: StreamKey, start, end| {
+            let new = self
+                .shared
+                .claim_stream(stream.clone(), start, end, &self.owner, path_id)?;
+            match self.reserve(pixels) {
+                Ok(r) => {
+                    reservation = Some(r);
+                    Ok(())
+                }
+                Err(e) => {
+                    if new {
+                        self.shared.release_stream(&stream, start);
+                    }
+                    Err(e)
+                }
+            }
+        };
         let data = match &self.streams {
-            Streams::Dir(dir) => texture.data(dir)?,
-            Streams::Bundle(bundle) => texture.data_in(bundle)?,
+            Streams::Dir(dir) => texture.data_claimed(dir, &mut claim)?,
+            Streams::Bundle(bundle) => texture.data_in_claimed(bundle, &mut claim)?,
+        };
+        // Inline pixels claim nothing; they reserve here, with nothing read yet.
+        let reservation = match reservation {
+            Some(r) => r,
+            None => self.reserve(pixels)?,
         };
         let (format, width, height) = (texture.format, texture.width, texture.height);
         let rgba = match data {
@@ -501,23 +543,30 @@ impl Assets {
     }
 
     /// Export one sprite, decoding its texture unless it's the one decoded last. The decoded
-    /// texture stays cached until the next texture or [`Assets::clear_cache`].
+    /// texture, or the reason it could not be decoded, stays cached until the next texture or
+    /// [`Assets::clear_cache`], so a texture that fails is tried once, not once per sprite.
     ///
     /// # Errors
     ///
-    /// As [`Assets::decode_texture`] and [`Assets::cut`].
+    /// As [`Assets::cut`]; when the texture cannot be decoded,
+    /// [`Error::TextureUnreadable`] holding the reason.
     pub fn export(&mut self, sprite: &Sprite) -> Result<Image> {
         let placement = self.placement(sprite)?;
         let texture = texture_id_of(sprite, &placement)?;
-        if self.cache.as_ref().is_none_or(|(id, _)| *id != texture) {
-            self.cache = None;
-            let image = self.decode_texture(texture)?;
-            self.cache = Some((texture, image));
-        }
-        match &self.cache {
-            Some((_, image)) => self.cut_at(sprite, &placement, image),
-            None => Err(Error::NotFound(format!("texture {texture}"))),
-        }
+        let decoded = match self.cache.take() {
+            Some((id, decoded)) if id == texture => decoded,
+            // Dropping the old texture first, so two are never held at once.
+            _ => self.decode_texture(texture).map_err(Arc::new),
+        };
+        let image = match &decoded {
+            Ok(image) => self.cut_at(sprite, &placement, image),
+            Err(error) => Err(Error::TextureUnreadable {
+                texture,
+                error: error.clone(),
+            }),
+        };
+        self.cache = Some((texture, decoded));
+        image
     }
 
     /// Drop the texture [`Assets::export`] keeps cached.
@@ -575,12 +624,12 @@ impl Assets {
             (false, _) => None,
             (true, None) => {
                 return Err(Error::Unsupported(format!(
-                    "sprite {name:?} is tight-packed, and its mesh is not one this crate reads"
+                    "sprite {name:?} is cut out by its mesh, which is not one this crate reads"
                 )))
             }
             (true, Some(t)) if t.is_empty() => {
                 return Err(Error::Invalid(format!(
-                    "sprite {name:?} is tight-packed, and its mesh is empty"
+                    "sprite {name:?} is cut out by its mesh, which is empty"
                 )))
             }
             (true, Some(t)) => Some(t.as_slice()),
@@ -621,11 +670,16 @@ impl Assets {
         } else {
             (w, h)
         };
-        let coverage = match triangles {
-            Some(t) => Some(self.coverage(sprite, t, placement, sw, sh)?),
+        // The mask's work and the copy's, reserved together before either starts and kept
+        // from then on: work done is never given back.
+        let mask = match triangles {
+            Some(t) => Some(self.plan_mask(sprite, t, placement, sw, sh)?),
             None => None,
         };
-        let copying = self.reserve(u64::from(sw) * u64::from(sh))?;
+        let mask_work = mask.as_ref().map_or(0, |m| m.work);
+        self.reserve(mask_work + u64::from(sw) * u64::from(sh))?
+            .keep();
+        let coverage = mask.map(|m| m.fill(sw, sh));
 
         // The texel under sprite-space pixel (sx, sy): undo the rotation to get the crop
         // pixel (cx, cy), counted from the rect's bottom left, then find it in the top-down
@@ -645,12 +699,12 @@ impl Assets {
         };
         let out_row = sw as usize * 4;
         let mut rgba = vec![0u8; out_row * sh as usize];
+        let whole_rows =
+            coverage.is_none() && matches!(rotation, Rotation::Unrotated | Rotation::FlipVertical);
         for (oy, line) in rgba.chunks_exact_mut(out_row.max(1)).enumerate() {
             // Output rows run top first; sprite space counts from the bottom.
             let sy = sh - 1 - oy as u32;
-            let whole_row = coverage.is_none()
-                && matches!(rotation, Rotation::Unrotated | Rotation::FlipVertical);
-            if whole_row {
+            if whole_rows {
                 let start = texel(0, crop(0, sy).1);
                 line.copy_from_slice(&texture.rgba[start..start + out_row]);
                 continue;
@@ -658,7 +712,7 @@ impl Assets {
             for (sx, px) in (0..sw).zip(line.chunks_exact_mut(4)) {
                 let masked_out = coverage
                     .as_ref()
-                    .is_some_and(|(c, _)| !c[sy as usize * sw as usize + sx as usize]);
+                    .is_some_and(|c| !c[sy as usize * sw as usize + sx as usize]);
                 if masked_out {
                     continue;
                 }
@@ -667,10 +721,6 @@ impl Assets {
                 px.copy_from_slice(&texture.rgba[at..at + 4]);
             }
         }
-        copying.keep();
-        if let Some((_, masking)) = coverage {
-            masking.keep();
-        }
         Ok(Image {
             width: sw,
             height: sh,
@@ -678,20 +728,22 @@ impl Assets {
         })
     }
 
-    /// Which pixels of the `w` x `h` sprite-space image (rows bottom first) the mesh covers:
-    /// a pixel is kept when any of four sample points in it (see [`SAMPLES`]) lies in a
-    /// triangle.
-    /// Mesh vertices are in sprite units around the pivot. The work, one test per pixel of
-    /// each triangle's bounding box, is counted before any is done and held to
-    /// [`Limits::max_mask_work`] and the total.
-    fn coverage(
+    /// The mask for the `w` x `h` sprite-space image (rows bottom first): each triangle
+    /// mapped into pixels, with the pixels its box could touch. Mesh vertices are in sprite
+    /// units around the pivot. The work, one test per pixel of each box, is counted here and
+    /// held to [`Limits::max_mask_work`]; the caller reserves it before [`Mask::fill`].
+    #[allow(
+        clippy::many_single_char_names,
+        reason = "a triangle's corners a, b, c and its points p, as in the geometry"
+    )]
+    fn plan_mask(
         &self,
         sprite: &Sprite,
         triangles: &[[[f32; 2]; 3]],
         placement: &Placement,
         w: u32,
         h: u32,
-    ) -> Result<(Vec<bool>, Reservation<'_>)> {
+    ) -> Result<Mask> {
         let name = &sprite.name;
         let scale = sprite.pixels_to_units;
         let dx = sprite.rect.width * sprite.pivot[0] - placement.texture_rect_offset[0];
@@ -729,14 +781,31 @@ impl Assets {
         }
         if boxes.is_empty() {
             return Err(Error::Invalid(format!(
-                "sprite {name:?} is tight-packed, and no triangle of its mesh has any area"
+                "sprite {name:?} is cut out by its mesh, and no triangle of it has any area"
             )));
         }
         Error::limit(LimitKind::MaskWork, work, self.file.limits().max_mask_work)?;
-        let reservation = self.reserve(work)?;
+        Ok(Mask { boxes, work })
+    }
+}
 
+/// Triangles in pixel space, each with the pixel ranges its box covers.
+struct Mask {
+    boxes: Vec<TriangleBox>,
+    work: u64,
+}
+
+/// A triangle's corners in pixels, and the columns and rows its bounding box covers.
+type TriangleBox = ([[f32; 2]; 3], std::ops::Range<u32>, std::ops::Range<u32>);
+
+impl Mask {
+    /// Which pixels of the `w` x `h` image the mesh covers: a pixel is kept when any of four
+    /// sample points in it (see [`SAMPLES`]) lies in a triangle.
+    fn fill(self, w: u32, h: u32) -> Vec<bool> {
+        #[cfg(test)]
+        tests::MASKS_FILLED.with(|n| n.set(n.get() + 1));
         let mut covered = vec![false; w as usize * h as usize];
-        for ([a, b, c], xs, ys) in boxes {
+        for ([a, b, c], xs, ys) in self.boxes {
             // On or inside all three edges, whichever way the triangle winds.
             let inside = |px: f32, py: f32| {
                 let side = |p: [f32; 2], q: [f32; 2]| {
@@ -756,12 +825,12 @@ impl Assets {
                 }
             }
         }
-        Ok((covered, reservation))
+        covered
     }
 }
 
 /// Where a pixel is sampled for the mask: at the quarter points. Of the rules measured
-/// against UnityPy's polygon fill on real sprites (pixel centre only, any overlap, these four,
+/// against `UnityPy`'s polygon fill on real sprites (pixel centre only, any overlap, these four,
 /// two of five), keeping a pixel when any of these four is covered disagreed on the fewest
 /// pixels.
 const SAMPLES: [(f32, f32); 4] = [(0.25, 0.25), (0.75, 0.25), (0.25, 0.75), (0.75, 0.75)];
@@ -785,6 +854,70 @@ fn texture_id_of(sprite: &Sprite, placement: &Placement) -> Result<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    thread_local! {
+        pub static MASKS_FILLED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    #[test]
+    fn test_a_mask_refused_for_the_total_is_never_built() {
+        use crate::test_common::*;
+        // A tight 4x4 sprite: decode 16, mask 16, copy 16.
+        let tri = Mesh {
+            vertices: &[[0.0, 0.0], [4.0, 0.0], [0.0, 4.0]],
+            indices: &[0, 1, 2],
+            ..Mesh::BASE
+        };
+        let r = [0.0, 0.0, 4.0, 4.0];
+        let s = sprite(
+            false,
+            false,
+            "s",
+            r,
+            [0.0, 0.0],
+            1,
+            0,
+            10,
+            0,
+            r,
+            0,
+            1.0,
+            &tri,
+        );
+        let tex = texture(
+            Layout::U2022_3,
+            false,
+            "t",
+            4,
+            4,
+            format::RGBA32,
+            &Pixels::Inline(&[9; 64]),
+            &[],
+        );
+        let file = serialized(
+            22,
+            "2022.3.62f1",
+            false,
+            19,
+            &[(10, TEXTURE_2D, tex), (1, SPRITE, s)],
+        );
+        for (limit, masks) in [(47, 0), (48, 1)] {
+            let file = SerializedFile::parse_with(
+                file.clone(),
+                Limits::DEFAULT.with_max_total_work(limit),
+            )
+            .unwrap();
+            let mut a = Assets::from_serialized(file, "").unwrap();
+            let list = a.sprites(|_| true);
+            MASKS_FILLED.with(|n| n.set(0));
+            let _ = a.export(&list.sprites[0]);
+            assert_eq!(
+                MASKS_FILLED.with(std::cell::Cell::get),
+                masks,
+                "limit {limit}"
+            );
+        }
+    }
 
     #[test]
     fn test_image_new_checks_length() {

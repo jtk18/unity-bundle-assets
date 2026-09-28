@@ -94,8 +94,40 @@ const fn links(_: &Metadata) -> u64 {
     1
 }
 
+/// Which file an open handle is, however its path was spelled: device and inode on Unix, the
+/// lower-cased file name elsewhere (so `A.resS` and `a.resS` are one file on a case-blind
+/// system, and possibly two different files are taken for one: the safe mistake).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum FileId {
+    #[cfg(unix)]
+    Inode(u64, u64),
+    #[cfg(not(unix))]
+    Name(String),
+}
+
+pub(crate) fn identity(file: &File, path: &Path) -> Result<FileId> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let m = file.metadata().map_err(Error::io(path))?;
+        Ok(FileId::Inode(m.dev(), m.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = file;
+        Ok(FileId::Name(
+            path.file_name()
+                .map(|n| n.to_string_lossy().to_lowercase())
+                .unwrap_or_default(),
+        ))
+    }
+}
+
 /// `(O_NONBLOCK, O_NOFOLLOW, O_NOCTTY)` for this target, where the values are certain.
-#[allow(clippy::unnecessary_wraps)]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "always Some on some targets, always None on others"
+)]
 const fn flags() -> Option<(i32, i32, i32)> {
     #[cfg(any(
         target_os = "macos",
@@ -112,7 +144,7 @@ const fn flags() -> Option<(i32, i32, i32)> {
         target_os = "dragonfly"
     ))]
     return Some((0x0004, 0x0100, 0x8000));
-    #[cfg(target_os = "illumos")]
+    #[cfg(any(target_os = "illumos", target_os = "solaris"))]
     return Some((0x80, 0x20000, 0x800));
     #[cfg(all(
         any(target_os = "linux", target_os = "android"),
@@ -139,7 +171,10 @@ const fn flags() -> Option<(i32, i32, i32)> {
     return Some((0x80, 0x20000, 0x800));
     #[cfg(all(target_os = "linux", target_arch = "sparc64"))]
     return Some((0x4000, 0x20000, 0x8000));
-    #[allow(unreachable_code)]
+    #[allow(
+        unreachable_code,
+        reason = "reached only on targets without a table entry"
+    )]
     None
 }
 
@@ -163,14 +198,39 @@ pub(crate) fn open_flagged(path: &Path, chosen: Chosen) -> Result<File> {
     options.open(path).map_err(Error::io(path))
 }
 
-/// Read a whole file the caller chose, under a size limit, refusing anything irregular. A
-/// file that grows past the limit while being read is refused too.
-pub(crate) fn read_limited(path: &Path, limit: u64) -> Result<Vec<u8>> {
+/// How much of a file its first bytes justify reading.
+pub(crate) type HeadCheck = fn(head: &[u8], len: u64) -> Result<u64>;
+
+/// Bytes read before [`HeadCheck`] decides on the rest.
+const HEAD: u64 = 64 * 1024;
+
+/// Read a file the caller chose, under a size limit, refusing anything irregular. The first
+/// bytes are read and checked before the rest, so a large file that is not what its header
+/// claims (a sparse file, say) is refused before it is read; `check` says how many bytes to
+/// read in all. A file that grows past the limit while being read is refused too.
+pub(crate) fn read_limited(path: &Path, limit: u64, check: HeadCheck) -> Result<Vec<u8>> {
     use std::io::Read;
-    let (file, len) = open_regular(path, Chosen::ByCaller)?;
+    let (mut file, len) = open_regular(path, Chosen::ByCaller)?;
     Error::limit(crate::LimitKind::FileSize, len, limit)?;
-    let mut data = Vec::with_capacity(usize::try_from(len).unwrap_or(0));
-    file.take(limit.saturating_add(1))
+    let mut data = Vec::new();
+    file.by_ref()
+        .take(HEAD.min(len))
+        .read_to_end(&mut data)
+        .map_err(Error::io(path))?;
+    let want = check(&data, len)?.min(len);
+    data.truncate(usize::try_from(want).unwrap_or(usize::MAX));
+    data.try_reserve_exact(
+        usize::try_from(want)
+            .unwrap_or(usize::MAX)
+            .saturating_sub(data.len()),
+    )
+    .map_err(|_| Error::LimitExceeded {
+        kind: crate::LimitKind::FileSize,
+        value: want,
+        limit,
+    })?;
+    let rest = want.saturating_sub(data.len() as u64);
+    file.take(rest.min(limit.saturating_add(1)))
         .read_to_end(&mut data)
         .map_err(Error::io(path))?;
     Error::limit(crate::LimitKind::FileSize, data.len() as u64, limit)?;
@@ -209,6 +269,38 @@ mod tests {
         // Skip the metadata check and open directly: the flags alone must refuse the link.
         assert!(open_flagged(&d.join("link.resS"), Chosen::ByData).is_err());
         assert!(open_flagged(&d.join("link.resS"), Chosen::ByCaller).is_ok());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn test_only_what_the_head_justifies_is_read() {
+        let d = dir("head");
+        let f = std::fs::File::create(d.join("sparse")).unwrap();
+        f.set_len(1 << 30).unwrap(); // 1 GiB, all holes
+        drop(f);
+        let data = read_limited(&d.join("sparse"), 2 << 30, |head, len| {
+            assert_eq!((head.len(), len), (64 * 1024, 1 << 30));
+            Ok(100)
+        })
+        .unwrap();
+        assert_eq!(data.len(), 100);
+        let refused = read_limited(&d.join("sparse"), 2 << 30, |_, _| {
+            Err(Error::NotUnity("test".into()))
+        });
+        assert!(matches!(refused, Err(Error::NotUnity(_))));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn test_a_read_only_file_opens() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = dir("readonly");
+        let p = d.join("r.assets");
+        std::fs::write(&p, b"x").unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o444)).unwrap();
+        for chosen in [Chosen::ByCaller, Chosen::ByData] {
+            assert!(open_flagged(&p, chosen).is_ok());
+        }
         let _ = std::fs::remove_dir_all(&d);
     }
 

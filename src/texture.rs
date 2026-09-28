@@ -5,10 +5,10 @@ use crate::bundle::Bundle;
 use crate::decode;
 use crate::reader::Reader;
 use crate::serialized::{class, ObjectInfo, SerializedFile};
-use crate::{check_release, Error, Result, Version};
+use crate::{check_release, Error, Result, StreamKey, Version};
 
 use std::borrow::Cow;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 /// Largest width or height Unity writes.
 const MAX_DIMENSION: i32 = 16384;
@@ -98,27 +98,40 @@ impl<'a> Texture2D<'a> {
         })
     }
 
-    /// Bytes to read for the first mip level, refusing formats this crate cannot decode
-    /// before anything is read.
+    /// Bytes to read for the first mip level, refusing formats this crate cannot decode and
+    /// data too short to hold the level before anything is read.
     fn wanted(&self, stored: usize) -> Result<usize> {
-        decode::mip0_size(self.format, self.width, self.height)
-            .map(|need| need.min(stored))
-            .ok_or_else(|| Error::UnsupportedTextureFormat {
+        let need = decode::mip0_size(self.format, self.width, self.height).ok_or_else(|| {
+            Error::UnsupportedTextureFormat {
                 texture: Some(self.name.clone()),
                 format: self.format,
-            })
+            }
+        })?;
+        if stored < need {
+            return Err(Error::Invalid(format!(
+                "texture {:?} holds {stored} bytes of pixels; its first mip level needs {need}",
+                self.name
+            )));
+        }
+        Ok(need)
     }
 
     /// The first mip level's pixel data. Streamed data is read from `dir`, the folder holding
     /// the serialized file, and only from a `.resS` or `.resource` file directly inside it: a
-    /// regular file, not a symbolic link, with no other hard links, and not named like a
-    /// Windows device or an alternate data stream.
+    /// regular file, not a symbolic link, with no other hard links (checked on Unix only), and
+    /// not named like a Windows device or an alternate data stream.
     ///
     /// # Errors
     ///
     /// For a format this crate does not decode, a stream path outside those rules, a file that
-    /// cannot be read, or a stream running past the end of its file.
+    /// cannot be read, or pixel data too short for the texture.
     pub fn data(&self, dir: &Path) -> Result<Cow<'a, [u8]>> {
+        self.data_claimed(dir, &mut |_, _, _| Ok(()))
+    }
+
+    /// [`Texture2D::data`], calling `claim` with the stream range once it is known to be valid
+    /// and before any of it is read.
+    pub(crate) fn data_claimed(&self, dir: &Path, claim: Claim<'_>) -> Result<Cow<'a, [u8]>> {
         use std::io::{Read, Seek, SeekFrom};
         let Some(stream) = &self.stream else {
             let want = self.wanted(self.image_data.len())?;
@@ -134,7 +147,7 @@ impl<'a> Texture2D<'a> {
         let path = stream_file(dir, &stream.path)?;
         let (mut file, len) = crate::file::open_regular(&path, crate::file::Chosen::ByData)?;
         let end = stream.offset.checked_add(u64::from(stream.size));
-        if end.is_none_or(|end| end > len) {
+        let Some(end) = end.filter(|&end| end <= len) else {
             return Err(Error::Invalid(format!(
                 "texture {:?} streams {} bytes at {} from {:?}, which holds {len}",
                 self.name,
@@ -142,24 +155,46 @@ impl<'a> Texture2D<'a> {
                 stream.offset,
                 path.display().to_string()
             )));
-        }
+        };
+        let id = crate::file::identity(&file, &path)?;
+        claim(StreamKey::File(id), stream.offset, end)?;
         file.seek(SeekFrom::Start(stream.offset))
             .map_err(Error::io(&path))?;
         let mut data = Vec::with_capacity(want);
         file.take(want as u64)
             .read_to_end(&mut data)
             .map_err(Error::io(&path))?;
+        if data.len() != want {
+            return Err(Error::Invalid(format!(
+                "{:?} ended while texture {:?} was being read",
+                path.display().to_string(),
+                self.name
+            )));
+        }
         Ok(Cow::Owned(data))
     }
 
     /// The first mip level's pixel data, for a texture read from a bundle: streamed data is
-    /// read from the bundle's own `.resS` entry.
+    /// read from one of the bundle's stream entries (never a serialized file).
     ///
     /// # Errors
     ///
-    /// For a format this crate does not decode, a stream entry the bundle does not hold, or a
-    /// stream running past the end of its entry.
+    /// For a format this crate does not decode, a stream entry the bundle does not hold or
+    /// that is a serialized file, or pixel data too short for the texture.
     pub fn data_in<'b>(&self, bundle: &'b Bundle) -> Result<Cow<'b, [u8]>>
+    where
+        'a: 'b,
+    {
+        self.data_in_claimed(bundle, &mut |_, _, _| Ok(()))
+    }
+
+    /// [`Texture2D::data_in`], calling `claim` with the stream's range in the bundle's data
+    /// once it is known to be valid.
+    pub(crate) fn data_in_claimed<'b>(
+        &self,
+        bundle: &'b Bundle,
+        claim: Claim<'_>,
+    ) -> Result<Cow<'b, [u8]>>
     where
         'a: 'b,
     {
@@ -174,56 +209,78 @@ impl<'a> Texture2D<'a> {
                 stream.path, self.name
             ))
         })?;
+        if entry.is_serialized() {
+            return Err(Error::Invalid(format!(
+                "texture {:?} streams from {:?}, a serialized file",
+                self.name,
+                entry.path()
+            )));
+        }
         let bytes = bundle.bytes(entry).unwrap_or_default();
-        usize::try_from(stream.offset)
+        let start = usize::try_from(stream.offset)
             .ok()
             .filter(|&start| {
                 start
                     .checked_add(stream.size as usize)
                     .is_some_and(|end| end <= bytes.len())
             })
-            .map(|start| Cow::Borrowed(&bytes[start..start + want]))
             .ok_or_else(|| {
                 Error::Invalid(format!(
                     "texture {:?} streams past the end of {:?}",
                     self.name,
                     entry.path()
                 ))
-            })
+            })?;
+        // Claimed by position in the bundle's data, so every path that resolves to this entry
+        // claims the same bytes.
+        let at = (entry.offset + start) as u64;
+        claim(StreamKey::Bundle, at, at + u64::from(stream.size))?;
+        Ok(Cow::Borrowed(&bytes[start..start + want]))
     }
 }
 
-/// `name` as a stream file directly inside `dir`: one plain path component ending in `.resS`
-/// or `.resource`, the names Unity writes. Anything else is refused.
+/// Called with a stream range, `(what, start, end)`, before it is read.
+pub(crate) type Claim<'c> = &'c mut dyn FnMut(StreamKey, u64, u64) -> Result<()>;
+
+/// `name` as a stream file directly inside `dir`: one plain file name ending in `.resS` or
+/// `.resource`, the names Unity writes. Anything else is refused: path separators, `.` and
+/// `..`, Windows alternate data streams (`:`) and device names, which Windows matches
+/// ignoring case, trailing spaces and dots, and any extension (`CON .resS`, `com1.resS`).
 fn stream_file(dir: &Path, name: &str) -> Result<PathBuf> {
-    // Windows reads `name:stream` as an alternate data stream and `CON.resS` as a device.
-    let stem = name.split('.').next().unwrap_or("").to_ascii_uppercase();
-    let device = ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"].contains(&stem.as_str())
-        || ((stem.starts_with("COM") || stem.starts_with("LPT"))
-            && stem.chars().count() == 4
-            && !stem.ends_with('0'));
-    if name.contains(':') || device {
-        return Err(Error::Unsupported(format!(
-            "stream path {name:?} is not a .resS or .resource file name beside the asset file"
-        )));
-    }
     let refuse = || {
         Error::Unsupported(format!(
             "stream path {name:?} is not a .resS or .resource file name beside the asset file"
         ))
     };
-    let mut parts = Path::new(name).components();
-    match (parts.next(), parts.next()) {
-        (Some(Component::Normal(file)), None) => {
-            let file = file.to_str().ok_or_else(refuse)?;
-            let (stem, ext) = file.rsplit_once('.').ok_or_else(refuse)?;
-            if stem.is_empty() || !(ext == "resS" || ext == "resource") {
-                return Err(refuse());
-            }
-            Ok(dir.join(file))
-        }
-        _ => Err(refuse()),
+    if name.contains(['/', '\\', ':', '\0']) {
+        return Err(refuse());
     }
+    let (stem, ext) = name.rsplit_once('.').ok_or_else(refuse)?;
+    if stem.is_empty() || !(ext == "resS" || ext == "resource") {
+        return Err(refuse());
+    }
+    if is_windows_device(name) {
+        return Err(refuse());
+    }
+    Ok(dir.join(name))
+}
+
+/// Whether Windows would open `name` as a device: its part before the first dot, less
+/// trailing spaces and dots, is a reserved name.
+fn is_windows_device(name: &str) -> bool {
+    let base = name.split('.').next().unwrap_or("");
+    let base = base.trim_end_matches([' ', '.']).to_ascii_uppercase();
+    if ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"].contains(&base.as_str()) {
+        return true;
+    }
+    let mut chars = base.chars();
+    let prefix: String = chars.by_ref().take(3).collect();
+    let digit = chars.next();
+    (prefix == "COM" || prefix == "LPT")
+        && chars.next().is_none()
+        && digit.is_some_and(|d| {
+            ('1'..='9').contains(&d) || ['\u{b9}', '\u{b2}', '\u{b3}'].contains(&d)
+        })
 }
 
 fn read_fields<'a>(r: &mut Reader<'a>, version: Version) -> Result<Texture2D<'a>> {
@@ -313,8 +370,9 @@ fn read_fields<'a>(r: &mut Reader<'a>, version: Version) -> Result<Texture2D<'a>
     }
     Ok(Texture2D {
         name,
-        width: width.unsigned_abs(),
-        height: height.unsigned_abs(),
+        // Both are within 0..=16384 here.
+        width: width as u32,
+        height: height as u32,
         format,
         mip_count,
         platform_blob,
