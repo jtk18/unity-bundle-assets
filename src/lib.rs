@@ -101,9 +101,10 @@ pub struct ReadmeDoctests;
 
 /// Everything that can go wrong reading a file.
 ///
-/// Strings that came from a file are quoted when displayed, with everything but printable
-/// ASCII written as `\u{...}`, and cut to 64 characters; the fields themselves (and so
-/// `Debug`) hold them whole, up to 12 KiB. Each message is complete: an underlying cause is
+/// Strings that came from a file are quoted when displayed: printable ASCII as it is, `\n`,
+/// `\r`, `\t`, `\"` and `\\` escaped with a backslash, everything else written as `\u{...}`,
+/// and cut to 64 characters; the fields themselves (and so
+/// `Debug`) hold them whole, up to 4 KiB. Each message is complete: an underlying cause is
 /// part of it rather than a separate [`std::error::Error::source`] (see [`Error::root`] for
 /// the wrapped ones).
 #[derive(Debug, thiserror::Error)]
@@ -319,7 +320,8 @@ pub struct Limits {
     /// Largest decompressed size of a bundle in bytes, counting the parsed directory at its
     /// in-memory size. Default 1 GiB.
     pub max_decompressed: u64,
-    /// Most objects in one serialized file, and across the files opened from one bundle.
+    /// Most objects and dependencies (external files named) in one serialized file, and across
+    /// the files opened from one bundle.
     /// Default 4,194,304.
     pub max_objects: u64,
     /// Most pixels in one texture this crate will decode. Default 16384 x 16384, Unity's
@@ -713,30 +715,37 @@ pub(crate) const NEWEST_KNOWN: [u32; 2] = [6000, 4];
 /// engine version was stripped.
 pub(crate) fn check_release(version: &str, what: &str, oldest: [u32; 3]) -> Result<()> {
     let v = Version::parse(version);
-    let shown = quoted(version);
+    let shown = || quoted(version);
     if v.stripped() {
         return Err(Error::Unsupported(format!(
-            "{what} from a file whose engine version was stripped ({shown})"
+            "{what} from a file whose engine version was stripped ({})",
+            shown()
         )));
     }
     if v.numbers < oldest {
         return Err(Error::Unsupported(format!(
-            "{what} from Unity {shown} (needs {}.{} or later)",
-            oldest[0], oldest[1]
+            "{what} from Unity {} (needs {}.{} or later)",
+            shown(),
+            oldest[0],
+            oldest[1]
         )));
     }
     if [v.numbers[0], v.numbers[1]] > NEWEST_KNOWN {
         return Err(Error::Unsupported(format!(
-            "{what} from Unity {shown}, newer than the layouts this crate knows (up to {}.{})",
-            NEWEST_KNOWN[0], NEWEST_KNOWN[1]
+            "{what} from Unity {}, newer than the layouts this crate knows (up to {}.{})",
+            shown(),
+            NEWEST_KNOWN[0],
+            NEWEST_KNOWN[1]
         )));
     }
     match v.kind {
         'a' => Err(Error::Unsupported(format!(
-            "{what} from Unity {shown}, an alpha build; layouts change between alphas"
+            "{what} from Unity {}, an alpha build; layouts change between alphas",
+            shown()
         ))),
         't' | 'x' => Err(Error::Unsupported(format!(
-            "{what} from Unity {shown}, an engine variant whose layouts are unchecked"
+            "{what} from Unity {}, an engine variant whose layouts are unchecked",
+            shown()
         ))),
         _ => Ok(()),
     }
@@ -754,6 +763,9 @@ mod tests {
     #[test]
     fn test_quoting_escapes_all_but_printable_ascii() {
         assert_eq!(quoted("a\"b\\c"), r#""a\"b\\c""#);
+        // The printable range's edges are kept; C1 controls (a lone CSI) are escaped.
+        assert_eq!(quoted(" ~"), r#"" ~""#);
+        assert_eq!(quoted("\u{7f}\u{80}\u{9b}"), r#""\u{7f}\u{80}\u{9b}""#);
         assert_eq!(
             quoted("\u{0}\u{1b}\u{e9}\u{fffd}\u{1f600}"),
             r#""\u{0}\u{1b}\u{e9}\u{fffd}\u{1f600}""#

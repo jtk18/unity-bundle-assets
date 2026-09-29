@@ -264,6 +264,10 @@ mod tests {
         assert_eq!((bad.len(), bad.capacity()), (4095, 4095));
         assert!(bad.chars().all(|c| c == '\u{fffd}'));
         assert_eq!(text(&[b'a'; 4096]).len(), 4096);
+        // "a" and 1366 bad bytes: 4099 bytes of text, cut at the boundary at exactly 4096.
+        let mut mixed = vec![b'a'];
+        mixed.extend([0xff; 1366]);
+        assert_eq!(text(&mixed).len(), 4096);
         let mut r = Reader::new(b"ok\0caf\xe9\0", false);
         assert_eq!(r.cstr().unwrap(), "ok");
         assert!(matches!(r.cstr(), Err(Error::Invalid(msg)) if msg.contains("not UTF-8")));

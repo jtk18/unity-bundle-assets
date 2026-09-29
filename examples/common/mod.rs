@@ -63,9 +63,10 @@ impl Names {
     }
 }
 
-/// A string safe to print to a terminal: printable ASCII as it is, everything else shown as
-/// `\u{...}`. Names from a file can hold characters that are blank, reorder text or look
-/// like others; no list of the harmful ones keeps up with Unicode, so none is trusted.
+/// A string safe to print to a terminal: printable ASCII as it is (a backslash doubled, so
+/// escapes cannot be forged), everything else shown as `\u{...}`. Names from a file can hold
+/// characters that are blank, reorder text or look like others; no list of the harmful ones
+/// keeps up with Unicode, so none is trusted.
 pub fn printable(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -73,6 +74,26 @@ pub fn printable(s: &str) -> String {
             // A backslash too, so a name holding the text `\u{202e}` does not read as one
             // holding the character.
             '\\' => out.push_str("\\\\"),
+            ' '..='~' => out.push(c),
+            _ => out.extend(c.escape_unicode()),
+        }
+    }
+    out
+}
+
+/// `s` cut to [`MAX_LINE`] characters: cut before escaping, so a long name costs no more than
+/// a short one and the cut never falls inside an escape.
+pub fn cut(s: &str) -> &str {
+    s.char_indices().nth(MAX_LINE).map_or(s, |(at, _)| &s[..at])
+}
+
+/// An error message safe to print: the crate's own messages are already escaped (with `\`
+/// escapes), so only what is not printable ASCII is escaped here, and backslashes are left as
+/// they are; other errors (I/O, PNG) get the same treatment.
+pub fn printable_error(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
             ' '..='~' => out.push(c),
             _ => out.extend(c.escape_unicode()),
         }
@@ -152,7 +173,7 @@ pub fn finish(result: Result<(), Box<dyn std::error::Error>>) -> std::process::E
         Err(e) => {
             let mut printed = 0;
             report(&mut printed, || {
-                format!("error: {}", printable(&e.to_string()))
+                format!("error: {}", printable_error(&e.to_string()))
             });
             std::process::ExitCode::FAILURE
         }

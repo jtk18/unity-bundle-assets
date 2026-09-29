@@ -427,6 +427,51 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_a_stream_read_to_decode_has_room_for_the_rgba() {
+        use crate::test_common::*;
+        // A streamed 8x8 RGB24 texture: read to decode, the buffer has room for the RGBA it
+        // widens to in place; read as data only, just the stored bytes.
+        let dir = TempDir::new("room");
+        dir.file("r.resS", &[3; 8 * 8 * 3]);
+        let t = texture(
+            Layout::U2022_3,
+            false,
+            "r",
+            8,
+            8,
+            format::RGB24,
+            &Pixels::Streamed {
+                path: "r.resS",
+                offset: 0,
+                size: 8 * 8 * 3,
+            },
+            &[],
+        );
+        let file = crate::SerializedFile::parse(serialized(
+            22,
+            "2022.3.62f1",
+            false,
+            19,
+            &[(7, TEXTURE_2D, t)],
+        ))
+        .unwrap();
+        let texture = Texture2D::read(&file, file.object(7).unwrap()).unwrap();
+        for (room, want) in [(true, 8 * 8 * 4), (false, 8 * 8 * 3)] {
+            let data = texture
+                .data_claimed(&dir.0, room, &mut || Ok(()), &mut |_, _, _| Ok(()))
+                .unwrap();
+            let Cow::Owned(v) = data else {
+                panic!("a stream is read into a buffer")
+            };
+            assert_eq!(v.len(), 8 * 8 * 3);
+            assert!(v.capacity() >= want, "room {room}: {}", v.capacity());
+            if !room {
+                assert!(v.capacity() < 8 * 8 * 4, "{}", v.capacity());
+            }
+        }
+    }
+
+    #[test]
     fn test_stream_file_names() {
         let dir = Path::new("/d");
         assert_eq!(

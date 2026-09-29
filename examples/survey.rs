@@ -21,7 +21,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             format!(
                 "sprite {}: {}",
                 s.path_id,
-                common::printable(&s.error.to_string())
+                common::printable_error(&s.error.to_string())
             )
         });
     }

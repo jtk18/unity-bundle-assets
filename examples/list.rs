@@ -31,7 +31,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // One line each, cut, and only so many: a file can name millions of long paths.
     let externals = file.externals();
     for e in externals.iter().take(common::MAX_REPORTED) {
-        outln!("  external {}", common::printable(cut(&e.path)));
+        outln!("  external {}", common::printable(common::cut(&e.path)));
     }
     if externals.len() > common::MAX_REPORTED {
         outln!(
@@ -48,7 +48,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 o.path_id(),
                 o.size(),
                 // Cut before escaping, so a long name costs no more than a short one.
-                common::printable(cut(&file.name(o).unwrap_or_default()))
+                common::printable(common::cut(&file.name(o).unwrap_or_default()))
             );
         }
     }
@@ -61,11 +61,4 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         outln!("({} more classes)", classes - common::MAX_REPORTED);
     }
     Ok(())
-}
-
-/// `s` cut to [`common::MAX_LINE`] characters.
-fn cut(s: &str) -> &str {
-    s.char_indices()
-        .nth(common::MAX_LINE)
-        .map_or(s, |(at, _)| &s[..at])
 }

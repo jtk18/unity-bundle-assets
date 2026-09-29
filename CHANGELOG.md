@@ -12,9 +12,9 @@ First release. Minimum Rust version 1.83.
 - `Sprite` and `SpriteAtlas` from Unity 2019.1 through 6000.4: packing rotation, flips, tight
   packing.
 - `Assets` lists and exports sprites and textures, top row first; the lower layers are public.
-- `Limits` bounds file size, decompression (with LZMA's working memory), objects (across a
-  bundle), decoded pixels, sprite meshes, mask work and the total work done, shared by every
-  `Assets` opened from one bundle.
+- `Limits` bounds file size, decompression (with LZMA's working memory), objects and
+  dependencies (across a bundle), decoded pixels, sprite meshes, mask work and the total work
+  done, shared by every `Assets` opened from one bundle.
 - Hostile input: records, bundle entries, sprite sub-meshes and streamed pixel ranges may not
   overlap, whatever path spelling reaches them (on Unix by device and inode); strings are held
   to 4 KiB (versions and the paths used to find data must be UTF-8); files are checked by

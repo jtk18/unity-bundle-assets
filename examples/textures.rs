@@ -45,9 +45,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 common::report(&mut printed, || {
                     format!(
                         "{} ({}): {}",
-                        common::printable(name),
+                        common::printable(common::cut(name)),
                         texture.path_id,
-                        common::printable(&e)
+                        common::printable_error(&e)
                     )
                 });
             }

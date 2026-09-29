@@ -205,8 +205,9 @@ impl Sprite {
         Self::read_within(file, object, u64::MAX)
     }
 
-    /// [`Sprite::read`], refusing a mesh of more than `remaining` triangles before building
-    /// any of it; `remaining` is what is left of a list's total.
+    /// [`Sprite::read`], refusing a mesh of more than `remaining` triangles once it is built
+    /// (one mesh is held to `max_sprite_triangles` before); `remaining` is what is left of a
+    /// list's total.
     pub(crate) fn read_within(
         file: &SerializedFile,
         object: &ObjectInfo,

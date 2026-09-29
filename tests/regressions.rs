@@ -4006,7 +4006,7 @@ fn a_long_name_costs_a_unit_a_byte_past_the_calls_share() {
 }
 
 #[test]
-fn a_quarter_turn_costs_two_units_a_pixel() {
+fn a_quarter_turn_costs_three_units_a_pixel() {
     // A 4x4 sprite over the whole 4x4 texture, packed with each rotation: the copy is a unit
     // a pixel, two for a quarter turn, which reads the texture down its columns.
     for (rotation, per_pixel) in [(0u32, 1u64), (1, 1), (3, 1), (4, 3)] {
@@ -4549,6 +4549,8 @@ fn a_declared_size_at_the_header_edge() {
         "{}",
         with(header)
     );
+    // At the header's edge the size check passes; what follows is simply missing.
+    assert!(!with(header).contains("declares"), "{}", with(header));
 }
 
 #[test]
@@ -5014,4 +5016,144 @@ fn a_bundle_directory_over_the_limit_reports_its_size() {
         }) => assert_eq!(value, 118),
         other => panic!("{:?}", other.err()),
     }
+}
+
+// Round 13.
+
+#[test]
+fn dependencies_count_toward_a_bundles_object_total() {
+    // Three files of one object and three dependencies each, under a limit of five: the first
+    // opens (4), the second would make 8 and is refused.
+    let extras = Extras {
+        externals: vec!["a.assets".into(), "b.assets".into(), "c.assets".into()],
+        ..Extras::default()
+    };
+    let tex = || rgba_texture(Layout::U2022_3, "t", 4, 4, &Pixels::Inline(&rgba_4x4()));
+    let file = serialized_with(
+        22,
+        "2022.3.62f1",
+        false,
+        19,
+        &[(1, TEXTURE_2D, tex())],
+        &extras,
+    );
+    let bytes = bundle(
+        &BundleOpts::new(6, "2018.4.36f1"),
+        &[
+            ("CAB-a", &file, 4),
+            ("CAB-b", &file, 4),
+            ("CAB-c", &file, 4),
+        ],
+    );
+    let b = Arc::new(Bundle::parse_with(&bytes, Limits::DEFAULT.with_max_objects(5)).unwrap());
+    assert!(Assets::from_bundle(b.clone(), "CAB-a").is_ok());
+    match Assets::from_bundle(b, "CAB-b") {
+        Err(Error::LimitExceeded {
+            kind: LimitKind::Objects,
+            value,
+            ..
+        }) => assert_eq!(value, 8),
+        other => panic!("{:?}", other.err()),
+    }
+}
+
+#[test]
+fn a_name_refused_before_it_is_read_is_not_charged() {
+    // Stated over 4 KiB, or past the object's end: refused without reading a byte of it, and
+    // charged only the call.
+    for stated in [4097u32, 4000] {
+        let mut t = rgba_texture(Layout::U2022_3, "t", 1, 1, &Pixels::Inline(&[1, 2, 3, 4]));
+        t[..4].copy_from_slice(&stated.to_le_bytes());
+        if stated > 4096 {
+            t.extend(vec![b'n'; 4200]);
+        }
+        let file = serialized(22, "2022.3.62f1", false, 19, &[(7, TEXTURE_2D, t)]);
+        let a = Assets::from_serialized(SerializedFile::parse(file).unwrap(), "").unwrap();
+        assert!(a.decode_texture(7).is_err(), "{stated}");
+        assert_eq!(a.work_done(), CALL, "{stated}");
+    }
+}
+
+#[test]
+fn streamed_block_textures_decode_as_blocks() {
+    for (fmt, n) in [(format::DXT1, 8usize), (format::DXT5, 16)] {
+        let px: Vec<u8> = (0..n * 4).map(|i| (i * 53 % 251) as u8).collect();
+        let t = texture(
+            Layout::U2022_3,
+            false,
+            "d",
+            8,
+            8,
+            fmt,
+            &Pixels::Streamed {
+                path: "d.resS",
+                offset: 0,
+                size: px.len() as u32,
+            },
+            &[],
+        );
+        let file = serialized(22, "2022.3.62f1", false, 19, &[(7, TEXTURE_2D, t)]);
+        let dir = TempDir::new("dxtstream");
+        dir.file("d.resS", &px);
+        let a = Assets::open(dir.file("d.assets", &file)).unwrap();
+        let img = a.decode_texture(7).unwrap();
+        assert_eq!(
+            img.rgba(),
+            &decode::decode(fmt, 8, 8, &px).unwrap()[..],
+            "format {fmt}"
+        );
+    }
+}
+
+#[test]
+fn a_sprite_rect_that_is_not_finite_says_so() {
+    let r = [0.0, 0.0, f32::NAN, 4.0];
+    let s = sprite(
+        false,
+        false,
+        "s",
+        r,
+        [0.0, 0.0],
+        1,
+        0,
+        TEX,
+        0,
+        r,
+        RECT,
+        1.0,
+        &Mesh::BASE,
+    );
+    let (_d, mut a, s) = one_sprite(s, Limits::default());
+    match a.export(&s) {
+        Err(Error::Invalid(msg)) => assert!(msg.contains("not a finite rect"), "{msg}"),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn a_sprite_list_keeps_no_spare_room() {
+    let file = serialized(
+        22,
+        "2022.3.62f1",
+        false,
+        19,
+        &[
+            (
+                TEX,
+                TEXTURE_2D,
+                rgba_texture(Layout::U2022_3, "t", 4, 4, &Pixels::Inline(&rgba_4x4())),
+            ),
+            (1, SPRITE, tight(&TRIANGLE, 0)),
+            (2, SPRITE, tight(&TRIANGLE, 0)),
+            (3, SPRITE, tight(&TRIANGLE, 0)),
+            (4, SPRITE, vec![0; 4]),
+            (5, SPRITE, vec![0; 4]),
+            (6, SPRITE, vec![0; 4]),
+        ],
+    );
+    let a = Assets::from_serialized(SerializedFile::parse(file).unwrap(), "").unwrap();
+    let list = a.sprites(|_| true);
+    assert_eq!((list.sprites.len(), list.skipped.len()), (3, 3));
+    assert_eq!(list.sprites.capacity(), list.sprites.len());
+    assert_eq!(list.skipped.capacity(), list.skipped.len());
 }

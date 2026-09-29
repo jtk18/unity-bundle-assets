@@ -245,7 +245,8 @@ impl Assets {
 
     /// Open a serialized file or single-file bundle from its bytes. A serialized file's
     /// streamed textures are read from `stream_dir`; a bundle's come from the bundle, and
-    /// `stream_dir` is not used.
+    /// `stream_dir` is not used. Not knowing which file the bytes came from, it cannot refuse
+    /// a texture that streams from that same file, as [`Assets::open`] does.
     ///
     /// # Errors
     ///
@@ -304,7 +305,8 @@ impl Assets {
     }
 
     /// Wrap a parsed file whose streamed textures live in `stream_dir` (`""` means the
-    /// current folder).
+    /// current folder). As with [`Assets::from_bytes`], a texture streaming from the parsed
+    /// file itself is not refused.
     ///
     /// # Errors
     ///
@@ -508,11 +510,12 @@ impl Assets {
             .ok()
             .and_then(|n| usize::try_from(n).ok())
             .unwrap_or(0);
-        // A name over the limit is refused before a byte of it is read: nothing to charge.
-        if stated > crate::reader::MAX_STRING {
+        // A name over the limit, or past the object's end, is refused before a byte of it is
+        // read: nothing to charge.
+        if stated > crate::reader::MAX_STRING || stated > r.remaining() {
             return 0;
         }
-        stated.min(r.remaining()) as u64
+        stated as u64
     }
 
     /// Where the sprite's pixels are: its atlas entry when it has one, its own render data

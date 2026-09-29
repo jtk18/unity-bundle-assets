@@ -33,9 +33,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         common::report(&mut printed, || {
             format!(
                 "{} ({}): {}",
-                common::printable(skipped.name.as_deref().unwrap_or("?")),
+                common::printable(common::cut(skipped.name.as_deref().unwrap_or("?"))),
                 skipped.path_id,
-                common::printable(&skipped.error.to_string())
+                common::printable_error(&skipped.error.to_string())
             )
         });
     }
@@ -54,9 +54,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 common::report(&mut printed, || {
                     format!(
                         "{} ({}): {}",
-                        common::printable(&sprite.name),
+                        common::printable(common::cut(&sprite.name)),
                         sprite.path_id,
-                        common::printable(&e)
+                        common::printable_error(&e)
                     )
                 });
             }

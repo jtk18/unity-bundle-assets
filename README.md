@@ -113,10 +113,12 @@ Files are treated as hostile:
   entries and a sprite's sub-meshes may not overlap, and a range of stream data may be read by
   one texture only. Ranges are compared by the bytes they reach (on Unix, the file's device
   and inode; elsewhere its lower-cased name; stream names must be ASCII everywhere), not by
-  how the path to them is spelled; a texture may not stream from a serialized file (with
-  `Assets::open`, not from its own; `Assets::from_bytes` does not know which file its bytes
-  came from). Claims last as long as the `Assets` (or the `Bundle`), so separate
-  `Assets::open` calls on files that share a stream file each claim its ranges afresh.
+  how the path to them is spelled; in a bundle no texture may stream from a serialized entry,
+  and a file opened with `Assets::open` may not stream from itself (a texture read through
+  `Assets::from_bytes` or `Assets::from_serialized` is not checked for that: they do not know
+  which file their bytes came from). Claims last as long as the `Assets` (or the `Bundle`), so
+  separate `Assets::open` calls on files that share a stream file each claim its ranges
+  afresh.
 - A file is checked by its header before the rest is read. A bundle must declare a size
   between its header's and its data's, and is read only that far; a serialized file is read
   as far as its header says it runs. A file that states a large size and holds nothing (a
@@ -132,16 +134,16 @@ Files are treated as hostile:
   4x4 blocks for DXT) or copied (three for a quarter-turned sprite, which reads the texture
   down its columns) and each column tested for a mask; 64 for each decode or cut asked for,
   refused or not, and a unit for each byte of a texture's name and stream path past 64; 8192
-  more each time a stream file is looked for and 192 more for a stream in the same bundle, whether
-  or not its range is then granted; and 16 for each mesh triangle and each row a triangle
-  crosses. Mesh vertices must lie within 65,536 pixels of the image's corner, after pivot and
-  offset. A unit costs about 2 ns on an Apple silicon Mac, so the total is under a minute of
-  CPU. It is shared by every `Assets` opened from one `Bundle` (two `Assets::open` calls on
-  one path are two totals), and it is never given back: a long-running program that decodes
-  the same textures again and again should raise it. Work is reserved before it starts, and
-  kept once reserved: a refusal keeps the steps already reserved (the call, a long name, a
-  stream file opened, and a mask's triangles and rows, reserved all at once before any is
-  worked out, so a mask refused partway still pays for all of them) and is not charged for
+  more each time a stream file is looked for and 192 more for a stream in the same bundle,
+  whether or not its range is then granted; and 16 for each mesh triangle and each row a
+  triangle crosses. Mesh vertices must lie within 65,536 pixels of the image's corner, after
+  pivot and offset. A unit costs about 2 ns on an Apple silicon Mac, so the total is under a
+  minute of CPU. It is shared by every `Assets` opened from one `Bundle` (two `Assets::open`
+  calls on one path are two totals), and it is never given back: a long-running program that
+  decodes the same textures again and again should raise it. Work is reserved before it
+  starts, and kept once reserved: a refusal keeps the steps already reserved (the call, a long
+  name, a stream file opened, and a mask's triangles and rows, reserved all at once before any
+  is worked out, so a mask refused partway still pays for all of them) and is not charged for
   pixels or columns it never touched. Pixels reserved stay charged if reading or allocating
   them then fails. Once the total is spent, every decode and cut is refused before it reads
   anything. Which of several threads' requests are refused under the limit depends on their
@@ -150,10 +152,12 @@ Files are treated as hostile:
   `Assets::placement`) are not counted: decompressing LZMA runs at up to about 55 ns a byte
   (incompressible data), so a bundle that decompresses to the default 1 GiB can take about a
   minute of CPU to open, before any work limit applies; lower `max_decompressed` for bundles
-  from strangers. Images one pixel wide, and refusals, cost up to about 3.5 ns a unit; many
-  tiny LZMA blocks decompress at up to about 150 ns a byte, but the directory charge caps them
-  at some 65,000 blocks, a fraction of a second; and every figure here is CPU on a local disk:
-  on a network share each stream file opened can take milliseconds.
+  from strangers. Images one pixel wide cost up to about 3.5 ns a unit, and refusals whose
+  message quotes a long non-ASCII name up to about 15 ns (a budget spent wholly on those takes
+  some four minutes); many tiny LZMA blocks decompress at up to about 150 ns a byte, but the
+  directory charge caps them at some 65,000 blocks, a fraction of a second; and every figure
+  here is CPU on a local disk: on a network share each stream file opened can take
+  milliseconds.
 - `Assets` enforces all of that. Used directly, `Bundle` and `SerializedFile` apply their own
   limits, `Texture2D` refuses data too short for its size but claims no ranges (texture after
   texture may read the same bytes), and `decode::decode` applies none; a caller using them

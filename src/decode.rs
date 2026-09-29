@@ -131,9 +131,10 @@ const fn widen(value: u16, max: u16) -> u8 {
 }
 
 /// [`decode`], taking ownership of the pixels: data stored pixel by pixel (not in blocks)
-/// and holding at least the first mip is widened to RGBA8, from the last pixel back, and
-/// turned the right way up in its own buffer, so decoding it needs no second one. The
-/// buffer should have room for the result already, or growing it may copy it.
+/// and holding at least the first mip is converted to RGBA8 in its own buffer (four-byte
+/// formats reordered where they lie, narrower ones widened from the last pixel back) and
+/// turned the right way up, so decoding it needs no second buffer. The buffer should have
+/// room for the result already, or growing it may copy it.
 pub(crate) fn decode_owned(
     format: i32,
     width: u32,
@@ -173,8 +174,7 @@ pub(crate) fn decode_owned(
             [argb[1], argb[2], argb[3], argb[0]]
         }),
         format::RGBA4444 => widen_pixels::<2>(&mut data, out_len, |s| nibbles(&s)),
-        _ => widen_pixels::<2>(&mut data, out_len, |s| {
-            // RGB565
+        format::RGB565 => widen_pixels::<2>(&mut data, out_len, |s| {
             let v = u16::from_le_bytes(s);
             [
                 widen(v >> 11, 31),
@@ -183,6 +183,8 @@ pub(crate) fn decode_owned(
                 255,
             ]
         }),
+        // Any other format is decoded by copying, from the table `decode` uses.
+        _ => return decode(format, width, height, &data),
     }
     let row = w * 4;
     for i in 0..h / 2 {

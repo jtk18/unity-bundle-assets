@@ -206,9 +206,10 @@ impl SerializedFile {
             },
             e => e,
         })?;
+        // Dependencies count with the objects, as `parse` checked them.
         shared.count_objects(
             entry.offset,
-            parsed.objects.len() as u64,
+            (parsed.objects.len() + parsed.externals.len()) as u64,
             limits.max_objects,
         )?;
         if Version::parse(&parsed.unity_version).stripped() {
