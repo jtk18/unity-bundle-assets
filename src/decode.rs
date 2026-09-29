@@ -501,7 +501,7 @@ fn half(s: &[u8]) -> f32 {
     }
 }
 
-fn single(s: &[u8]) -> f32 {
+const fn single(s: &[u8]) -> f32 {
     f32::from_le_bytes([s[0], s[1], s[2], s[3]])
 }
 

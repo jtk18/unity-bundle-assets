@@ -60,7 +60,7 @@ impl<'a> RangeDecoder<'a> {
     /// The first byte is always 0 from an encoder and carries nothing; like lzma-rs (which this
     /// crate used before), a nonzero one is not refused, nor a first code at the top of the
     /// range, which the specification lets a decoder flag.
-    fn new(data: &'a [u8]) -> Option<Self> {
+    const fn new(data: &'a [u8]) -> Option<Self> {
         let [_, a, b, c, d, ..] = *data else {
             return None;
         };
