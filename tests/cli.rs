@@ -37,7 +37,7 @@ fn example(name: &str) -> PathBuf {
 }
 
 /// A Unity 2022.3 file: a 4x2 texture "tex" (10), a sprite "icon" on it (1), and with `bad`
-/// a texture "bc7" (20) in a format the crate does not decode.
+/// a texture "astc" (20) in a format the crate does not decode.
 fn sample(dir: &TempDir, bad: bool) -> PathBuf {
     let rgba: Vec<u8> = (0..32).collect();
     let tex = texture(
@@ -68,17 +68,17 @@ fn sample(dir: &TempDir, bad: bool) -> PathBuf {
     );
     let mut objects = vec![(10, TEXTURE_2D, tex), (1, SPRITE, icon)];
     if bad {
-        let bc7 = texture(
+        let astc = texture(
             Layout::U2022_3,
             false,
-            "bc7",
+            "astc",
             4,
             4,
-            format::BC7,
+            format::ASTC_4X4,
             &Pixels::Inline(&[0; 16]),
             &[],
         );
-        objects.push((20, TEXTURE_2D, bc7));
+        objects.push((20, TEXTURE_2D, astc));
     }
     dir.file(
         "sample.assets",
@@ -137,7 +137,7 @@ fn a_failed_run_says_why_on_stderr_and_exits_1() {
     assert_eq!(out.status.code(), Some(1), "{out:?}");
     assert_eq!(text(&out.stdout), "exported 1, failed 1\n");
     let err = text(&out.stderr);
-    assert!(err.starts_with("bc7 (20): "), "{err}");
+    assert!(err.starts_with("astc (20): "), "{err}");
     assert!(err.ends_with("error: 1 not exported\n"), "{err}");
     assert!(pngs.join("tex_10.png").exists());
 }

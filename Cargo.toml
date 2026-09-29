@@ -15,10 +15,11 @@ exclude = [".github", ".gitignore", "deny.toml"]
 targets = ["x86_64-unknown-linux-gnu"]
 
 [dependencies]
-lzma-rs = "0.3"
 thiserror = "2"
 
 [dev-dependencies]
+# Builds LZMA blocks for the tests (its encoder writes literals only).
+lzma-rs = "0.3"
 image = { version = "0.25", default-features = false, features = ["png"] }
 
 # Each example runs its own tests on a small generated file under `cargo test`, so one that

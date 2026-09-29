@@ -257,7 +257,7 @@ pub mod fixture {
 
     /// A Unity 2022.3 file with a 4x2 RGBA32 texture "tex" and a sprite "icon" over its lower
     /// left 2x1 pixels (neither square, so width and height cannot be swapped unseen); with
-    /// `bad`, also a texture "bc7" in a format the crate does not decode.
+    /// `bad`, also a texture "astc" in a format the crate does not decode.
     pub fn sample(dir: &TempDir, bad: bool) -> std::path::PathBuf {
         let rgba: Vec<u8> = (0..32).collect();
         let tex = texture(
@@ -288,17 +288,17 @@ pub mod fixture {
         );
         let mut objects = vec![(TEXTURE, TEXTURE_2D, tex), (SPRITE_ID, SPRITE, icon)];
         if bad {
-            let bc7 = texture(
+            let astc = texture(
                 builders::Layout::U2022_3,
                 false,
-                "bc7",
+                "astc",
                 4,
                 4,
-                format::BC7,
+                format::ASTC_4X4,
                 &Pixels::Inline(&[0; 16]),
                 &[],
             );
-            objects.push((20, TEXTURE_2D, bc7));
+            objects.push((20, TEXTURE_2D, astc));
         }
         dir.file(
             "sample.assets",

@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+- Texture formats R8, RG16, R16, RG32, BGR24, RGB48, RGBA64, RHalf, RGHalf, RGBAHalf, RFloat,
+  RGFloat, RGBAFloat, RGB9e5, DXT3, BC4, BC5 and BC7, each checked byte for byte against
+  unity-rs-core 0.5.2 on random data, and BC7 on real textures too. Formats stored wider than
+  RGBA8 are narrowed in their own buffer.
+- LZMA blocks are decoded by the crate itself, straight into the bundle's buffer, instead of
+  through lzma-rs: bundle parsing is about 1.8 times as fast (100 real bundles, 2.4 GB out:
+  4.0 s to 2.2 s), and the only runtime dependency left is `thiserror`. Output is identical
+  to 0.1.0's over 660 real bundles (40.8 GB) and 24,000 corrupted ones.
+- LZ4 blocks are decoded into a buffer sized up front, with fixed 16-byte copies for short
+  runs.
+
 ## 0.1.0 (2026-09-29)
 
 First release. Minimum Rust version 1.83.

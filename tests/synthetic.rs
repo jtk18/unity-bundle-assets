@@ -253,14 +253,14 @@ fn texture_data_is_the_first_mip_and_refuses_unknown_formats() {
             (
                 8,
                 TEXTURE_2D,
-                texture(Layout::U2018_4, false, "bc7", 4, 4, 25, &gone, &[]),
+                texture(Layout::U2018_4, false, "astc", 4, 4, 48, &gone, &[]),
             ),
         ],
     );
     let assets = Assets::open(dir.file("t.assets", &file)).unwrap();
     assert_eq!(assets.texture(7).unwrap().data(&dir.0).unwrap().len(), 64);
     match assets.texture(8).unwrap().data(&dir.0) {
-        Err(Error::UnsupportedTextureFormat { format: 25, .. }) => {}
+        Err(Error::UnsupportedTextureFormat { format: 48, .. }) => {}
         other => panic!("{other:?}"),
     }
 }
@@ -631,10 +631,10 @@ fn unsupported_formats_name_the_texture() {
     let obj = texture(
         Layout::U2018_4,
         false,
-        "bc7",
+        "astc",
         4,
         4,
-        25,
+        48,
         &Pixels::Inline(&[0; 16]),
         &[],
     );
@@ -643,10 +643,10 @@ fn unsupported_formats_name_the_texture() {
     match assets.unwrap().decode_texture(7) {
         Err(Error::UnsupportedTextureFormat {
             name: texture,
-            format: 25,
+            format: 48,
             ..
         }) => {
-            assert_eq!(texture.as_deref(), Some("bc7"));
+            assert_eq!(texture.as_deref(), Some("astc"));
         }
         other => panic!("{other:?}"),
     }

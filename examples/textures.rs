@@ -158,7 +158,7 @@ mod output {
         assert_eq!(capture::out(), ["exported 1, failed 1"]);
         let err = capture::err();
         assert_eq!(err.len(), 1, "{err:?}");
-        assert!(err[0].starts_with("bc7 (20): "), "{err:?}");
+        assert!(err[0].starts_with("astc (20): "), "{err:?}");
     }
 
     #[test]

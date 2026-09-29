@@ -899,13 +899,22 @@ fn script_table_entries_are_aligned_even_when_the_table_is_not() {
 #[test]
 fn an_undecodable_texture_is_refused_before_its_stream_is_read() {
     // The stream file does not exist: reaching for it would give an I/O error instead.
-    let dir = TempDir::new("bc7");
+    let dir = TempDir::new("astc");
     let px = Pixels::Streamed {
         path: "missing.resS",
         offset: 0,
         size: 16,
     };
-    let obj = texture(Layout::U2018_4, false, "t", 4, 4, format::BC7, &px, &[]);
+    let obj = texture(
+        Layout::U2018_4,
+        false,
+        "t",
+        4,
+        4,
+        format::ASTC_4X4,
+        &px,
+        &[],
+    );
     let a = Assets::open(dir.file("t.assets", &file_2018(&[(7, TEXTURE_2D, obj)]))).unwrap();
     match a.decode_texture(7) {
         Err(Error::UnsupportedTextureFormat {
@@ -913,7 +922,7 @@ fn an_undecodable_texture_is_refused_before_its_stream_is_read() {
             format,
             ..
         }) => {
-            assert_eq!((texture.as_deref(), format), (Some("t"), format::BC7));
+            assert_eq!((texture.as_deref(), format), (Some("t"), format::ASTC_4X4));
         }
         other => panic!("{other:?}"),
     }
@@ -3089,13 +3098,13 @@ fn the_root_error_is_the_same_through_export() {
         1.0,
         &Mesh::BASE,
     );
-    let bc7 = texture(
+    let astc = texture(
         Layout::U2022_3,
         false,
         "t",
         4,
         4,
-        format::BC7,
+        format::ASTC_4X4,
         &Pixels::Inline(&[0; 16]),
         &[],
     );
@@ -3104,7 +3113,7 @@ fn the_root_error_is_the_same_through_export() {
         "2022.3.62f1",
         false,
         19,
-        &[(TEX, TEXTURE_2D, bc7), (1, SPRITE, s)],
+        &[(TEX, TEXTURE_2D, astc), (1, SPRITE, s)],
     );
     let mut a = Assets::open(dir.file("t.assets", &f)).unwrap();
     let direct = a.decode_texture(TEX).unwrap_err();
@@ -3116,7 +3125,7 @@ fn the_root_error_is_the_same_through_export() {
     ));
     for e in [&direct, &exported] {
         assert!(
-            matches!(e.root(), Error::UnsupportedTextureFormat { format: 25, .. }),
+            matches!(e.root(), Error::UnsupportedTextureFormat { format: 48, .. }),
             "{e:?}"
         );
         assert!(e.io_error().is_none());

@@ -74,10 +74,12 @@
 //! Malformed data is meant to give an [`Error`] rather than a panic. `tests/fuzz.rs` checks
 //! that over mutated files; it is evidence, not proof.
 
+mod bc7;
 mod bundle;
 pub mod decode;
 mod export;
 mod file;
+mod lzma;
 mod reader;
 mod serialized;
 mod sprite;

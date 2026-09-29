@@ -20,7 +20,7 @@ pub mod format {
     pub const DXT1: i32 = 10;
     pub const DXT5: i32 = 12;
     pub const BGRA32: i32 = 14;
-    pub const BC7: i32 = 25;
+    pub const ASTC_4X4: i32 = 48;
 }
 
 pub const TEXTURE_2D: i32 = 28;

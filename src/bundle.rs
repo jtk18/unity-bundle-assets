@@ -317,10 +317,11 @@ impl Bundle {
             let block = r.take(compressed)?;
             if block_flags & flags::COMPRESSION_MASK == 1 {
                 // LZMA's working memory is not part of its output: a table sized by the
-                // header's lc and lp for every block, and a dictionary as large as the output
-                // or the header's dictionary size, whichever is smaller. Held one block at a
-                // time, and charged against what the output leaves of the limit; the tables
-                // also add up, since many tiny blocks cost their setup many times over.
+                // header's lc and lp for every block, and (see `lzma_memory`) a dictionary as
+                // large as the output or the header's dictionary size, whichever is smaller.
+                // Held one block at a time, and charged against what the output leaves of the
+                // limit; the tables also add up, since many tiny blocks cost their setup many
+                // times over.
                 let (tables, dictionary) = lzma_memory(block, size)?;
                 charged += tables;
                 Error::limit(LimitKind::Decompressed, charged + dictionary, budget)?;
@@ -516,10 +517,12 @@ fn declared_len(declared_size: i64, header: usize, len: u64) -> Result<u64> {
         })
 }
 
-/// The working memory an LZMA block needs, `(tables, dictionary)` in bytes, from its
-/// properties header: `lc`, `lp` and `pb` within LZMA2's bounds (Unity writes lc 3, lp 0,
-/// pb 2), and a dictionary no larger than the output needs (a vector grown to it may hold
-/// twice that).
+/// What an LZMA block is charged against the decompression limit besides its output,
+/// `(tables, dictionary)` in bytes, from its properties header: `lc`, `lp` and `pb` within
+/// LZMA2's bounds (Unity writes lc 3, lp 0, pb 2), and a dictionary no larger than the output
+/// needs. This is the working memory of lzma-rs, which 0.1.0 used; the crate's own decoder
+/// needs the tables but no dictionary apart from its output, so the charge now errs high,
+/// kept so that the same bundles are refused as before.
 fn lzma_memory(block: &[u8], size: usize) -> Result<(u64, u64)> {
     let header = block
         .get(..5)
@@ -539,109 +542,198 @@ fn lzma_memory(block: &[u8], size: usize) -> Result<(u64, u64)> {
     Ok((tables, 2 * dictionary.max(4096).min(size.max(4096) as u64)))
 }
 
-/// Unity's LZMA: the 5-byte properties header, then the raw stream, with no size field. The
-/// output grows as it is written, so a false `size` costs nothing up front.
+/// Unity's LZMA: the 5-byte properties header, then the raw stream, with no size field.
 fn lzma_into(out: &mut Vec<u8>, data: &[u8], size: usize) -> Result<()> {
-    use lzma_rs::decompress::{Options, UnpackedSize};
-    let options = Options {
-        unpacked_size: UnpackedSize::UseProvided(Some(size as u64)),
-        // The dictionary never needs to be larger than what the block produces, and that is
-        // already held to the bundle's decompression limit.
-        memlimit: Some(size.max(4096)),
-        allow_incomplete: false,
-    };
-    let start = out.len();
-    lzma_rs::lzma_decompress_with_options(&mut &data[..], out, &options)
-        .map_err(|e| Error::Invalid(format!("LZMA block: {e}")))?;
-    let produced = out.len() - start;
-    if produced != size {
-        return Err(Error::Invalid(format!(
-            "LZMA block gave {produced} bytes, header says {size}"
-        )));
-    }
-    Ok(())
+    let bad = |what: &str| Error::Invalid(format!("LZMA block: {what}"));
+    let (header, stream) = data
+        .split_first_chunk::<5>()
+        .ok_or_else(|| bad("shorter than its 5-byte header"))?;
+    let props = crate::lzma::Props::parse(*header).ok_or_else(|| bad("bad properties"))?;
+    // Reserved, not filled: the output grows as the block makes it.
+    out.try_reserve(size)
+        .map_err(|_| Error::OutOfMemory { bytes: size as u64 })?;
+    crate::lzma::decode(&props, stream, out, size).map_err(|f| bad(&f.what))
 }
 
 /// An LZ4 block (not frame): sequences of literals and back-references. LZ4HC produces the
 /// same format. Matches refer only to this block's own output.
 fn lz4_into(out: &mut Vec<u8>, data: &[u8], size: usize) -> Result<()> {
-    let bad = |what: &str| Error::Invalid(format!("LZ4 block: {what}"));
     if size > data.len().saturating_mul(LZ4_MAX_RATIO).saturating_add(16) {
-        return Err(bad("claims more output than LZ4 can encode in its input"));
+        return Err(lz4_error(
+            "claims more output than LZ4 can encode in its input",
+        ));
     }
-    let base = out.len();
-    let end = base + size;
+    // Reserved, not filled: the output grows as the block makes it.
     out.try_reserve(size)
         .map_err(|_| Error::OutOfMemory { bytes: size as u64 })?;
-    let mut i = 0;
-    let length = |i: &mut usize, mut n: usize| -> Result<usize> {
+    let start = out.len();
+    lz4_block(data, out, size).map_err(|(made, e)| {
+        // The output holds what the block made before the fault.
+        out.truncate(start + made);
+        e
+    })
+}
+
+fn lz4_error(what: &str) -> Error {
+    Error::Invalid(format!("LZ4 block: {what}"))
+}
+
+/// Append an LZ4 block of `size` bytes to `out`. Copies are slice copies into output already
+/// grown for them, most of them a fixed 16 bytes. On failure, how many bytes it had made and
+/// why it stopped.
+fn lz4_block(
+    data: &[u8],
+    out: &mut Vec<u8>,
+    size: usize,
+) -> std::result::Result<(), (usize, Error)> {
+    let start = out.len();
+    let end = start + size;
+    let (mut i, mut o) = (0usize, start);
+    let fail = |o: usize, what: &str| Err((o - start, lz4_error(what)));
+    let length = |i: &mut usize, mut n: usize| -> Option<usize> {
         if n == 15 {
             loop {
-                let b = *data.get(*i).ok_or_else(|| bad("truncated length"))?;
+                let b = *data.get(*i)?;
                 *i += 1;
-                n = n
-                    .checked_add(b as usize)
-                    .ok_or_else(|| bad("length overflows"))?;
+                n = n.checked_add(b as usize)?;
                 if b != 255 {
                     break;
                 }
             }
         }
-        Ok(n)
+        Some(n)
     };
     loop {
-        let token = *data.get(i).ok_or_else(|| bad("truncated"))?;
+        let Some(&token) = data.get(i) else {
+            return fail(o, "truncated");
+        };
         i += 1;
-        let literals = length(&mut i, (token >> 4) as usize)?;
-        let src = i
-            .checked_add(literals)
-            .and_then(|e| data.get(i..e))
-            .ok_or_else(|| bad("literals run past the input"))?;
-        if out.len() + literals > end {
-            return Err(bad("output larger than the header says"));
+        let Some(literals) = length(&mut i, (token >> 4) as usize) else {
+            return fail(o, "truncated length");
+        };
+        if literals > end - o {
+            return fail(o, "output larger than the header says");
         }
-        out.extend_from_slice(src);
+        if o + literals > out.len() {
+            crate::lzma::grow(out, start, end, o + literals);
+        }
+        if literals <= 16 && i + 16 <= data.len() && o + 16 <= out.len() {
+            // Copy 16 and keep `literals`: the rest is overwritten or never used.
+            let chunk: [u8; 16] = data[i..i + 16].try_into().unwrap_or([0; 16]);
+            out[o..o + 16].copy_from_slice(&chunk);
+        } else {
+            let Some(src) = i.checked_add(literals).and_then(|e| data.get(i..e)) else {
+                return fail(o, "literals run past the input");
+            };
+            out[o..o + literals].copy_from_slice(src);
+        }
         i += literals;
+        o += literals;
         if i == data.len() {
             break;
         }
-        let offset = u16::from_le_bytes(
-            data.get(i..i + 2)
-                .ok_or_else(|| bad("truncated offset"))?
-                .try_into()
-                .unwrap(),
-        ) as usize;
+        let (Some(&lo), Some(&hi)) = (data.get(i), data.get(i + 1)) else {
+            return fail(o, "truncated offset");
+        };
+        let offset = usize::from(u16::from_le_bytes([lo, hi]));
         i += 2;
-        let matched = length(&mut i, (token & 15) as usize)? + 4;
-        if offset == 0 || offset > out.len() - base {
-            return Err(bad("offset outside the output"));
+        let Some(matched) = length(&mut i, (token & 15) as usize).map(|n| n + 4) else {
+            return fail(o, "truncated length");
+        };
+        if offset == 0 || offset > o - start {
+            return fail(o, "offset outside the output");
         }
-        if out.len() + matched > end {
-            return Err(bad("output larger than the header says"));
+        if matched > end - o {
+            return fail(o, "output larger than the header says");
         }
-        // The match may overlap the bytes it is producing. Its output repeats with period
-        // `offset` from `start`, so each pass can copy everything written since `start`,
-        // doubling the span: a one-byte run takes log2(length) copies, not length.
-        let start = out.len() - offset;
-        let mut left = matched;
-        while left > 0 {
-            let n = left.min(out.len() - start);
-            out.extend_from_within(start..start + n);
-            left -= n;
+        if o + matched > out.len() {
+            crate::lzma::grow(out, start, end, o + matched);
         }
+        let from = o - offset;
+        if offset >= 16 && matched <= 16 && o + 16 <= out.len() {
+            let chunk: [u8; 16] = out[from..from + 16].try_into().unwrap_or([0; 16]);
+            out[o..o + 16].copy_from_slice(&chunk);
+        } else if offset >= matched {
+            out.copy_within(from..from + matched, o);
+        } else {
+            // The match overlaps the bytes it is producing. Its output repeats with period
+            // `offset` from `from`, so each pass can copy everything written since `from`,
+            // doubling the span: a one-byte run takes log2(length) copies, not length.
+            let mut done = 0;
+            while done < matched {
+                let n = (matched - done).min(o + done - from);
+                out.copy_within(from..from + n, o + done);
+                done += n;
+            }
+        }
+        o += matched;
     }
-    if out.len() != end {
-        return Err(bad(&format!(
-            "gave {} bytes, header says {size}",
-            out.len() - base
-        )));
+    if o != end {
+        return fail(o, &format!("gave {} bytes, header says {size}", o - start));
     }
+    // The last fixed-size copy may have grown the output past the block's own bytes.
+    out.truncate(end);
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A block from a full LZMA encoder (Python's `lzma`, LZMA1 with lc 3, lp 0, pb 2 and a
+    /// 64 KiB dictionary, as Unity writes), of [`lzma_text`]: literals, matches, all four
+    /// repeated distances, short repeats and runs that overlap themselves, then the end marker
+    /// the encoder adds when it is not told the size. (Its data does not reach the short repeat
+    /// after a match or the fourth repeated distance; the corpus comparison and fuzzing do.)
+    const LZMA_BLOCK: &[u8] = include_bytes!("../tests/data/lzma-block.bin");
+
+    /// 2,000 bytes of words from a small vocabulary in a pseudo-random order.
+    fn lzma_text() -> Vec<u8> {
+        let vocab: [&[u8]; 13] = [
+            b"sprite",
+            b"texture",
+            b"atlas",
+            b"bundle",
+            b" ",
+            b"; ",
+            b"\0\0\0\0",
+            b"a",
+            b"ab",
+            b"abc",
+            b"Unity",
+            b"2018.4",
+            b"\xff",
+        ];
+        let mut s = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut out = Vec::new();
+        while out.len() < 2000 {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            out.extend_from_slice(vocab[(s % 13) as usize]);
+            if s % 7 == 0 {
+                out.extend([(s >> 8) as u8, (s >> 16) as u8]);
+            }
+        }
+        out.truncate(2000);
+        out
+    }
+
+    #[test]
+    fn test_lzma_block_with_matches() {
+        let text = lzma_text();
+        let mut out = vec![0xee; 3]; // output from earlier blocks, out of reach
+        lzma_into(&mut out, LZMA_BLOCK, text.len()).unwrap();
+        assert_eq!(out[3..], text[..]);
+        // Short of the size: the end marker comes first.
+        let err = lzma_into(&mut Vec::new(), LZMA_BLOCK, text.len() + 1).unwrap_err();
+        assert!(err.to_string().contains("end marker"), "{err}");
+        // Cut short: truncated, and the output is only what was made.
+        let mut out = Vec::new();
+        let err = lzma_into(&mut out, &LZMA_BLOCK[..300], text.len()).unwrap_err();
+        assert!(err.to_string().contains("truncated"), "{err}");
+        assert!(out.len() < text.len() && text.starts_with(&out));
+    }
 
     fn lz4(data: &[u8], size: usize) -> Result<Vec<u8>> {
         let mut out = vec![0xee; 3]; // output from earlier blocks, out of reach

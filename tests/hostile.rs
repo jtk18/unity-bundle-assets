@@ -118,10 +118,10 @@ fn sockets_are_refused_before_opening() {
 
 #[test]
 fn unsupported_formats_are_refused_before_any_read() {
-    // The stream file does not exist; a BC7 texture must fail on its format, not on I/O.
+    // The stream file does not exist; an ASTC texture must fail on its format, not on I/O.
     let dir = TempDir::new("fmt");
-    match streamed_from(&dir.0, "missing.resS", 25, 0, 16) {
-        Err(Error::UnsupportedTextureFormat { format: 25, .. }) => {}
+    match streamed_from(&dir.0, "missing.resS", 48, 0, 16) {
+        Err(Error::UnsupportedTextureFormat { format: 48, .. }) => {}
         other => panic!("{other:?}"),
     }
 }

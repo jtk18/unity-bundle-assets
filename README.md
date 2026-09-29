@@ -64,12 +64,16 @@ and open each with `Assets::from_bundle`.
   wrong numbers.
 - Packing rotation and flips, and tight packing (pixels outside the sprite's mesh are cleared,
   colour and alpha).
-- Texture formats Alpha8, ARGB4444, RGBA4444, RGB565, RGB24, RGBA32, ARGB32, BGRA32, DXT1
-  (BC1), DXT5 (BC3).
+- Texture formats Alpha8, R8, RG16, R16, RG32, RGB24, BGR24, RGB48, RGBA32, ARGB32, BGRA32,
+  RGBA64, ARGB4444, RGBA4444, RGB565, the half- and single-precision float formats (RHalf,
+  RGHalf, RGBAHalf, RFloat, RGFloat, RGBAFloat) and RGB9e5, and the block formats DXT1 (BC1),
+  DXT3 (BC2), DXT5 (BC3), BC4, BC5 and BC7.
 
 Exports follow AssetStudio where references disagree: the sprite's texture rectangle, not
 padded out to its full rect; Alpha8 as white with the stored alpha (UnityPy gives black);
-`Rotate90` packing undone counter-clockwise (UnityPy turns the other way, and no real sample
+formats with fewer channels filled out as red (then green) with the rest 0 and alpha opaque,
+16-bit channels rounded to the nearest byte and floats clamped to 0-1; `Rotate90` packing
+undone counter-clockwise (UnityPy turns the other way, and no real sample
 here settles it); the mask's pixel grid starts at the texture rectangle's own origin, not at
 the whole pixel the cut-out starts from, so it can sit a fraction of a pixel off it; and a
 triangle with no area covers nothing (Pillow, under UnityPy, draws it as a line). A tight
@@ -86,8 +90,8 @@ Each of these gives an error naming it:
   stream from a different bundle.
 - Engine releases before 5.5 (textures) or 2019.1 (sprites), after 6000.4, alpha builds, and
   files whose engine version was stripped outside a bundle.
-- Every texture format not listed above, among them crunch-compressed, BC4-7, ETC, EAC, ASTC,
-  PVRTC, R8, R16, RG16 and the half- and float-precision formats.
+- Every texture format not listed above: crunch-compressed, BC6H, ETC, EAC, ASTC, PVRTC, ATC
+  and YUY2.
 - Textures from files built for consoles (PlayStation, Xbox, Switch, Wii U, 3DS), whose GPU
   tiling this crate does not undo. This is a list of known console platforms: a file for a
   console Unity adds later would be decoded as if untiled.
@@ -168,8 +172,11 @@ Files are treated as hostile:
   object table takes about 100 bytes an object (about 400 MiB at `max_objects`), and each
   opening of a bundle's file builds its own. On top of that, at the default 16384 x 16384,
   decoding one texture holds up to about 1 GiB more for the RGBA result; a streamed texture's
-  stored pixels are widened to it in place, except DXT's, which are held beside it while they
-  are decoded: up to 1.25 GiB in all (DXT5). Exporting a sprite holds up to about 2.25 GiB
+  stored pixels are converted to it in place, except a block format's, which are held beside
+  it while they are decoded: up to 1.25 GiB in all (DXT5, BC5, BC7). A format stored wider
+  than RGBA8 is narrowed in its own buffer, but that buffer is its stored size: up to 16 bytes
+  a pixel, 4 GiB for a 16384 x 16384 RGBAFloat texture (streamed, it needs a stream file or
+  bundle that large). Exporting a sprite holds up to about 2.25 GiB
   more (the decoded texture, the sprite and its mask); each thread decoding and cutting in
   parallel holds about that much. Names are held as text, at most 4 KiB each: every sprite
   `Assets::sprites` reads and every texture `Assets::textures` lists keeps its name, and each
@@ -184,8 +191,8 @@ Files are treated as hostile:
   listing hold a few times `max_decompressed`: lower it for bundles from strangers. LZMA can
   expand a 150 KB file to the full 1 GiB of decompressed data, and 40 KB of a compressed
   bundle can make a 1 GiB texture. Allocations sized by the file fail as `Error::OutOfMemory`
-  where the crate makes them, but that is best effort: LZMA's own buffers, the object table
-  and other small growth abort on failure as usual, and an operating system that overcommits
+  where the crate makes them, but that is best effort: the object table and other small
+  growth abort on failure as usual, and an operating system that overcommits
   may never refuse. For files from strangers, lower `max_decompressed`, `max_texture_pixels`
   and `max_total_work`.
 - Streamed pixels are read only from the same bundle, or from a `.resS` / `.resource` file
@@ -215,16 +222,15 @@ over mutated files (set `UBA_FUZZ_ITERS` to run longer); it is evidence, not pro
 ## Tested against
 
 - A Unity 2022.3 macOS player build: all 9,436 sprites of its 754 MB `sharedassets0.assets`
-  export, and 1,756 of its 1,795 textures decode (the rest are 27 empty font textures and 12
-  BC7). Against UnityPy, 8,878 sprites are pixel-identical, 557 differ only in the colour of
+  export, and 1,768 of its 1,795 textures decode (the rest are 27 empty font textures); the
+  12 BC7 match unity-rs-core's decoder byte for byte. Against UnityPy, 8,878 sprites are pixel-identical, 557 differ only in the colour of
   fully transparent pixels (masking clears it; UnityPy keeps the texel), and one differs in 2
   pixels at a mask edge. Exporting every sprite and decoding every texture of that file takes
   about 4.5 s and 1 GB of memory (0.95 to 1.07 GB peak across runs and harnesses) on an Apple
   silicon Mac. In its `resources.assets`, 174 of 176 sprites export (two use a texture in
   another file); 164 match UnityPy up to transparent colour and 10 differ at mask edges, in 1
   to 136 pixels each. Across all 148 Unity files of the build (57 serialized files, built-in
-  resources included, and 91 bundles), 6,022 textures decode; the 76 that do not are 44
-  empty, 21 BC7, 10 RGBAFloat and one RHalf. Its 34 ARGB4444 textures match UnityPy exactly.
+  resources included, and 91 bundles), 6,054 textures decode; the 44 that do not are empty. Its 34 ARGB4444 textures match UnityPy exactly.
 - 737 asset bundles from a Unity 5.6.6, 5.6.7 and 2018.4 (.2, .11, .36) game and its mods: all
   open, and 15,193 textures export; the one failure is a dynamic font texture stored empty. On
   a sample of 171 bundles, 3,042 of the 3,056 textures UnityPy could decode are pixel-identical

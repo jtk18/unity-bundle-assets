@@ -30,6 +30,43 @@ pub mod format {
     pub const RGBA4444: i32 = 13;
     /// Blue, green, red, alpha, one byte each.
     pub const BGRA32: i32 = 14;
+    /// Blue, green, red, one byte each.
+    pub const BGR24: i32 = 8;
+    /// Red only, a little-endian 16-bit value. Decodes to red, with green and blue 0.
+    pub const R16: i32 = 9;
+    /// BC2: 4x4 blocks of 16 bytes, four bits of alpha a pixel.
+    pub const DXT3: i32 = 11;
+    /// Red only, a half-precision float. Floats decode clamped to 0-1, green and blue 0 where
+    /// the format has none.
+    pub const R_HALF: i32 = 15;
+    /// Red and green, half-precision floats.
+    pub const RG_HALF: i32 = 16;
+    /// Red, green, blue, alpha, half-precision floats.
+    pub const RGBA_HALF: i32 = 17;
+    /// Red only, a single-precision float.
+    pub const R_FLOAT: i32 = 18;
+    /// Red and green, single-precision floats.
+    pub const RG_FLOAT: i32 = 19;
+    /// Red, green, blue, alpha, single-precision floats.
+    pub const RGBA_FLOAT: i32 = 20;
+    /// Red, green, blue with nine bits each and a shared five-bit exponent.
+    pub const RGB9E5_FLOAT: i32 = 22;
+    /// BC4: 4x4 blocks of 8 bytes, one interpolated channel. Decodes to red.
+    pub const BC4: i32 = 26;
+    /// BC5: 4x4 blocks of 16 bytes, two interpolated channels. Decodes to red and green.
+    pub const BC5: i32 = 27;
+    /// BC7: 4x4 blocks of 16 bytes in eight modes, colour with or without alpha.
+    pub const BC7: i32 = 25;
+    /// Red and green, one byte each.
+    pub const RG16: i32 = 62;
+    /// Red only, one byte.
+    pub const R8: i32 = 63;
+    /// Red and green, little-endian 16-bit values.
+    pub const RG32: i32 = 72;
+    /// Red, green, blue, little-endian 16-bit values.
+    pub const RGB48: i32 = 73;
+    /// Red, green, blue, alpha, little-endian 16-bit values.
+    pub const RGBA64: i32 = 74;
 }
 
 /// Bytes in the first mip level, or `None` for a format this crate does not decode or a size
@@ -39,20 +76,24 @@ pub fn mip0_size(format: i32, width: u32, height: u32) -> Option<usize> {
     let (w, h) = (width as usize, height as usize);
     let blocks = w.div_ceil(4).checked_mul(h.div_ceil(4))?;
     let pixels = w.checked_mul(h)?;
+    match block_bytes(format) {
+        Some(n) => blocks.checked_mul(n),
+        None => pixels.checked_mul(pixel_format(format)?.0),
+    }
+}
+
+/// Bytes in each 4x4 block, for a format stored in blocks.
+const fn block_bytes(format: i32) -> Option<usize> {
     match format {
-        format::ALPHA8 => Some(pixels),
-        format::ARGB4444 | format::RGB565 | format::RGBA4444 => pixels.checked_mul(2),
-        format::RGB24 => pixels.checked_mul(3),
-        format::RGBA32 | format::ARGB32 | format::BGRA32 => pixels.checked_mul(4),
-        format::DXT1 => blocks.checked_mul(8),
-        format::DXT5 => blocks.checked_mul(16),
+        format::DXT1 | format::BC4 => Some(8),
+        format::DXT3 | format::DXT5 | format::BC5 | format::BC7 => Some(16),
         _ => None,
     }
 }
 
-/// Whether `format` is stored in 4x4 blocks (DXT1, DXT5).
+/// Whether `format` is stored in 4x4 blocks.
 pub(crate) const fn is_block_format(format: i32) -> bool {
-    matches!(format, format::DXT1 | format::DXT5)
+    block_bytes(format).is_some()
 }
 
 /// Whether this crate decodes `format`.
@@ -98,6 +139,26 @@ pub fn decode(format: i32, width: u32, height: u32, data: &[u8]) -> Result<Vec<u
         format::DXT5 => blocks(data, &mut out, w, h, 16, |b, px| {
             color_block(&b[8..], px, false);
             alpha_block(&b[..8], px);
+        }),
+        format::DXT3 => blocks(data, &mut out, w, h, 16, |b, px| {
+            color_block(&b[8..], px, false);
+            let bits = u64::from_le_bytes(b[..8].try_into().unwrap_or([0; 8]));
+            for (i, p) in px.iter_mut().enumerate() {
+                p[3] = widen((bits >> (i * 4)) as u16 & 15, 15);
+            }
+        }),
+        format::BC7 => blocks(data, &mut out, w, h, 16, crate::bc7::block),
+        format::BC4 => blocks(data, &mut out, w, h, 8, |b, px| {
+            let red = interpolated(b);
+            for (p, r) in px.iter_mut().zip(red) {
+                *p = [r, 0, 0, 255];
+            }
+        }),
+        format::BC5 => blocks(data, &mut out, w, h, 16, |b, px| {
+            let (red, green) = (interpolated(&b[..8]), interpolated(&b[8..]));
+            for (i, p) in px.iter_mut().enumerate() {
+                *p = [red[i], green[i], 0, 255];
+            }
         }),
         _ => {
             let Some((bpp, convert)) = pixel_format(format) else {
@@ -154,10 +215,10 @@ pub(crate) fn decode_owned(
         return decode(format, width, height, &data);
     }
     data.truncate(size);
-    data.try_reserve_exact(out_len - size)
-        .map_err(|_| Error::OutOfMemory {
-            bytes: (out_len - size) as u64,
-        })?;
+    // A format wider than RGBA8 narrows and needs no more room.
+    let more = out_len.saturating_sub(size);
+    data.try_reserve_exact(more)
+        .map_err(|_| Error::OutOfMemory { bytes: more as u64 })?;
     match format {
         // Already four bytes a pixel: reordered where they lie, or left as they are.
         format::RGBA32 => {}
@@ -183,8 +244,32 @@ pub(crate) fn decode_owned(
                 255,
             ]
         }),
-        // Any other format is decoded by copying, from the table `decode` uses.
-        _ => return decode(format, width, height, &data),
+        // Any other format converts through the table `decode` uses, still in place: a wider
+        // pixel narrows from the first pixel on (pixel i's output ends at or before where
+        // pixel i + 1 is stored), a narrower one widens from the last back.
+        _ => {
+            let Some((bpp, convert)) = pixel_format(format) else {
+                return decode(format, width, height, &data);
+            };
+            let mut px = [0u8; 4];
+            let mut stored = [0u8; 16];
+            let pixels = w * h;
+            if bpp >= 4 {
+                for i in 0..pixels {
+                    stored[..bpp].copy_from_slice(&data[i * bpp..(i + 1) * bpp]);
+                    convert(&stored[..bpp], &mut px);
+                    data[i * 4..(i + 1) * 4].copy_from_slice(&px);
+                }
+                data.truncate(out_len);
+            } else {
+                data.resize(out_len, 0);
+                for i in (0..pixels).rev() {
+                    stored[..bpp].copy_from_slice(&data[i * bpp..(i + 1) * bpp]);
+                    convert(&stored[..bpp], &mut px);
+                    data[i * 4..(i + 1) * 4].copy_from_slice(&px);
+                }
+            }
+        }
     }
     let row = w * 4;
     for i in 0..h / 2 {
@@ -234,6 +319,43 @@ fn pixel_format(format: i32) -> Option<(usize, Convert)> {
             ]);
         }),
         format::BGRA32 => (4, |s, d| d.copy_from_slice(&[s[2], s[1], s[0], s[3]])),
+        format::BGR24 => (3, |s, d| d.copy_from_slice(&[s[2], s[1], s[0], 255])),
+        format::R8 => (1, |s, d| d.copy_from_slice(&[s[0], 0, 0, 255])),
+        format::RG16 => (2, |s, d| d.copy_from_slice(&[s[0], s[1], 0, 255])),
+        format::R16 => (2, |s, d| d.copy_from_slice(&[unorm16(s), 0, 0, 255])),
+        format::RG32 => (4, |s, d| {
+            d.copy_from_slice(&[unorm16(s), unorm16(&s[2..]), 0, 255]);
+        }),
+        format::RGB48 => (6, |s, d| {
+            d.copy_from_slice(&[unorm16(s), unorm16(&s[2..]), unorm16(&s[4..]), 255]);
+        }),
+        format::RGBA64 => (8, |s, d| {
+            d.copy_from_slice(&[
+                unorm16(s),
+                unorm16(&s[2..]),
+                unorm16(&s[4..]),
+                unorm16(&s[6..]),
+            ]);
+        }),
+        format::R_HALF => (2, |s, d| {
+            d.copy_from_slice(&[unorm_float(half(s)), 0, 0, 255]);
+        }),
+        format::RG_HALF => (4, |s, d| {
+            d.copy_from_slice(&[unorm_float(half(s)), unorm_float(half(&s[2..])), 0, 255]);
+        }),
+        format::RGBA_HALF => (8, |s, d| {
+            d.copy_from_slice(&[0, 2, 4, 6].map(|i| unorm_float(half(&s[i..]))));
+        }),
+        format::R_FLOAT => (4, |s, d| {
+            d.copy_from_slice(&[unorm_float(single(s)), 0, 0, 255]);
+        }),
+        format::RG_FLOAT => (8, |s, d| {
+            d.copy_from_slice(&[unorm_float(single(s)), unorm_float(single(&s[4..])), 0, 255]);
+        }),
+        format::RGBA_FLOAT => (16, |s, d| {
+            d.copy_from_slice(&[0, 4, 8, 12].map(|i| unorm_float(single(&s[i..]))));
+        }),
+        format::RGB9E5_FLOAT => (4, |s, d| d.copy_from_slice(&rgb9e5(s))),
         _ => return None,
     })
 }
@@ -318,6 +440,14 @@ fn color_block(b: &[u8], out: &mut [[u8; 4]; 16], dxt1: bool) {
 
 /// BC3 alpha block: two endpoints and sixteen 3-bit indices.
 fn alpha_block(b: &[u8], out: &mut [[u8; 4]; 16]) {
+    for (px, a) in out.iter_mut().zip(interpolated(b)) {
+        px[3] = a;
+    }
+}
+
+/// One interpolated channel as BC3 stores alpha (and BC4 and BC5 their channels): two
+/// endpoints and sixteen 3-bit indices.
+fn interpolated(b: &[u8]) -> [u8; 16] {
     let (a0, a1) = (u16::from(b[0]), u16::from(b[1]));
     let mut palette = [0u8; 8];
     palette[0] = b[0];
@@ -337,9 +467,50 @@ fn alpha_block(b: &[u8], out: &mut [[u8; 4]; 16]) {
     for (i, &byte) in b[2..8].iter().enumerate() {
         bits |= u64::from(byte) << (8 * i);
     }
-    for (i, px) in out.iter_mut().enumerate() {
-        px[3] = palette[(bits >> (i * 3)) as usize & 7];
+    std::array::from_fn(|i| palette[(bits >> (i * 3)) as usize & 7])
+}
+
+/// A 16-bit channel as a byte, rounded to nearest.
+fn unorm16(s: &[u8]) -> u8 {
+    let v = u32::from(u16::from_le_bytes([s[0], s[1]]));
+    ((v * 255 + 32_895) >> 16) as u8
+}
+
+/// A float channel as a byte: clamped to 0-1, rounded to nearest (ties to even); NaN is 0.
+fn unorm_float(v: f32) -> u8 {
+    (v * 255.0).round_ties_even() as u8
+}
+
+fn half(s: &[u8]) -> f32 {
+    let bits = u16::from_le_bytes([s[0], s[1]]);
+    let sign = u32::from(bits & 0x8000) << 16;
+    let exponent = u32::from((bits >> 10) & 0x1f);
+    let fraction = u32::from(bits & 0x3ff);
+    match exponent {
+        0 => {
+            // Zero or subnormal: fraction * 2^-24.
+            let m = fraction as f32 * (1.0 / 16_777_216.0);
+            if sign == 0 {
+                m
+            } else {
+                -m
+            }
+        }
+        0x1f => f32::from_bits(sign | 0x7f80_0000 | (fraction << 13)),
+        _ => f32::from_bits(sign | ((exponent + 112) << 23) | (fraction << 13)),
     }
+}
+
+fn single(s: &[u8]) -> f32 {
+    f32::from_le_bytes([s[0], s[1], s[2], s[3]])
+}
+
+fn rgb9e5(s: &[u8]) -> [u8; 4] {
+    let v = u32::from_le_bytes([s[0], s[1], s[2], s[3]]);
+    // 2^(exponent - 15 - 9), exactly.
+    let scale = f32::from_bits((((v >> 27) & 31) + 127 - 24) << 23);
+    let c = |shift: u32| unorm_float(((v >> shift) & 0x1ff) as f32 * scale);
+    [c(0), c(9), c(18), 255]
 }
 
 #[cfg(test)]
@@ -359,10 +530,25 @@ mod tests {
             format::RGB565,
             format::RGBA4444,
             format::BGRA32,
+            format::BGR24,
+            format::R8,
+            format::RG16,
+            format::R16,
+            format::RG32,
+            format::RGB48,
+            format::RGBA64,
+            format::R_HALF,
+            format::RG_HALF,
+            format::RGBA_HALF,
+            format::R_FLOAT,
+            format::RG_FLOAT,
+            format::RGBA_FLOAT,
+            format::RGB9E5_FLOAT,
         ] {
             let size = mip0_size(format, 5, 3).unwrap();
             for extra in [0, 12] {
-                let mut data = Vec::with_capacity(5 * 3 * 4 + extra);
+                // Wider formats narrow into the pixels' own room.
+                let mut data = Vec::with_capacity((5 * 3 * 4).max(size) + extra);
                 data.extend((0..size + extra).map(|i| (i * 37 % 251) as u8));
                 let at = data.as_ptr();
                 let want = decode(format, 5, 3, &data).unwrap();
@@ -371,6 +557,92 @@ mod tests {
                 assert_eq!(got, want, "format {format}, {extra} extra");
             }
         }
+    }
+
+    #[test]
+    fn test_wide_and_float_pixels() {
+        let one = |format, stored: &[u8]| decode(format, 1, 1, stored).unwrap();
+        assert_eq!(one(format::BGR24, &[1, 2, 3]), [3, 2, 1, 255]);
+        assert_eq!(one(format::R8, &[9]), [9, 0, 0, 255]);
+        assert_eq!(one(format::RG16, &[9, 8]), [9, 8, 0, 255]);
+        // 16-bit channels round to nearest: 0x8080 is 128.5 levels of 255, 0x7f7f 127.5.
+        assert_eq!(one(format::R16, &[0xff, 0xff]), [255, 0, 0, 255]);
+        assert_eq!(
+            one(format::RGB48, &[0x80, 0x80, 0x7f, 0x7f, 0, 0]),
+            [128, 127, 0, 255]
+        );
+        // Floats clamp to 0-1 and round half to even; NaN is 0.
+        let f = |v: f32| v.to_le_bytes();
+        let px = [f(0.5), f(-1.0), f(7.0), f(f32::NAN)].concat();
+        assert_eq!(one(format::RGBA_FLOAT, &px), [128, 0, 255, 0]);
+        // Halves: 1.0 is 0x3c00, 0.5 is 0x3800, infinity 0x7c00.
+        let px = [0x00, 0x3c, 0x00, 0x38, 0x00, 0x7c, 0x00, 0x00];
+        assert_eq!(one(format::RGBA_HALF, &px), [255, 128, 255, 0]);
+        // RGB9E5: mantissas 256, 128, 0 with exponent 16 give 2^-8 each step: 1.0, 0.5, 0.
+        let v: u32 = 256 | (128 << 9) | (16 << 27);
+        assert_eq!(
+            one(format::RGB9E5_FLOAT, &v.to_le_bytes()),
+            [255, 128, 0, 255]
+        );
+    }
+
+    #[test]
+    fn test_dxt3_bc4_bc5_blocks() {
+        let red = 0xf800u16.to_le_bytes();
+        let colour = [red[0], red[1], red[0], red[1], 0, 0, 0, 0];
+        // DXT3: pixel 0's alpha nibble 3, pixel 1's 15, the rest 0.
+        let block = [[0xf3, 0, 0, 0, 0, 0, 0, 0], colour].concat();
+        let out = decode(format::DXT3, 4, 4, &block).unwrap();
+        assert_eq!(at(&out, 4, 4, 0, 0), [255, 0, 0, 51]);
+        assert_eq!(at(&out, 4, 4, 1, 0), [255, 0, 0, 255]);
+        assert_eq!(at(&out, 4, 4, 2, 0), [255, 0, 0, 0]);
+        // BC4: endpoints 200 and 100, pixel 0 index 1 (the second endpoint), pixel 1 index 2.
+        let channel = [200, 100, 0b010_001, 0, 0, 0, 0, 0];
+        let out = decode(format::BC4, 4, 4, &channel).unwrap();
+        assert_eq!(at(&out, 4, 4, 0, 0), [100, 0, 0, 255]);
+        assert_eq!(at(&out, 4, 4, 1, 0), [185, 0, 0, 255]);
+        // BC5: red then green, each a BC4 block.
+        let other = [50, 60, 0, 0, 0, 0, 0, 0];
+        let out = decode(format::BC5, 4, 4, &[channel, other].concat()).unwrap();
+        assert_eq!(at(&out, 4, 4, 0, 0), [100, 50, 0, 255]);
+    }
+
+    #[test]
+    fn test_bc7_every_mode() {
+        // 64 pseudo-random blocks, block i in mode i % 9 (the ninth the reserved mode, first
+        // byte 0). The hash was taken when this output matched unity-rs-core 0.5.2's decoder
+        // (texture2ddecoder) byte for byte.
+        let mut s = 0x2545_f491_4f6c_dd1d_u64;
+        let mut data: Vec<u8> = (0..64 * 16)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                (s >> 24) as u8
+            })
+            .collect();
+        for (i, b) in data.chunks_exact_mut(16).enumerate() {
+            let m = i % 9;
+            b[0] = if m == 8 {
+                0
+            } else {
+                b[0].checked_shl(m as u32 + 1).unwrap_or(0) | (1 << m)
+            };
+        }
+        let out = decode(format::BC7, 32, 32, &data).unwrap();
+        let hash = out.iter().fold(0xcbf2_9ce4_8422_2325_u64, |h, &x| {
+            (h ^ u64::from(x)).wrapping_mul(0x100_0000_01b3)
+        });
+        assert_eq!(hash, 0x0a1e_fe0c_f8b9_c5e7);
+        // A reserved-mode block is transparent black.
+        let mut px = [[1u8; 4]; 16];
+        crate::bc7::block(&[0; 16], &mut px);
+        assert_eq!(px, [[0; 4]; 16]);
+        // Mode 6, every endpoint bit and p-bit set: opaque white whatever the indices.
+        let mut block = [0xffu8; 16];
+        block[0] = 0b1100_0000;
+        crate::bc7::block(&block, &mut px);
+        assert_eq!(px, [[255; 4]; 16]);
     }
 
     /// The output pixel for stored pixel (x, y), y counted from the bottom as stored.
