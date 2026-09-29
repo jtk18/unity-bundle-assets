@@ -1,5 +1,5 @@
 //! Read every sprite and count them by texture format, packing, and atlas use:
-//! `cargo run --example survey -- <file>`.
+//! `cargo run --example survey -- <file-or-bundle>`.
 
 #[macro_use]
 mod common;
@@ -7,12 +7,17 @@ mod common;
 use std::collections::BTreeMap;
 use unity_bundle_assets::{Assets, Error, Settings};
 
+/// How to call it; the README's line for this example must match.
+const USAGE: &str = "usage: survey <file-or-bundle>";
+
 fn main() -> std::process::ExitCode {
-    common::finish(run())
+    common::finish(run(std::env::args_os().skip(1)))
 }
 
-fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let path = std::env::args_os().nth(1).ok_or("usage: survey <file>")?;
+fn run(
+    mut args: impl Iterator<Item = std::ffi::OsString>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let path = args.next().ok_or(USAGE)?;
     let assets = Assets::open(&path)?;
     let list = assets.sprites(|_| true);
     let mut printed = 0;
@@ -106,5 +111,19 @@ fn kind(e: &Error) -> String {
         Error::OutOfMemory { .. } => "out of memory".into(),
         Error::Io { error, .. } => format!("io {:?}", error.kind()),
         _ => "other".into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use common::fixture::{args, sample, TempDir};
+
+    #[test]
+    fn surveys_a_file() {
+        let dir = TempDir::new("ex-survey");
+        let file = sample(&dir, true);
+        run(args(&[file.as_os_str()])).unwrap();
+        assert_eq!(run(args(&[])).unwrap_err().to_string(), USAGE);
     }
 }

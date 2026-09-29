@@ -9,15 +9,18 @@
 #[macro_use]
 mod common;
 
+/// How to call it; the README's line for this example must match.
+const USAGE: &str = "usage: textures <file-or-bundle> <out-dir> [name-prefix...]";
+
 fn main() -> std::process::ExitCode {
-    common::finish(run())
+    common::finish(run(std::env::args_os().skip(1)))
 }
 
-fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let mut args = std::env::args_os().skip(1);
-    let usage = "usage: textures <file-or-bundle> <out-dir> [name-prefix...]";
-    let path = args.next().ok_or(usage)?;
-    let out = std::path::PathBuf::from(args.next().ok_or(usage)?);
+fn run(
+    mut args: impl Iterator<Item = std::ffi::OsString>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let path = args.next().ok_or(USAGE)?;
+    let out = std::path::PathBuf::from(args.next().ok_or(USAGE)?);
     let mut prefixes = Vec::new();
     while let Some(prefix) = common::text_arg(&mut args, "a name prefix")? {
         prefixes.push(prefix);
@@ -59,4 +62,34 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Err(format!("{failed} not exported").into());
     }
     Ok(summary?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use common::fixture::{args, sample, TempDir, TEXTURE};
+
+    #[test]
+    fn exports_the_textures_as_pngs() {
+        let dir = TempDir::new("ex-textures");
+        let file = sample(&dir, false);
+        let out = dir.0.join("out");
+        run(args(&[file.as_os_str(), out.as_os_str()])).unwrap();
+        let png = image::open(out.join(format!("tex_{TEXTURE}.png"))).unwrap();
+        assert_eq!((png.width(), png.height()), (4, 4));
+    }
+
+    #[test]
+    fn a_texture_it_cannot_decode_fails_the_run_but_not_the_others() {
+        let dir = TempDir::new("ex-textures-bad");
+        let file = sample(&dir, true);
+        let out = dir.0.join("out");
+        let e = run(args(&[file.as_os_str(), out.as_os_str()])).unwrap_err();
+        assert_eq!(e.to_string(), "1 not exported");
+        assert!(out.join(format!("tex_{TEXTURE}.png")).exists());
+        assert_eq!(
+            run(args(&[file.as_os_str()])).unwrap_err().to_string(),
+            USAGE
+        );
+    }
 }

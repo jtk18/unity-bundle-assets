@@ -147,16 +147,35 @@ macro_rules! outln {
 }
 
 /// [`outln!`]'s writer.
+#[cfg(not(test))]
 pub fn write_line(line: std::fmt::Arguments<'_>) -> std::io::Result<()> {
     use std::io::Write;
     writeln!(std::io::stdout().lock(), "{line}")
 }
 
+/// Under test, through `println!`, which the test harness captures.
+#[cfg(test)]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "the same signature as the real one"
+)]
+pub fn write_line(line: std::fmt::Arguments<'_>) -> std::io::Result<()> {
+    println!("{line}");
+    Ok(())
+}
+
 /// Write a line to standard error, dropping it if standard error is gone (a closed pipe):
 /// the exit status still says what happened.
+#[cfg(not(test))]
 fn to_stderr(line: std::fmt::Arguments<'_>) {
     use std::io::Write;
     let _ = writeln!(std::io::stderr().lock(), "{line}");
+}
+
+/// Under test, through `eprintln!`, which the test harness captures.
+#[cfg(test)]
+fn to_stderr(line: std::fmt::Arguments<'_>) {
+    eprintln!("{line}");
 }
 
 /// End an example: print its error, if any, as one cleaned line (not `Debug`), and exit
@@ -200,6 +219,84 @@ pub fn report(printed: &mut usize, line: impl FnOnce() -> String) {
         to_stderr(format_args!("(further errors are counted, not printed)"));
     }
     *printed += 1;
+}
+
+/// The crate's test file builders.
+#[cfg(test)]
+#[path = "../../tests/common/mod.rs"]
+mod builders;
+
+/// Files for the examples' own tests: each example is run on them under `cargo test`, so an
+/// example that stops working fails the build rather than a user.
+#[cfg(test)]
+pub mod fixture {
+    use super::builders;
+    pub use builders::TempDir;
+    use builders::{format, serialized, sprite, texture, Mesh, Pixels, SPRITE, TEXTURE_2D};
+
+    /// The texture's path ID in [`sample`].
+    pub const TEXTURE: i64 = 10;
+    /// The sprite's path ID in [`sample`].
+    pub const SPRITE_ID: i64 = 1;
+
+    /// A Unity 2022.3 file with a 4x4 RGBA32 texture "tex" and a sprite "icon" over its lower
+    /// left 2x2 pixels; with `bad`, also a texture "bc7" in a format the crate does not
+    /// decode.
+    pub fn sample(dir: &TempDir, bad: bool) -> std::path::PathBuf {
+        let rgba: Vec<u8> = (0..64).collect();
+        let tex = texture(
+            builders::Layout::U2022_3,
+            false,
+            "tex",
+            4,
+            4,
+            format::RGBA32,
+            &Pixels::Inline(&rgba),
+            &[],
+        );
+        let r = [0.0, 0.0, 2.0, 2.0];
+        let icon = sprite(
+            false,
+            false,
+            "icon",
+            r,
+            [0.0, 0.0],
+            1,
+            0,
+            TEXTURE,
+            0,
+            r,
+            0b10,
+            1.0,
+            &Mesh::BASE,
+        );
+        let mut objects = vec![(TEXTURE, TEXTURE_2D, tex), (SPRITE_ID, SPRITE, icon)];
+        if bad {
+            let bc7 = texture(
+                builders::Layout::U2022_3,
+                false,
+                "bc7",
+                4,
+                4,
+                format::BC7,
+                &Pixels::Inline(&[0; 16]),
+                &[],
+            );
+            objects.push((20, TEXTURE_2D, bc7));
+        }
+        dir.file(
+            "sample.assets",
+            &serialized(22, "2022.3.62f1", false, 19, &objects),
+        )
+    }
+
+    /// Arguments as the command line gives them.
+    pub fn args(list: &[&std::ffi::OsStr]) -> std::vec::IntoIter<std::ffi::OsString> {
+        list.iter()
+            .map(|a| a.to_os_string())
+            .collect::<Vec<_>>()
+            .into_iter()
+    }
 }
 
 #[cfg(test)]

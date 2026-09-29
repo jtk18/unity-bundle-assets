@@ -6,15 +6,17 @@ mod common;
 
 use std::collections::BTreeMap;
 
+/// How to call it; the README's line for this example must match.
+const USAGE: &str = "usage: list <file-or-bundle> [class-id]";
+
 fn main() -> std::process::ExitCode {
-    common::finish(run())
+    common::finish(run(std::env::args_os().skip(1)))
 }
 
-fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let mut args = std::env::args_os().skip(1);
-    let path = args
-        .next()
-        .ok_or("usage: list <file-or-bundle> [class-id]")?;
+fn run(
+    mut args: impl Iterator<Item = std::ffi::OsString>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let path = args.next().ok_or(USAGE)?;
     let filter: Option<i32> = common::text_arg(&mut args, "the class id")?
         .map(|s| s.parse().map_err(|e| format!("the class id: {e}")))
         .transpose()?;
@@ -61,4 +63,28 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         outln!("({} more classes)", classes - common::MAX_REPORTED);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use common::fixture::{args, sample, TempDir};
+    use std::ffi::OsStr;
+
+    #[test]
+    fn lists_a_file_and_a_class() {
+        let dir = TempDir::new("ex-list");
+        let file = sample(&dir, false);
+        run(args(&[file.as_os_str()])).unwrap();
+        run(args(&[file.as_os_str(), OsStr::new("28")])).unwrap();
+    }
+
+    #[test]
+    fn says_what_is_wrong_with_its_arguments() {
+        assert_eq!(run(args(&[])).unwrap_err().to_string(), USAGE);
+        let dir = TempDir::new("ex-list-bad");
+        let file = sample(&dir, false);
+        let e = run(args(&[file.as_os_str(), OsStr::new("x")])).unwrap_err();
+        assert!(e.to_string().starts_with("the class id"), "{e}");
+    }
 }

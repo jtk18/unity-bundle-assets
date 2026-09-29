@@ -21,9 +21,26 @@ thiserror = "2"
 [dev-dependencies]
 image = { version = "0.25", default-features = false, features = ["png"] }
 
-# The examples' shared helpers carry tests; run them once, with the rest, under `cargo test`.
+# Each example runs its own tests on a small generated file under `cargo test`, so one that
+# stops working fails the build (the helpers' tests in examples/common run with each).
+[[example]]
+name = "dump"
+test = true
+
 [[example]]
 name = "export"
+test = true
+
+[[example]]
+name = "list"
+test = true
+
+[[example]]
+name = "survey"
+test = true
+
+[[example]]
+name = "textures"
 test = true
 
 [lints.rust]

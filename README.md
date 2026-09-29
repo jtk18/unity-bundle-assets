@@ -241,12 +241,15 @@ over mutated files (set `UBA_FUZZ_ITERS` to run longer); it is evidence, not pro
 The examples are the tools used to work out and check the layouts:
 
 ```sh
-cargo run --example list -- <file> [class-id]           # objects by class, with names
-cargo run --example dump -- <file> <path-id> [bytes]     # hex dump of one object
-cargo run --example survey -- <file>                     # sprites by texture format and packing
-cargo run --release --example export -- <file> <out-dir> [name-prefix...]
+cargo run --example list -- <file-or-bundle> [class-id]                 # objects by class
+cargo run --example dump -- <file-or-bundle> <path-id> [max-bytes]      # hex dump of one object
+cargo run --example survey -- <file-or-bundle>                          # sprites by format, packing
+cargo run --release --example export -- <file-or-bundle> <out-dir> [name-prefix...]
 cargo run --release --example textures -- <file-or-bundle> <out-dir> [name-prefix...]
 ```
+
+Each example runs on a small generated file under `cargo test`, and `tests/readme.rs` holds
+these lines to the examples' own usage, so neither drifts from the code.
 
 ## Minimum Rust version
 
