@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.1 (2026-09-29)
 
 - `Sprite` and `SpriteAtlas` from Unity 2018.1 (was 2019.1): no secondary textures before
   2019.1, the 2017-2018 vertex format numbering, and 2018.1's `m_SourceSkin`. The 19 real

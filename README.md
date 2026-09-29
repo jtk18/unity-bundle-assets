@@ -91,7 +91,10 @@ Each of these gives an error naming it:
 - Engine releases before 5.5 (textures) or 2018.1 (sprites), after 6000.4, alpha builds, and
   files whose engine version was stripped outside a bundle.
 - Every texture format not listed above: crunch-compressed, BC6H, ETC, EAC, ASTC, PVRTC, ATC
-  and YUY2.
+  and YUY2. For those, and for audio, meshes, animation or writing assets, see
+  [`unity-rs-core`](https://crates.io/crates/unity-rs-core) and
+  [`unity-asset`](https://crates.io/crates/unity-asset), which cover far more of Unity with
+  more dependencies.
 - Textures from files built for consoles (PlayStation, Xbox, Switch, Wii U, 3DS), whose GPU
   tiling this crate does not undo. This is a list of known console platforms: a file for a
   console Unity adds later would be decoded as if untiled.
