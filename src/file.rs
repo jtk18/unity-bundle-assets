@@ -164,7 +164,7 @@ const fn flags() -> Option<(i32, i32, i32)> {
             target_arch = "s390x"
         )
     ))]
-    return Some((0o4000, 0o400000, 0o400));
+    return Some((0o4000, 0o400_000, 0o400));
     #[cfg(all(
         any(target_os = "linux", target_os = "android"),
         any(
@@ -174,7 +174,7 @@ const fn flags() -> Option<(i32, i32, i32)> {
             target_arch = "powerpc64"
         )
     ))]
-    return Some((0o4000, 0o100000, 0o400));
+    return Some((0o4000, 0o100_000, 0o400));
     #[cfg(all(target_os = "linux", any(target_arch = "mips", target_arch = "mips64")))]
     return Some((0x80, 0x20000, 0x800));
     #[cfg(all(target_os = "linux", target_arch = "sparc64"))]
