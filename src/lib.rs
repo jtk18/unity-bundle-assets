@@ -262,7 +262,7 @@ impl Error {
     }
 }
 
-/// Which of the [`Limits`] a [`Error::LimitExceeded`] is about.
+/// Which of the [`Limits`] an [`Error::LimitExceeded`] is about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum LimitKind {
