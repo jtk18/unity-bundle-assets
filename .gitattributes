@@ -1,0 +1,4 @@
+# Checked out with LF everywhere, Windows included: the README tests read the README line by
+# line, and test vectors are bytes.
+* text=auto eol=lf
+*.bin binary
