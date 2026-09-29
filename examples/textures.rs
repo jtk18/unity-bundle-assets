@@ -67,7 +67,15 @@ fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use common::fixture::{args, sample, TempDir, TEXTURE};
+    use common::fixture::{args, sample, sample_bundle, TempDir, TEXTURE};
+
+    #[test]
+    fn exports_from_a_bundle() {
+        let dir = TempDir::new("ex-textures-bundle");
+        let out = dir.0.join("out");
+        run(args(&[sample_bundle(&dir).as_os_str(), out.as_os_str()])).unwrap();
+        assert!(out.join(format!("tex_{TEXTURE}.png")).exists());
+    }
 
     #[test]
     fn exports_the_textures_as_pngs() {
@@ -76,7 +84,7 @@ mod tests {
         let out = dir.0.join("out");
         run(args(&[file.as_os_str(), out.as_os_str()])).unwrap();
         let png = image::open(out.join(format!("tex_{TEXTURE}.png"))).unwrap();
-        assert_eq!((png.width(), png.height()), (4, 4));
+        assert_eq!((png.width(), png.height()), (4, 2));
     }
 
     #[test]
@@ -91,5 +99,82 @@ mod tests {
             run(args(&[file.as_os_str()])).unwrap_err().to_string(),
             USAGE
         );
+    }
+}
+
+/// Added by the mutation review: what `textures` writes, selects and prints.
+#[cfg(test)]
+mod output {
+    use super::*;
+    use common::capture;
+    use common::fixture::{args, sample, TempDir, TEXTURE};
+    use common::more_fixtures::{self, png};
+    use std::ffi::OsStr;
+
+    #[test]
+    fn the_png_holds_the_decoded_texture() {
+        let dir = TempDir::new("mk-tex-px");
+        let file = sample(&dir, false);
+        let out = dir.0.join("out");
+        let _ = capture::out();
+        run(args(&[file.as_os_str(), out.as_os_str()])).unwrap();
+        assert_eq!(capture::out(), ["exported 1, failed 0"]);
+        let want = unity_bundle_assets::Assets::open(&file)
+            .unwrap()
+            .decode_texture(TEXTURE)
+            .unwrap();
+        assert_eq!(
+            png(&out.join(format!("tex_{TEXTURE}.png"))),
+            (want.width(), want.height(), want.rgba().to_vec())
+        );
+    }
+
+    #[test]
+    fn a_prefix_selects_textures() {
+        let dir = TempDir::new("mk-tex-prefix");
+        let file = sample(&dir, true);
+        let out = dir.0.join("out");
+        // "te" leaves out the texture it cannot decode, so the run succeeds.
+        run(args(&[
+            file.as_os_str(),
+            out.as_os_str(),
+            OsStr::new("zz"),
+            OsStr::new("te"),
+        ]))
+        .unwrap();
+        let files: Vec<_> = std::fs::read_dir(&out)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(files, [format!("tex_{TEXTURE}.png")]);
+    }
+
+    #[test]
+    fn a_failure_is_counted_and_reported() {
+        let dir = TempDir::new("mk-tex-fail");
+        let file = sample(&dir, true);
+        let (_, _) = (capture::out(), capture::err());
+        assert!(run(args(&[file.as_os_str(), dir.0.join("out").as_os_str()])).is_err());
+        assert_eq!(capture::out(), ["exported 1, failed 1"]);
+        let err = capture::err();
+        assert_eq!(err.len(), 1, "{err:?}");
+        assert!(err[0].starts_with("bc7 (20): "), "{err:?}");
+    }
+
+    #[test]
+    fn names_are_cleaned() {
+        let dir = TempDir::new("mk-tex-names");
+        let file = more_fixtures::textures(&dir, &[(7, "../up")]);
+        let out = dir.0.join("out");
+        run(args(&[file.as_os_str(), out.as_os_str()])).unwrap();
+        assert!(out.join(".._up_7.png").exists());
+    }
+
+    #[test]
+    fn a_missing_input_makes_no_folder() {
+        let dir = TempDir::new("mk-tex-missing");
+        let out = dir.0.join("out");
+        assert!(run(args(&[dir.0.join("missing").as_os_str(), out.as_os_str()])).is_err());
+        assert!(!out.exists());
     }
 }

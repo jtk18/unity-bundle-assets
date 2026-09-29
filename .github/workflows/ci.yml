@@ -1,0 +1,55 @@
+# Checks every push to main and every pull request: the same gate the release workflow
+# runs before it publishes (format, lints, tests including the examples and the README,
+# docs, the minimum Rust version), on Linux and macOS. It never publishes.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Toolchains
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy,rustfmt
+          rustup toolchain install 1.83 --profile minimal
+          rustup default stable
+          rustup target add wasm32-unknown-unknown
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Lints
+        run: |
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo clippy --locked --target wasm32-unknown-unknown --lib -- -D warnings
+
+      - name: Tests (library, examples, README)
+        run: cargo test --locked
+
+      - name: Docs
+        env:
+          RUSTDOCFLAGS: -D warnings -D rustdoc::all
+        run: cargo doc --locked --no-deps
+
+      - name: Minimum Rust version
+        run: cargo +1.83 check --locked --lib

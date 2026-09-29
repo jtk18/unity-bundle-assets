@@ -117,7 +117,13 @@ fn kind(e: &Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use common::fixture::{args, sample, TempDir};
+    use common::fixture::{args, sample, sample_bundle, TempDir};
+
+    #[test]
+    fn surveys_a_bundle() {
+        let dir = TempDir::new("ex-survey-bundle");
+        run(args(&[sample_bundle(&dir).as_os_str()])).unwrap();
+    }
 
     #[test]
     fn surveys_a_file() {
@@ -125,5 +131,56 @@ mod tests {
         let file = sample(&dir, true);
         run(args(&[file.as_os_str()])).unwrap();
         assert_eq!(run(args(&[])).unwrap_err().to_string(), USAGE);
+    }
+}
+
+/// Added by the mutation review: what `survey` counts and prints.
+#[cfg(test)]
+mod output {
+    use super::*;
+    use common::capture;
+    use common::fixture::{args, TempDir, SPRITE_ID};
+    use common::more_fixtures::{self, broken, sprite_on, TEXTURE};
+
+    #[test]
+    fn groups_sprites_by_texture_packing_and_atlas() {
+        let dir = TempDir::new("mk-survey");
+        let file = more_fixtures::sprites(
+            &dir,
+            vec![
+                (SPRITE_ID, sprite_on("icon", TEXTURE, 0, 0b10)),
+                // Packed, rectangle, flipped horizontally.
+                (2, sprite_on("packed", TEXTURE, 0, 0b111)),
+                // Packed, tight, unrotated.
+                (3, sprite_on("tight", TEXTURE, 0, 0b01)),
+                // In an atlas the file does not hold.
+                (4, sprite_on("atlased", TEXTURE, 5, 0b10)),
+                // On a texture the file does not hold.
+                (5, sprite_on("orphan", 99, 0, 0b10)),
+                (30, broken()),
+            ],
+        );
+        let (_, _) = (capture::out(), capture::err());
+        run(args(&[file.as_os_str()])).unwrap();
+        assert_eq!(
+            capture::out(),
+            [
+                "sprites read 5, skipped 1",
+                "     1 format 4 rect FlipHorizontal atlas=false",
+                "     1 format 4 rect Unrotated atlas=false",
+                "     1 format 4 rect Unrotated atlas=true",
+                "     1 format 4 tight Unrotated atlas=false",
+                "     1 texture error: not found rect Unrotated atlas=false",
+            ]
+        );
+        let err = capture::err();
+        assert_eq!(err.len(), 1, "{err:?}");
+        assert!(err[0].starts_with("sprite 30: "), "{err:?}");
+    }
+
+    #[test]
+    fn a_file_it_cannot_open_is_an_error() {
+        let dir = TempDir::new("mk-survey-missing");
+        assert!(run(args(&[dir.0.join("missing").as_os_str()])).is_err());
     }
 }

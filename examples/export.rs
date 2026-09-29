@@ -77,8 +77,16 @@ fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use common::fixture::{args, sample, TempDir};
+    use common::fixture::{args, sample, sample_bundle, TempDir};
     use std::ffi::OsStr;
+
+    #[test]
+    fn exports_from_a_bundle() {
+        let dir = TempDir::new("ex-export-bundle");
+        let out = dir.0.join("out");
+        run(args(&[sample_bundle(&dir).as_os_str(), out.as_os_str()])).unwrap();
+        assert!(out.join("icon.png").exists());
+    }
 
     #[test]
     fn exports_the_sprites_as_pngs() {
@@ -86,8 +94,10 @@ mod tests {
         let file = sample(&dir, false);
         let out = dir.0.join("out");
         run(args(&[file.as_os_str(), out.as_os_str()])).unwrap();
-        let png = image::open(out.join("icon.png")).unwrap();
-        assert_eq!((png.width(), png.height()), (2, 2));
+        let png = image::open(out.join("icon.png")).unwrap().to_rgba8();
+        assert_eq!((png.width(), png.height()), (2, 1));
+        // The sprite is the texture's bottom-left 2x1: the first two stored pixels, as stored.
+        assert_eq!(png.into_raw(), (0..8).collect::<Vec<u8>>());
         // A prefix nothing matches exports nothing, and is not a failure.
         let none = dir.0.join("none");
         run(args(&[
@@ -111,6 +121,109 @@ mod tests {
         assert_eq!(
             run(args(&[missing.as_os_str()])).unwrap_err().to_string(),
             USAGE
+        );
+    }
+}
+
+/// Added by the mutation review: what `export` writes, names and prints.
+#[cfg(test)]
+mod output {
+    use super::*;
+    use common::capture;
+    use common::fixture::{args, sample, TempDir, SPRITE_ID};
+    use common::more_fixtures::{self, broken, png, sprite_on, TEXTURE};
+    use std::ffi::OsStr;
+
+    /// The file names in `dir`, sorted.
+    fn names(dir: &std::path::Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn the_png_holds_the_sprites_own_pixels() {
+        let dir = TempDir::new("mk-export-px");
+        let file = sample(&dir, false);
+        let out = dir.0.join("out");
+        let _ = capture::out();
+        run(args(&[file.as_os_str(), out.as_os_str()])).unwrap();
+        assert_eq!(capture::out(), ["exported 1, failed 0"]);
+        let mut assets = unity_bundle_assets::Assets::open(&file).unwrap();
+        let list = assets.sprites(|_| true);
+        let want = assets.export(&list.sprites[0]).unwrap();
+        assert_eq!(
+            png(&out.join("icon.png")),
+            (want.width(), want.height(), want.rgba().to_vec())
+        );
+    }
+
+    #[test]
+    fn any_prefix_selects() {
+        let dir = TempDir::new("mk-export-prefix");
+        let file = sample(&dir, false);
+        let out = dir.0.join("out");
+        run(args(&[
+            file.as_os_str(),
+            out.as_os_str(),
+            OsStr::new("zz"),
+            OsStr::new("ic"),
+        ]))
+        .unwrap();
+        assert_eq!(names(&out), ["icon.png"]);
+    }
+
+    #[test]
+    fn names_are_cleaned_and_kept_apart() {
+        let dir = TempDir::new("mk-export-names");
+        let file = more_fixtures::sprites(
+            &dir,
+            vec![
+                (SPRITE_ID, sprite_on("icon", TEXTURE, 0, 0b10)),
+                (2, sprite_on("Icon", TEXTURE, 0, 0b10)),
+                (3, sprite_on("../evil", TEXTURE, 0, 0b10)),
+            ],
+        );
+        let out = dir.0.join("out");
+        run(args(&[file.as_os_str(), out.as_os_str()])).unwrap();
+        assert_eq!(names(&out), [".._evil.png", "Icon_2.png", "icon.png"]);
+        assert!(!dir.0.join("evil.png").exists());
+    }
+
+    #[test]
+    fn a_sprite_it_cannot_read_is_counted_and_reported() {
+        let dir = TempDir::new("mk-export-broken");
+        let file = more_fixtures::sprites(
+            &dir,
+            vec![
+                (SPRITE_ID, sprite_on("icon", TEXTURE, 0, 0b10)),
+                (30, broken()),
+            ],
+        );
+        let out = dir.0.join("out");
+        let (_, _) = (capture::out(), capture::err());
+        let e = run(args(&[file.as_os_str(), out.as_os_str()])).unwrap_err();
+        assert_eq!(e.to_string(), "1 not exported");
+        assert_eq!(capture::out(), ["exported 1, failed 1"]);
+        let err = capture::err();
+        assert_eq!(err.len(), 1, "{err:?}");
+        assert!(err[0].starts_with("? (30): "), "{err:?}");
+    }
+
+    #[test]
+    fn a_summary_that_cannot_be_written_is_an_error() {
+        let dir = TempDir::new("mk-export-pipe");
+        let file = sample(&dir, false);
+        capture::fail_out(true);
+        let e = run(args(&[file.as_os_str(), dir.0.join("out").as_os_str()]));
+        capture::fail_out(false);
+        let e = e.unwrap_err();
+        assert_eq!(
+            e.downcast_ref::<std::io::Error>().map(std::io::Error::kind),
+            Some(std::io::ErrorKind::BrokenPipe)
         );
     }
 }

@@ -110,6 +110,15 @@ pub fn save_png(
     path: &std::path::Path,
     image: &unity_bundle_assets::Image,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    save_png_through(path, image, std::io::BufWriter::new)
+}
+
+/// [`save_png`], writing through `wrap` of the new file (under test, a writer that fails).
+fn save_png_through<W: std::io::Write>(
+    path: &std::path::Path,
+    image: &unity_bundle_assets::Image,
+    wrap: impl FnOnce(std::fs::File) -> W,
+) -> Result<(), Box<dyn std::error::Error>> {
     use image::ImageEncoder;
     let file = std::fs::OpenOptions::new()
         .write(true)
@@ -118,7 +127,7 @@ pub fn save_png(
         .map_err(|e| format!("{}: {e}", path.display()))?;
     // Flushed here, not on drop, so a disk that fills up at the end is an error, not a
     // silently truncated PNG.
-    let mut out = std::io::BufWriter::new(file);
+    let mut out = wrap(file);
     let written = image::codecs::png::PngEncoder::new(&mut out)
         .write_image(
             image.rgba(),
@@ -160,7 +169,12 @@ pub fn write_line(line: std::fmt::Arguments<'_>) -> std::io::Result<()> {
     reason = "the same signature as the real one"
 )]
 pub fn write_line(line: std::fmt::Arguments<'_>) -> std::io::Result<()> {
+    // Mutation review: fail on request, and keep the line for the tests to read.
+    if capture::FAIL_OUT.with(std::cell::Cell::get) {
+        return Err(std::io::ErrorKind::BrokenPipe.into());
+    }
     println!("{line}");
+    capture::OUT.with(|v| v.borrow_mut().push(line.to_string()));
     Ok(())
 }
 
@@ -176,6 +190,8 @@ fn to_stderr(line: std::fmt::Arguments<'_>) {
 #[cfg(test)]
 fn to_stderr(line: std::fmt::Arguments<'_>) {
     eprintln!("{line}");
+    // Mutation review: keep the line for the tests to read.
+    capture::ERR.with(|v| v.borrow_mut().push(line.to_string()));
 }
 
 /// End an example: print its error, if any, as one cleaned line (not `Debug`), and exit
@@ -239,22 +255,22 @@ pub mod fixture {
     /// The sprite's path ID in [`sample`].
     pub const SPRITE_ID: i64 = 1;
 
-    /// A Unity 2022.3 file with a 4x4 RGBA32 texture "tex" and a sprite "icon" over its lower
-    /// left 2x2 pixels; with `bad`, also a texture "bc7" in a format the crate does not
-    /// decode.
+    /// A Unity 2022.3 file with a 4x2 RGBA32 texture "tex" and a sprite "icon" over its lower
+    /// left 2x1 pixels (neither square, so width and height cannot be swapped unseen); with
+    /// `bad`, also a texture "bc7" in a format the crate does not decode.
     pub fn sample(dir: &TempDir, bad: bool) -> std::path::PathBuf {
-        let rgba: Vec<u8> = (0..64).collect();
+        let rgba: Vec<u8> = (0..32).collect();
         let tex = texture(
             builders::Layout::U2022_3,
             false,
             "tex",
             4,
-            4,
+            2,
             format::RGBA32,
             &Pixels::Inline(&rgba),
             &[],
         );
-        let r = [0.0, 0.0, 2.0, 2.0];
+        let r = [0.0, 0.0, 2.0, 1.0];
         let icon = sprite(
             false,
             false,
@@ -288,6 +304,16 @@ pub mod fixture {
             "sample.assets",
             &serialized(22, "2022.3.62f1", false, 19, &objects),
         )
+    }
+
+    /// [`sample`] inside an asset bundle, as its one serialized file.
+    pub fn sample_bundle(dir: &TempDir) -> std::path::PathBuf {
+        let inner = std::fs::read(sample(dir, false)).unwrap();
+        let bytes = builders::bundle(
+            &builders::BundleOpts::new(6, "2022.3.62f1"),
+            &[("CAB-sample", &inner, 4)],
+        );
+        dir.file("sample.bundle", &bytes)
     }
 
     /// Arguments as the command line gives them.
@@ -372,5 +398,255 @@ mod tests {
             "no overwriting"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// What the examples print is captured under test so the tests can check it, with a switch that
+// makes standard output fail as a closed pipe does; more fixtures; and the helpers' own tests.
+
+/// Lines the examples print under test, per test thread.
+#[cfg(test)]
+pub mod capture {
+    use std::cell::{Cell, RefCell};
+    thread_local! {
+        pub static OUT: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+        pub static ERR: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+        pub static FAIL_OUT: Cell<bool> = const { Cell::new(false) };
+    }
+    /// Standard output lines since the last call.
+    pub fn out() -> Vec<String> {
+        OUT.with(|v| std::mem::take(&mut *v.borrow_mut()))
+    }
+    /// Standard error lines since the last call.
+    pub fn err() -> Vec<String> {
+        ERR.with(|v| std::mem::take(&mut *v.borrow_mut()))
+    }
+    /// Make standard output fail as a closed pipe does, or work again.
+    pub fn fail_out(fail: bool) {
+        FAIL_OUT.with(|f| f.set(fail));
+    }
+}
+
+#[cfg(test)]
+pub mod more_fixtures {
+    use super::builders::{self, format, sprite, texture, Mesh, Pixels, SPRITE, TEXTURE_2D};
+    use super::fixture::TempDir;
+    pub use super::fixture::TEXTURE;
+
+    /// A 4x4 RGBA32 texture holding bytes 0..64.
+    pub fn rgba_texture(name: &str) -> Vec<u8> {
+        let rgba: Vec<u8> = (0..64).collect();
+        texture(
+            builders::Layout::U2022_3,
+            false,
+            name,
+            4,
+            4,
+            format::RGBA32,
+            &Pixels::Inline(&rgba),
+            &[],
+        )
+    }
+
+    /// A sprite over the lower left 2x2 pixels of texture `texture_id`.
+    pub fn sprite_on(name: &str, texture_id: i64, atlas: i64, settings: u32) -> Vec<u8> {
+        let r = [0.0, 0.0, 2.0, 2.0];
+        sprite(
+            false,
+            false,
+            name,
+            r,
+            [0.0, 0.0],
+            1,
+            atlas,
+            texture_id,
+            0,
+            r,
+            settings,
+            1.0,
+            &Mesh::BASE,
+        )
+    }
+
+    /// A Unity 2022.3 file of `objects` (`(path_id, class_id, data)`) naming `externals`.
+    pub fn file(
+        dir: &TempDir,
+        name: &str,
+        objects: &[(i64, i32, Vec<u8>)],
+        externals: &[String],
+    ) -> std::path::PathBuf {
+        let extras = builders::Extras {
+            externals: externals.to_vec(),
+            ..Default::default()
+        };
+        dir.file(
+            name,
+            &builders::serialized_with(22, "2022.3.62f1", false, 19, objects, &extras),
+        )
+    }
+
+    /// Texture 10 "tex" and the given sprites.
+    pub fn sprites(dir: &TempDir, sprites: Vec<(i64, Vec<u8>)>) -> std::path::PathBuf {
+        let mut objects = vec![(TEXTURE, TEXTURE_2D, rgba_texture("tex"))];
+        objects.extend(sprites.into_iter().map(|(id, data)| (id, SPRITE, data)));
+        file(dir, "more.assets", &objects, &[])
+    }
+
+    /// Textures by path ID and name.
+    pub fn textures(dir: &TempDir, textures: &[(i64, &str)]) -> std::path::PathBuf {
+        let objects: Vec<_> = textures
+            .iter()
+            .map(|&(id, name)| (id, TEXTURE_2D, rgba_texture(name)))
+            .collect();
+        file(dir, "textures.assets", &objects, &[])
+    }
+
+    /// Bytes the reader cannot take as a sprite.
+    pub fn broken() -> Vec<u8> {
+        vec![0; 3]
+    }
+
+    /// A PNG as RGBA8 with its size.
+    pub fn png(path: &std::path::Path) -> (u32, u32, Vec<u8>) {
+        let img = image::open(path).unwrap().to_rgba8();
+        (img.width(), img.height(), img.into_raw())
+    }
+}
+
+#[cfg(test)]
+mod output {
+    use super::*;
+    use std::process::ExitCode;
+
+    /// A writer that takes `left` bytes, then fails as a full disk does.
+    struct FullAfter<W> {
+        inner: W,
+        left: usize,
+    }
+
+    impl<W: std::io::Write> std::io::Write for FullAfter<W> {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.left == 0 {
+                return Err(std::io::Error::other("no space left"));
+            }
+            let n = buf.len().min(self.left);
+            self.left -= n;
+            self.inner.write(&buf[..n])
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.inner.flush()
+        }
+    }
+
+    #[test]
+    fn a_png_that_cannot_be_written_whole_is_removed() {
+        let dir = fixture::TempDir::new("full");
+        let image = unity_bundle_assets::Image::new(2, 1, vec![9; 8]).unwrap();
+        let path = dir.0.join("x.png");
+        let e = save_png_through(&path, &image, |f| FullAfter { inner: f, left: 10 }).unwrap_err();
+        assert!(e.to_string().contains("no space left"), "{e}");
+        assert!(!path.exists(), "the damaged file was left behind");
+        // And the name is free for the next try.
+        save_png(&path, &image).unwrap();
+    }
+
+    #[test]
+    fn finish_maps_results_to_exit_codes_and_prints_one_clean_line() {
+        let _ = capture::err();
+        assert_eq!(finish(Ok(())), ExitCode::SUCCESS);
+        assert!(capture::err().is_empty());
+        let pipe = std::io::Error::from(std::io::ErrorKind::BrokenPipe);
+        assert_eq!(finish(Err(pipe.into())), ExitCode::SUCCESS, "a closed pipe");
+        assert!(capture::err().is_empty(), "a closed pipe is not reported");
+        let other = std::io::Error::other("disk \u{1b}[2J full");
+        assert_eq!(
+            finish(Err(other.into())),
+            ExitCode::FAILURE,
+            "other I/O errors"
+        );
+        assert_eq!(capture::err(), ["error: disk \\u{1b}[2J full"]);
+        assert_eq!(finish(Err("bad".into())), ExitCode::FAILURE);
+        assert_eq!(capture::err(), ["error: bad"]);
+    }
+
+    #[test]
+    fn printable_escapes_del_and_printable_error_keeps_backslashes() {
+        assert_eq!(printable("a\x7fb"), "a\\u{7f}b");
+        assert_eq!(
+            printable_error("a\\b \u{1b}\u{e9}\x7f"),
+            "a\\b \\u{1b}\\u{e9}\\u{7f}"
+        );
+    }
+
+    #[test]
+    fn cut_keeps_exactly_max_line_chars() {
+        let long = "\u{e9}".repeat(MAX_LINE + 5);
+        assert_eq!(cut(&long).chars().count(), MAX_LINE);
+        let exact = "x".repeat(MAX_LINE);
+        assert_eq!(cut(&exact), exact);
+        assert_eq!(cut("short"), "short");
+    }
+
+    #[test]
+    fn report_cuts_long_lines_and_stops_after_max_reported() {
+        let _ = capture::err();
+        let mut printed = 0;
+        report(&mut printed, || "y".repeat(MAX_LINE + 50));
+        assert_eq!(capture::err(), [format!("{}...", "y".repeat(MAX_LINE))]);
+        let (mut printed, mut built) = (0, 0);
+        for i in 0..MAX_REPORTED + 5 {
+            report(&mut printed, || {
+                built += 1;
+                format!("e{i}")
+            });
+        }
+        let lines = capture::err();
+        assert_eq!(lines.len(), MAX_REPORTED + 1, "{lines:?}");
+        assert_eq!(lines[MAX_REPORTED - 1], format!("e{}", MAX_REPORTED - 1));
+        assert_eq!(
+            lines[MAX_REPORTED],
+            "(further errors are counted, not printed)"
+        );
+        assert_eq!(built, MAX_REPORTED, "lines past the cap are not built");
+        assert_eq!(printed, MAX_REPORTED + 5, "but they are counted");
+    }
+
+    #[test]
+    fn file_names_refuse_every_device_all_dot_and_non_ascii_name() {
+        for (raw, want) in [
+            ("LPT1", "_LPT1"),
+            ("lpt9.png", "_lpt9.png"),
+            ("nul", "_nul"),
+            ("aux.x", "_aux.x"),
+            (".", "_."),
+            ("...", "_..."),
+            ("\u{e9}", "_"),
+            ("a/b\\c:d", "a_b_c_d"),
+            ("COM10", "COM10"),
+            ("icon", "icon"),
+        ] {
+            assert_eq!(file_name(raw), want, "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn names_append_the_path_id_then_a_counter() {
+        let mut names = Names::default();
+        assert_eq!(names.claim("a", 5), "a");
+        assert_eq!(names.claim("A", 7), "A_7");
+        assert_eq!(names.claim("a", 7), "a_7_2");
+        assert_eq!(names.claim("a", 7), "a_7_3");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn text_arg_refuses_non_utf8() {
+        use std::os::unix::ffi::OsStringExt;
+        let mut args = vec![std::ffi::OsString::from_vec(vec![b'a', 0xff])].into_iter();
+        assert_eq!(
+            text_arg(&mut args, "the thing").unwrap_err(),
+            "the thing is not UTF-8"
+        );
+        assert_eq!(text_arg(&mut args, "x"), Ok(None));
     }
 }
