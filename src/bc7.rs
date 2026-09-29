@@ -124,14 +124,19 @@ struct Bits {
 
 impl Bits {
     fn read(&mut self, n: u8) -> u8 {
-        let v = (self.bits >> self.pos) as u32 & ((1u32 << n) - 1);
+        // Past the block's 128 bits there is nothing left: zeros.
+        let v = self.bits.checked_shr(self.pos).unwrap_or(0) as u32 & ((1u32 << n) - 1);
         self.pos += u32::from(n);
         v as u8
     }
 }
 
-/// An endpoint channel of `bits` bits widened to eight, its top bits repeated below.
+/// An endpoint channel of `bits` bits widened to eight, its top bits repeated below. Eight
+/// bits (mode 5's alpha) are already a byte.
 const fn expand(v: u8, bits: u8) -> u8 {
+    if bits >= 8 {
+        return v;
+    }
     let v = v << (8 - bits);
     v | (v >> bits)
 }
