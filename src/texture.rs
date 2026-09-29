@@ -130,15 +130,18 @@ impl<'a> Texture2D<'a> {
     /// For a format this crate does not decode, a stream path outside those rules, a file that
     /// cannot be read, or pixel data too short for the texture.
     pub fn data(&self, dir: &Path) -> Result<Cow<'a, [u8]>> {
-        self.data_claimed(dir, &mut || Ok(()), &mut |_, _, _| Ok(()))
+        self.data_claimed(dir, false, &mut || Ok(()), &mut |_, _, _| Ok(()))
     }
 
     /// [`Texture2D::data`], calling `opening` just before the stream file is looked for (its
     /// name and the texture's size already checked), and `claim` with the stream range once it
     /// is known to be valid and before any of it is read.
+    /// `rgba_room` asks for room for the decoded RGBA in the buffer returned, so it can be
+    /// widened in place.
     pub(crate) fn data_claimed(
         &self,
         dir: &Path,
+        rgba_room: bool,
         opening: &mut dyn FnMut() -> Result<()>,
         claim: Claim<'_>,
     ) -> Result<Cow<'a, [u8]>> {
@@ -178,10 +181,10 @@ impl<'a> Texture2D<'a> {
         // Room for the decoded RGBA too, when it can be widened in place: the stored pixels
         // and the result are then one buffer, never two.
         let rgba = self.width as usize * self.height as usize * 4;
-        let room = if crate::decode::is_block_format(self.format) {
-            want
-        } else {
+        let room = if rgba_room && !crate::decode::is_block_format(self.format) {
             want.max(rgba)
+        } else {
+            want
         };
         let mut data = Vec::new();
         data.try_reserve_exact(room)

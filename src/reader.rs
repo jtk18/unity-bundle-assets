@@ -8,10 +8,18 @@ use crate::{Error, Result};
 /// says.
 pub const MAX_STRING: usize = 4096;
 
-/// A name from a file as text: invalid UTF-8 becomes U+FFFD, so a name costs at most three
-/// times its bytes (12 KiB at [`MAX_STRING`]), held exactly.
+/// A name from a file as text: invalid UTF-8 becomes U+FFFD, and the text is cut, on a
+/// character boundary, to [`MAX_STRING`] bytes, so a name never costs more as text than the
+/// most the file may spend on it. Held exactly.
 fn text(bytes: &[u8]) -> String {
     let mut s = String::from_utf8_lossy(bytes).into_owned();
+    if s.len() > MAX_STRING {
+        let cut = (0..=MAX_STRING)
+            .rev()
+            .find(|&i| s.is_char_boundary(i))
+            .unwrap_or(0);
+        s.truncate(cut);
+    }
     s.shrink_to_fit();
     s
 }
@@ -250,8 +258,12 @@ mod tests {
         assert_eq!(text("\u{e9}".as_bytes()), "\u{e9}");
         // Every character but the bad byte is kept.
         assert_eq!(text(b"Caf\xe9_Icon_Big"), "Caf\u{fffd}_Icon_Big");
+        // 4096 bad bytes would be 12 KiB of U+FFFD: cut to the last whole character within
+        // 4 KiB, and held exactly.
         let bad = text(&[0xff; 4096]);
-        assert_eq!((bad.len(), bad.capacity()), (3 * 4096, 3 * 4096));
+        assert_eq!((bad.len(), bad.capacity()), (4095, 4095));
+        assert!(bad.chars().all(|c| c == '\u{fffd}'));
+        assert_eq!(text(&[b'a'; 4096]).len(), 4096);
         let mut r = Reader::new(b"ok\0caf\xe9\0", false);
         assert_eq!(r.cstr().unwrap(), "ok");
         assert!(matches!(r.cstr(), Err(Error::Invalid(msg)) if msg.contains("not UTF-8")));

@@ -167,6 +167,9 @@ pub struct Assets {
     /// This file (or its folder, when only that is known), as named in errors about stream
     /// ranges.
     owner: Arc<str>,
+    /// The serialized file itself, when it was opened from disk: no texture may stream from
+    /// it, which would decode its own bytes a second time.
+    own_file: Option<crate::file::FileId>,
     /// Atlases read so far, by path ID; one that fails to read is kept as its error, so it
     /// spoils only the sprites packed into it. Only atlases a sprite asks for are held.
     atlases: RwLock<HashMap<i64, Arc<OnceLock<AtlasResult>>>>,
@@ -225,7 +228,7 @@ impl Assets {
     /// As [`Assets::open`].
     pub fn open_with(path: impl AsRef<Path>, limits: Limits) -> Result<Self> {
         let path = path.as_ref();
-        let data = crate::file::read_limited(path, limits.max_file_size, |head, len| {
+        let (data, id) = crate::file::read_identified(path, limits.max_file_size, |head, len| {
             if bundle::is_bundle(head) {
                 bundle::check_head(head, len)
             } else {
@@ -235,6 +238,7 @@ impl Assets {
         let mut assets = Self::from_bytes(data, folder_of(path), limits)?;
         if matches!(assets.streams, Streams::Dir(_)) {
             assets.owner = path.display().to_string().into();
+            assets.own_file = Some(id);
         }
         Ok(assets)
     }
@@ -327,6 +331,7 @@ impl Assets {
             file,
             streams,
             owner,
+            own_file: None,
             atlases: RwLock::default(),
             cache: None,
             shared,
@@ -436,6 +441,7 @@ impl Assets {
         }
         // Held as long as the list: no spare capacity in it or its messages.
         list.skipped.shrink_to_fit();
+        list.sprites.shrink_to_fit();
         list.sprites.sort_by_cached_key(|s| self.texture_key(s));
         list
     }
@@ -598,6 +604,12 @@ impl Assets {
         // starts at once, and work started is never given back.
         let mut claimed = false;
         let mut claim = |stream: StreamKey, start, end| {
+            if matches!((&stream, &self.own_file), (StreamKey::File(id), Some(own)) if id == own) {
+                return Err(Error::Invalid(format!(
+                    "texture {} streams from its own serialized file",
+                    quoted(&texture.name)
+                )));
+            }
             self.shared
                 .claim_stream(stream, start, end, &self.owner, path_id, || {
                     self.reserve(pixels)
@@ -609,7 +621,7 @@ impl Assets {
             // Opening a stream file costs its step before the range is known, and keeps it
             // whether the range is then granted or refused.
             Streams::Dir(dir) => {
-                texture.data_claimed(dir, &mut || self.reserve(FILE_STEP), &mut claim)?
+                texture.data_claimed(dir, true, &mut || self.reserve(FILE_STEP), &mut claim)?
             }
             // Finding a stream in a bundle (its entry by path, then the claim) costs its own
             // step, kept whether the range is granted or not.
@@ -740,7 +752,8 @@ impl Assets {
             (false, _) => None,
             (true, None) => {
                 return Err(Error::Unsupported(format!(
-                    "sprite {name} is cut out by its mesh, which is not one this crate reads",
+                    "sprite {name} is cut out by its mesh, which this crate cannot read (a vertex \
+                     format it does not know, or indices past the vertices)",
                     name = quoted(name)
                 )))
             }
@@ -773,9 +786,14 @@ impl Assets {
         ];
         let [x0, y0, x1, y1] = bounds.map(|v| if v.is_finite() { v as i64 } else { -1 });
         let (tw, th) = (i64::from(texture.width), i64::from(texture.height));
+        let what = if bounds.iter().all(|v| v.is_finite()) {
+            "no whole pixel"
+        } else {
+            "not a finite rect"
+        };
         if x0 >= x1 || y0 >= y1 {
             return Err(Error::Invalid(format!(
-                "sprite {name} covers {}x{} at {},{}: no whole pixel",
+                "sprite {name} covers {}x{} at {},{}: {what}",
                 r.width,
                 r.height,
                 r.x,
@@ -812,8 +830,8 @@ impl Assets {
             None => None,
         };
         let columns = mask.as_ref().map_or(0, |m| m.columns);
-        // A quarter turn reads the texture down its columns, at two to three times the cost
-        // a pixel.
+        // A quarter turn reads the texture down its columns: some five times a straight copy's
+        // cost a pixel, which three units cover.
         let per_pixel = if rotation == Rotation::Rotate90 { 3 } else { 1 };
         self.reserve(columns + per_pixel * u64::from(sw) * u64::from(sh))?;
         let coverage = mask.map(|m| m.fill(sw, sh)).transpose()?;

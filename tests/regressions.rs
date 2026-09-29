@@ -4755,3 +4755,263 @@ fn block_formats_are_charged_whole_blocks_in_height_too() {
     a.decode_texture(7).unwrap();
     assert_eq!(a.work_done(), CALL + 32);
 }
+
+#[test]
+fn a_mesh_that_is_never_built_does_not_count_toward_the_lists_triangles() {
+    // Positions in the second stream, after a first stream whose channel format has no known
+    // size: the mesh cannot be read, so the sprite (rect-packed, needing none) is listed
+    // without one and counts nothing, even under a list limit of none.
+    let mesh = Mesh {
+        pos_stream: 1,
+        uv_format: 12,
+        ..TRIANGLE
+    };
+    let file = serialized(
+        22,
+        "2022.3.62f1",
+        false,
+        19,
+        &[
+            (
+                TEX,
+                TEXTURE_2D,
+                rgba_texture(Layout::U2022_3, "t", 4, 4, &Pixels::Inline(&rgba_4x4())),
+            ),
+            (1, SPRITE, tight(&mesh, RECT)),
+        ],
+    );
+    let a = Assets::from_serialized(
+        SerializedFile::parse_with(file, Limits::DEFAULT.with_max_total_triangles(0)).unwrap(),
+        "",
+    )
+    .unwrap();
+    let list = a.sprites(|_| true);
+    assert!(list.skipped.is_empty(), "{:?}", list.skipped);
+    assert!(list.sprites[0].triangles.is_none());
+}
+
+#[test]
+fn texture_data_given_directly_holds_only_the_stored_bytes() {
+    let dir = TempDir::new("dataroom");
+    dir.file("a.resS", &[9; 64 * 64]);
+    let t = texture(
+        Layout::U2022_3,
+        false,
+        "a",
+        64,
+        64,
+        format::ALPHA8,
+        &streamed("a.resS", 0, 64 * 64),
+        &[],
+    );
+    let file = SerializedFile::parse(serialized(
+        22,
+        "2022.3.62f1",
+        false,
+        19,
+        &[(7, TEXTURE_2D, t)],
+    ))
+    .unwrap();
+    let texture = Texture2D::read(&file, file.object(7).unwrap()).unwrap();
+    let data = texture.data(&dir.0).unwrap();
+    assert_eq!(data.len(), 64 * 64);
+    if let std::borrow::Cow::Owned(v) = data {
+        assert!(v.capacity() < 2 * 64 * 64, "{}", v.capacity());
+    }
+}
+
+// Round 12.
+
+#[test]
+fn dependencies_count_with_objects_toward_the_object_limit() {
+    let tex = || rgba_texture(Layout::U2022_3, "t", 4, 4, &Pixels::Inline(&rgba_4x4()));
+    let extras = Extras {
+        externals: vec!["a.assets".into(), "b.assets".into(), "c.assets".into()],
+        ..Extras::default()
+    };
+    let file = serialized_with(
+        22,
+        "2022.3.62f1",
+        false,
+        19,
+        &[(1, TEXTURE_2D, tex()), (2, TEXTURE_2D, tex())],
+        &extras,
+    );
+    // Two objects and three dependencies: five.
+    assert!(matches!(
+        SerializedFile::parse_with(file.clone(), Limits::DEFAULT.with_max_objects(4)),
+        Err(Error::LimitExceeded {
+            kind: LimitKind::Objects,
+            value: 5,
+            ..
+        })
+    ));
+    assert!(SerializedFile::parse_with(file, Limits::DEFAULT.with_max_objects(5)).is_ok());
+}
+
+#[test]
+fn a_serialized_file_may_not_stream_from_itself() {
+    // Saved under a stream file's name, a file names itself as texture 2's stream, at texture
+    // 1's inline pixels: refused, not decoded a second time.
+    let pixels: Vec<u8> = (100..164).collect();
+    let file_with = |offset: u64| {
+        serialized(
+            22,
+            "2022.3.62f1",
+            false,
+            19,
+            &[
+                (
+                    1,
+                    TEXTURE_2D,
+                    rgba_texture(Layout::U2022_3, "i", 4, 4, &Pixels::Inline(&pixels)),
+                ),
+                (
+                    2,
+                    TEXTURE_2D,
+                    rgba_texture(
+                        Layout::U2022_3,
+                        "s",
+                        4,
+                        4,
+                        &Pixels::Streamed {
+                            path: "evil.resS",
+                            offset,
+                            size: 64,
+                        },
+                    ),
+                ),
+            ],
+        )
+    };
+    let at = file_with(0).windows(64).position(|w| w == pixels).unwrap() as u64;
+    let file = file_with(at);
+    assert_eq!(
+        file.windows(64).position(|w| w == pixels),
+        Some(at as usize)
+    );
+    let dir = TempDir::new("selfstream");
+    let a = Assets::open(dir.file("evil.resS", &file)).unwrap();
+    assert!(a.decode_texture(1).is_ok());
+    match a.decode_texture(2) {
+        Err(Error::Invalid(msg)) => assert!(msg.contains("its own serialized file"), "{msg}"),
+        other => panic!("{other:?}"),
+    }
+}
+
+// Round 12: gaps the mutation run found.
+
+#[test]
+fn a_later_bundle_file_over_the_object_limit_on_its_own_is_refused() {
+    let tex = || rgba_texture(Layout::U2018_4, "t", 4, 4, &Pixels::Inline(&rgba_4x4()));
+    let a = file_2018(&[(1, TEXTURE_2D, tex()), (2, TEXTURE_2D, tex())]);
+    let b = file_2018(&(1..=7).map(|i| (i, TEXTURE_2D, tex())).collect::<Vec<_>>());
+    let bytes = bundle(
+        &BundleOpts::new(6, "2018.4.36f1"),
+        &[("CAB-a", &a, 4), ("CAB-b", &b, 4)],
+    );
+    let b = Arc::new(Bundle::parse_with(&bytes, Limits::DEFAULT.with_max_objects(4)).unwrap());
+    assert!(Assets::from_bundle(b.clone(), "CAB-a").is_ok());
+    match Assets::from_bundle(b, "CAB-b") {
+        Err(Error::LimitExceeded {
+            kind: LimitKind::Objects,
+            value,
+            limit,
+            ..
+        }) => assert_eq!((value, limit), (9, 4)),
+        other => panic!("{:?}", other.err()),
+    }
+}
+
+/// A 4x4 RGBA32 texture streaming `path` from a stream entry of its bundle.
+fn bundle_streamed(path: &str, limits: Limits) -> Assets {
+    let t = rgba_texture(
+        Layout::U2018_4,
+        "t",
+        4,
+        4,
+        &Pixels::Streamed {
+            path,
+            offset: 0,
+            size: 64,
+        },
+    );
+    let f = file_2018(&[(1, TEXTURE_2D, t)]);
+    let bytes = bundle(
+        &BundleOpts::new(6, "2018.4.36f1"),
+        &[("CAB-a", &f, 4), ("CAB-a.resS", &[5; 64], 0)],
+    );
+    Assets::from_bundle(
+        Arc::new(Bundle::parse_with(&bytes, limits).unwrap()),
+        "CAB-a",
+    )
+    .unwrap()
+}
+
+#[test]
+fn a_bundle_stream_is_refused_at_its_step_and_at_a_long_paths_charge() {
+    // Room for the call and the pixels, not the bundle stream's step: charged the call only.
+    let a = bundle_streamed(
+        "archive:/CAB-a/CAB-a.resS",
+        Limits::DEFAULT.with_max_total_work(CALL + 16 + 100),
+    );
+    assert!(matches!(
+        a.decode_texture(1),
+        Err(Error::LimitExceeded {
+            kind: LimitKind::TotalWork,
+            ..
+        })
+    ));
+    assert_eq!(a.work_done(), CALL);
+    // A 3 KiB path: room for the call, the step and the pixels, not the path's bytes.
+    let path = format!("archive:/{}CAB-a.resS", "a/".repeat(1500));
+    let charge = (1 + path.len() as u64) - CALL;
+    let a = bundle_streamed(
+        &path,
+        Limits::DEFAULT.with_max_total_work(CALL + charge - 1),
+    );
+    assert!(matches!(
+        a.decode_texture(1),
+        Err(Error::LimitExceeded {
+            kind: LimitKind::TotalWork,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn an_atlas_that_ends_before_its_last_field_is_refused() {
+    let mut at = atlas(false, &[]);
+    at.truncate(at.len() - 4);
+    let f = serialized(22, "2022.3.62f1", false, 19, &[(3, SPRITE_ATLAS, at)]);
+    let f = SerializedFile::parse(f).unwrap();
+    assert!(unity_bundle_assets::SpriteAtlas::read(&f, f.object(3).unwrap()).is_err());
+}
+
+#[test]
+fn a_flat_edge_away_from_the_image_edge_is_counted_by_its_x_ends() {
+    let mesh = Mesh {
+        vertices: &[[0.0, 2.75], [1.0, 2.75], [60.0, 10.0]],
+        indices: &[0, 1, 2],
+        ..Mesh::BASE
+    };
+    let (_d, mut a, s) = tight_square(64, &mesh, Limits::default());
+    a.export(&s).unwrap();
+    assert_eq!(a.work_done(), 8523);
+}
+
+#[test]
+fn a_bundle_directory_over_the_limit_reports_its_size() {
+    let bytes = bundle(
+        &BundleOpts::new(6, "2018.4.36f1"),
+        &[("CAB-a", &file_2018(&[]), 4)],
+    );
+    match Bundle::parse_with(&bytes, Limits::DEFAULT.with_max_decompressed(100)) {
+        Err(Error::LimitExceeded {
+            kind: LimitKind::Decompressed,
+            value,
+            ..
+        }) => assert_eq!(value, 118),
+        other => panic!("{:?}", other.err()),
+    }
+}

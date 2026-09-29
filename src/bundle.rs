@@ -163,8 +163,9 @@ impl Bundle {
             }
             if flags & flags::BLOCK_INFO_NEEDS_PADDING != 0 {
                 return Err(Error::Unsupported(format!(
-                    "bundle flag 0x200 with engine version {unity_revision:?}: it means padding \
-                     after 2020.3.34 and encryption before, and the version is stripped"
+                    "bundle flag 0x200 with engine version {}: it means padding after \
+                     2020.3.34 and encryption before, and the version is stripped",
+                    quoted(&unity_revision)
                 )));
             }
         }

@@ -13,7 +13,11 @@
 //! let mut assets = Assets::open("Game_Data/sharedassets0.assets")?;
 //! let list = assets.sprites(|name| name.starts_with("Icon_"));
 //! for sprite in &list.sprites {
-//!     let image = assets.export(sprite)?;
+//!     match assets.export(sprite) {
+//!         // Names come from the file: `{:?}` escapes anything a terminal would act on.
+//!         Ok(image) => println!("{:?}: {}x{}", sprite.name, image.width(), image.height()),
+//!         Err(e) => eprintln!("sprite {} not exported: {e}", sprite.path_id),
+//!     }
 //! }
 //! for skipped in &list.skipped {
 //!     eprintln!("{}: {}", skipped.path_id, skipped.error);
@@ -22,7 +26,10 @@
 //! // Whole textures, from a bundle.
 //! let assets = Assets::open("assetbundles/characters")?;
 //! for texture in assets.textures(|_| true) {
-//!     let image = assets.decode_texture(texture.path_id)?;
+//!     // A texture in a format this crate does not decode is skipped.
+//!     if let Ok(image) = assets.decode_texture(texture.path_id) {
+//!         println!("{}: {} bytes", texture.path_id, image.rgba().len());
+//!     }
 //! }
 //! # Ok(())
 //! # }
@@ -37,9 +44,8 @@
 //! Files are treated as hostile:
 //!
 //! - Counts and lengths are checked against the bytes present before they size an
-//!   allocation, and every string kept is at most 4 KiB of the file (names at most three
-//!   times that as text, invalid UTF-8 shown as U+FFFD; versions and the paths used to find
-//!   data must be UTF-8).
+//!   allocation, and every string kept is at most 4 KiB, of the file and as text (invalid
+//!   UTF-8 in names shown as U+FFFD; versions and the paths used to find data must be UTF-8).
 //!   Objects in a file, entries in a bundle, a sprite's sub-meshes, and the stream ranges
 //!   textures read may not overlap, so one blob cannot be decoded many times over; stream
 //!   ranges are compared by the bytes they reach (on Unix; by lower-cased ASCII name
@@ -95,10 +101,11 @@ pub struct ReadmeDoctests;
 
 /// Everything that can go wrong reading a file.
 ///
-/// Strings that came from a file are quoted (`{:?}`) when displayed, and cut to 64
-/// characters; the fields themselves (and so `Debug`) hold them whole, up to 12 KiB. Each
-/// message is complete: an underlying cause is part of it rather than a
-/// separate [`std::error::Error::source`] (see [`Error::root`] for the wrapped ones).
+/// Strings that came from a file are quoted when displayed, with everything but printable
+/// ASCII written as `\u{...}`, and cut to 64 characters; the fields themselves (and so
+/// `Debug`) hold them whole, up to 12 KiB. Each message is complete: an underlying cause is
+/// part of it rather than a separate [`std::error::Error::source`] (see [`Error::root`] for
+/// the wrapped ones).
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
@@ -294,9 +301,11 @@ impl std::fmt::Display for LimitKind {
 /// `Result` with this crate's [`Error`].
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// Ceilings on work and memory that the data alone cannot bound. The defaults sit well above
-/// what the games this crate was tested on use; lower them for batch tools that open files
-/// from strangers.
+/// Ceilings on work and memory that the data alone cannot bound.
+///
+/// The defaults cover the games this crate was tested on, some with little room: the largest
+/// real bundle seen decompresses to 95% of `max_decompressed`, and a bigger one needs it
+/// raised. Lower them for batch tools that open files from strangers.
 ///
 /// ```
 /// use unity_bundle_assets::Limits;
@@ -331,10 +340,9 @@ pub struct Limits {
     /// from one [`Bundle`], in units of about one pixel's: a unit for each pixel decoded
     /// (whole 4x4 blocks for block formats) or copied (three for a quarter-turned sprite), 64
     /// for each decode or cut asked for, refused or not, a unit for each byte of a texture's
-    /// name and stream path past 64, 8192 more for each stream file opened (192 for a stream in
-    /// the same bundle), and the mask
-    /// work. Opening and
-    /// listing are not counted. Default 2^34, under a minute of CPU.
+    /// name and stream path past 64, 8192 more for each stream file looked for (192 for a
+    /// stream in the same bundle), and the mask work. Opening and listing are not counted.
+    /// Default 2^34, under a minute of CPU.
     pub max_total_work: u64,
 }
 
@@ -564,8 +572,8 @@ pub(crate) fn zeroed(len: usize) -> Result<Vec<u8>> {
     Ok(v)
 }
 
-/// A string from a file, for an error message: quoted with `{:?}`, so it cannot send control
-/// sequences to a terminal, and cut to its first 64 characters, so a message stays short
+/// A string from a file, for an error message: quoted by [`escaped`], so it cannot send
+/// control sequences to a terminal, and cut to its first 64 characters, so a message stays short
 /// whatever the file holds.
 pub(crate) fn quoted(s: &str) -> String {
     const SHOWN: usize = 64;
@@ -705,29 +713,30 @@ pub(crate) const NEWEST_KNOWN: [u32; 2] = [6000, 4];
 /// engine version was stripped.
 pub(crate) fn check_release(version: &str, what: &str, oldest: [u32; 3]) -> Result<()> {
     let v = Version::parse(version);
+    let shown = quoted(version);
     if v.stripped() {
         return Err(Error::Unsupported(format!(
-            "{what} from a file whose engine version was stripped ({version:?})"
+            "{what} from a file whose engine version was stripped ({shown})"
         )));
     }
     if v.numbers < oldest {
         return Err(Error::Unsupported(format!(
-            "{what} from Unity {version:?} (needs {}.{} or later)",
+            "{what} from Unity {shown} (needs {}.{} or later)",
             oldest[0], oldest[1]
         )));
     }
     if [v.numbers[0], v.numbers[1]] > NEWEST_KNOWN {
         return Err(Error::Unsupported(format!(
-            "{what} from Unity {version:?}, newer than the layouts this crate knows (up to {}.{})",
+            "{what} from Unity {shown}, newer than the layouts this crate knows (up to {}.{})",
             NEWEST_KNOWN[0], NEWEST_KNOWN[1]
         )));
     }
     match v.kind {
         'a' => Err(Error::Unsupported(format!(
-            "{what} from Unity {version:?}, an alpha build; layouts change between alphas"
+            "{what} from Unity {shown}, an alpha build; layouts change between alphas"
         ))),
         't' | 'x' => Err(Error::Unsupported(format!(
-            "{what} from Unity {version:?}, an engine variant whose layouts are unchecked"
+            "{what} from Unity {shown}, an engine variant whose layouts are unchecked"
         ))),
         _ => Ok(()),
     }

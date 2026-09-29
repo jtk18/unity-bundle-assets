@@ -133,9 +133,9 @@ pub enum Layout {
     U2017_1,
     /// 2017.3 to 2018.1: plus the fallback fields.
     U2017_3,
-    /// 2018.2 to 2019.3.0: fallback fields, streaming mip maps.
+    /// 2018.2 to 2019.3.0f4: fallback fields, streaming mip maps.
     U2018_4,
-    /// 2019.3.1 to 2019.4.8: plus `m_IgnoreMasterTextureLimit`.
+    /// 2019.3.0f5 to 2019.4.8: plus `m_IgnoreMasterTextureLimit`.
     U2019_3,
     /// 2019.4.9: plus `m_IsPreProcessed`.
     U2019_4,

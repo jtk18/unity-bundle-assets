@@ -146,8 +146,7 @@ pub(crate) fn decode_owned(
         .and_then(|p| p.checked_mul(4))
         .filter(|&n| isize::try_from(n).is_ok());
     let size = mip0_size(format, width, height);
-    let (Some((bpp, convert)), Some(size), Some(out_len)) = (pixel_format(format), size, out_len)
-    else {
+    let (true, Some(size), Some(out_len)) = (pixel_format(format).is_some(), size, out_len) else {
         return decode(format, width, height, &data);
     };
     if data.len() < size {
@@ -156,15 +155,34 @@ pub(crate) fn decode_owned(
     data.truncate(size);
     data.try_reserve_exact(out_len - size)
         .map_err(|_| Error::OutOfMemory {
-            bytes: out_len as u64,
+            bytes: (out_len - size) as u64,
         })?;
-    data.resize(out_len, 0);
-    // From the last pixel back: pixel i's four output bytes start at 4i, at or after where
-    // its stored bytes and every later pixel's start, so nothing is overwritten unread.
-    let mut stored = [0u8; 4];
-    for i in (0..w * h).rev() {
-        stored[..bpp].copy_from_slice(&data[i * bpp..(i + 1) * bpp]);
-        convert(&stored[..bpp], &mut data[i * 4..(i + 1) * 4]);
+    match format {
+        // Already four bytes a pixel: reordered where they lie, or left as they are.
+        format::RGBA32 => {}
+        format::BGRA32 => data.chunks_exact_mut(4).for_each(|p| p.swap(0, 2)),
+        // A, R, G, B read little-endian is one word; turning it a byte right gives R, G, B, A.
+        format::ARGB32 => data.chunks_exact_mut(4).for_each(|p| {
+            let word = u32::from_le_bytes([p[0], p[1], p[2], p[3]]).rotate_right(8);
+            p.copy_from_slice(&word.to_le_bytes());
+        }),
+        format::ALPHA8 => widen_pixels::<1>(&mut data, out_len, |s| [255, 255, 255, s[0]]),
+        format::RGB24 => widen_pixels::<3>(&mut data, out_len, |s| [s[0], s[1], s[2], 255]),
+        format::ARGB4444 => widen_pixels::<2>(&mut data, out_len, |s| {
+            let argb = nibbles(&s);
+            [argb[1], argb[2], argb[3], argb[0]]
+        }),
+        format::RGBA4444 => widen_pixels::<2>(&mut data, out_len, |s| nibbles(&s)),
+        _ => widen_pixels::<2>(&mut data, out_len, |s| {
+            // RGB565
+            let v = u16::from_le_bytes(s);
+            [
+                widen(v >> 11, 31),
+                widen((v >> 5) & 63, 63),
+                widen(v & 31, 31),
+                255,
+            ]
+        }),
     }
     let row = w * 4;
     for i in 0..h / 2 {
@@ -172,6 +190,23 @@ pub(crate) fn decode_owned(
         top[i * row..(i + 1) * row].swap_with_slice(&mut bottom[..row]);
     }
     Ok(data)
+}
+
+/// Widen `data`, `N` stored bytes a pixel, to `len` bytes of RGBA8 in place, from the last
+/// pixel back: pixel i's four output bytes start at 4i, at or after where its stored bytes and
+/// every later pixel's start, so nothing is overwritten unread.
+fn widen_pixels<const N: usize>(
+    data: &mut Vec<u8>,
+    len: usize,
+    convert: impl Fn([u8; N]) -> [u8; 4],
+) {
+    let pixels = data.len() / N;
+    data.resize(len, 0);
+    for i in (0..pixels).rev() {
+        let mut stored = [0u8; N];
+        stored.copy_from_slice(&data[i * N..(i + 1) * N]);
+        data[i * 4..(i + 1) * 4].copy_from_slice(&convert(stored));
+    }
 }
 
 /// The stored bytes a pixel and the conversion to RGBA8 for a format stored pixel by pixel

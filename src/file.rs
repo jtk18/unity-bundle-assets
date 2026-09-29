@@ -217,6 +217,16 @@ const HEAD: u64 = 64 * 1024;
 /// claims (a sparse file, say) is refused before it is read; `check` says how many bytes to
 /// read in all, never more than its length when opened.
 pub(crate) fn read_limited(path: &Path, limit: u64, check: HeadCheck) -> Result<Vec<u8>> {
+    read_identified(path, limit, check).map(|(data, _)| data)
+}
+
+/// [`read_limited`], with the identity of the file read, so a stream naming that same file
+/// can be told apart.
+pub(crate) fn read_identified(
+    path: &Path,
+    limit: u64,
+    check: HeadCheck,
+) -> Result<(Vec<u8>, FileId)> {
     use std::io::Read;
     let (mut file, len) = open_regular(path, Chosen::ByCaller)?;
     Error::limit(crate::LimitKind::FileSize, len, limit)?;
@@ -234,10 +244,12 @@ pub(crate) fn read_limited(path: &Path, limit: u64, check: HeadCheck) -> Result<
     )
     .map_err(|_| Error::OutOfMemory { bytes: want })?;
     let rest = want.saturating_sub(data.len() as u64);
-    file.take(rest)
+    file.by_ref()
+        .take(rest)
         .read_to_end(&mut data)
         .map_err(Error::io(path))?;
-    Ok(data)
+    let id = identity(&file, path)?;
+    Ok((data, id))
 }
 
 #[cfg(all(test, unix))]

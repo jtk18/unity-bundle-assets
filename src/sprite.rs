@@ -409,8 +409,6 @@ fn read_mesh(
     let Some(&(pos_stream, pos_offset, 0, 2..=4)) = channels.first() else {
         return Ok(if total == 0 { Some(Vec::new()) } else { None });
     };
-    // Only a mesh that will be built counts toward the list's total, as the list counts it.
-    Error::limit(LimitKind::TotalTriangles, total, budget.remaining)?;
     // Stream layout: each stream's stride is the sum of its channels; streams follow one
     // another, each padded to 16 bytes.
     // One pass over the channels for every stream's stride; a channel whose format has no
@@ -421,7 +419,7 @@ fn read_mesh(
             let slot = &mut strides[usize::from(stream)];
             *slot = slot
                 .zip(component_size(format))
-                .map(|(s, size)| s + size * d as usize);
+                .map(|(s, size)| s.saturating_add(size.saturating_mul(d as usize)));
         }
     }
     let mut stream_offset = 0usize;
@@ -475,6 +473,9 @@ fn read_mesh(
             triangles.push(corners);
         }
     }
+    // Only a mesh that was built counts toward the list's total, as the list counts it. One
+    // mesh is held to `max_sprite_triangles` above, so building it first costs little.
+    Error::limit(LimitKind::TotalTriangles, total, budget.remaining)?;
     Ok(Some(triangles))
 }
 

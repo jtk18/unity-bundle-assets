@@ -201,7 +201,7 @@ impl SerializedFile {
                 ..
             } => Error::LimitExceeded {
                 kind: LimitKind::Objects,
-                value: value + (limits.max_objects - left),
+                value: value.saturating_add(limits.max_objects.saturating_sub(left)),
                 limit: limits.max_objects,
             },
             e => e,
@@ -521,6 +521,12 @@ fn parse(data: &[u8], limits: &Limits) -> Result<Parsed> {
     }
 
     let external_count = r.len(22)?;
+    // Each dependency is held as a path: counted with the objects, against the same limit.
+    Error::limit(
+        LimitKind::Objects,
+        (object_count + external_count) as u64,
+        limits.max_objects,
+    )?;
     let mut externals = Vec::with_capacity(external_count);
     for _ in 0..external_count {
         r.cstr_bytes()?; // always empty; unused

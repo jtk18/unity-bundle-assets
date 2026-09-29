@@ -67,15 +67,17 @@ impl Names {
 /// `\u{...}`. Names from a file can hold characters that are blank, reorder text or look
 /// like others; no list of the harmful ones keeps up with Unicode, so none is trusted.
 pub fn printable(s: &str) -> String {
-    s.chars()
-        .flat_map(|c| {
-            if matches!(c, ' '..='~') {
-                vec![c]
-            } else {
-                c.escape_unicode().collect()
-            }
-        })
-        .collect()
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            // A backslash too, so a name holding the text `\u{202e}` does not read as one
+            // holding the character.
+            '\\' => out.push_str("\\\\"),
+            ' '..='~' => out.push(c),
+            _ => out.extend(c.escape_unicode()),
+        }
+    }
+    out
 }
 
 /// Write a top-down RGBA image as PNG to a new file. Anything already at `path` is left alone
@@ -211,6 +213,7 @@ mod tests {
             assert!(p.chars().all(|c| c.is_ascii_graphic()), "{bad:?} -> {p:?}");
         }
         assert_eq!(printable("Icon \"x\" é"), "Icon \"x\" \\u{e9}");
+        assert_eq!(printable("a\\u{202e}"), "a\\\\u{202e}");
         for blank in ["\u{3164}", "\u{115f}", "\u{2800}", "\u{5d0}"] {
             assert!(printable(blank).starts_with("\\u{"), "{blank:?}");
         }
