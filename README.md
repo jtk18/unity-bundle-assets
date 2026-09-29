@@ -171,17 +171,19 @@ Files are treated as hostile:
   `Assets::sprites` reads and every texture `Assets::textures` lists keeps its name, and each
   sprite it could not read keeps an entry of some 220 bytes besides its name, up to
   `max_objects`; so a file of tiny broken sprites can make a list some eight to ten times its
-  size. Each stream range decoded is remembered, some 100 bytes, for the life of the `Assets`,
-  and so is each atlas read (about 1.5 times its bytes) or refused (some 430 bytes). A file's
-  dependency list is held as text too, some 40 bytes a dependency besides its path, and its
-  dependencies count with its objects toward `max_objects`. Together, a small LZMA bundle of
-  long names can still make opening and listing hold a few times `max_decompressed`: lower it
-  for bundles from strangers. LZMA can expand a 150 KB file to the full 1 GiB of decompressed
-  data, and 40 KB of a compressed bundle can make a 1 GiB texture. Allocations sized by the
-  file fail as `Error::OutOfMemory` where the crate makes them, but that is best effort:
-  LZMA's own buffers, the object table and other small growth abort on failure as usual, and
-  an operating system that overcommits may never refuse. For files from strangers, lower
-  `max_decompressed`, `max_texture_pixels` and `max_total_work`.
+  size. Each sprite's mesh is held at 24 bytes a triangle, up to about 96 MiB for a list at
+  the default `max_total_triangles`. Each stream range decoded is remembered, some 100 bytes,
+  for the life of the `Assets`, and so is each atlas read (about 1.5 times its bytes) or
+  refused (some 430 bytes). A file's dependency list is held as text too, some 40 bytes a
+  dependency besides its path, and its dependencies count with its objects toward
+  `max_objects`. Together, a small LZMA bundle of long names can still make opening and
+  listing hold a few times `max_decompressed`: lower it for bundles from strangers. LZMA can
+  expand a 150 KB file to the full 1 GiB of decompressed data, and 40 KB of a compressed
+  bundle can make a 1 GiB texture. Allocations sized by the file fail as `Error::OutOfMemory`
+  where the crate makes them, but that is best effort: LZMA's own buffers, the object table
+  and other small growth abort on failure as usual, and an operating system that overcommits
+  may never refuse. For files from strangers, lower `max_decompressed`, `max_texture_pixels`
+  and `max_total_work`.
 - Streamed pixels are read only from the same bundle, or from a `.resS` / `.resource` file
   directly beside the asset file: one plain file name, a regular file, not a symbolic link,
   and not named like a Windows device however spelled (`CON`, `nul .resS`, `COM1`, ...) or an

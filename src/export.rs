@@ -508,7 +508,11 @@ impl Assets {
             .ok()
             .and_then(|n| usize::try_from(n).ok())
             .unwrap_or(0);
-        stated.min(crate::reader::MAX_STRING).min(r.remaining()) as u64
+        // A name over the limit is refused before a byte of it is read: nothing to charge.
+        if stated > crate::reader::MAX_STRING {
+            return 0;
+        }
+        stated.min(r.remaining()) as u64
     }
 
     /// Where the sprite's pixels are: its atlas entry when it has one, its own render data
