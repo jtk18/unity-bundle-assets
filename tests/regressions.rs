@@ -2363,10 +2363,13 @@ fn sprite_gates_at_their_first_releases() {
             .next()
             .map(|s| s.error.to_string())
     };
-    // Sprites are read from 2019.1.
+    // Sprites are read from 2018.1, in 2019.1's layout from 2019.1 (2018's has no secondary
+    // textures).
     assert_eq!(skipped("2019.1.0f1", base()), None);
-    let old = skipped("2018.4.36f1", base()).unwrap();
-    assert!(old.contains("needs 2019.1"), "{old}");
+    let layout = skipped("2018.4.36f1", base()).unwrap();
+    assert!(layout.contains("does not fit"), "{layout}");
+    let old = skipped("2017.4.40f1", base()).unwrap();
+    assert!(old.contains("needs 2018.1"), "{old}");
     let new = skipped("6000.5.0f1", base()).unwrap();
     assert!(new.contains("up to 6000.4"), "{new}");
     // Bones gain a GUID and a colour at 2021.1.0; m_ScriptableObjects arrives at 2023.1.0.
@@ -4563,8 +4566,19 @@ fn a_declared_size_at_the_header_edge() {
 }
 
 #[test]
-fn an_atlas_from_before_2019_1_is_refused_when_read_directly() {
+fn an_atlas_from_before_2018_1_is_refused_when_read_directly() {
+    // 2018's atlas layout is 2019's; 2017's is refused.
     let file = file_2018(&[(3, SPRITE_ATLAS, atlas(false, &[]))]);
+    let file = SerializedFile::parse(file).unwrap();
+    let object = file.object(3).unwrap();
+    assert!(unity_bundle_assets::SpriteAtlas::read(&file, object).is_ok());
+    let file = serialized(
+        17,
+        "2017.4.40f1",
+        false,
+        19,
+        &[(3, SPRITE_ATLAS, atlas(false, &[]))],
+    );
     let file = SerializedFile::parse(file).unwrap();
     let object = file.object(3).unwrap();
     assert!(matches!(

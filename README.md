@@ -59,7 +59,7 @@ and open each with `Assets::from_bundle`.
   Fields are gated by engine release, checked against the per-release type trees UnityPy
   ships; those run to the 6000.4 betas, so 6000.4 finals are read with the betas' layout,
   unchecked.
-- `Sprite` and `SpriteAtlas` from Unity 2019.1 through 6000.4, likewise. Every object read
+- `Sprite` and `SpriteAtlas` from Unity 2018.1 through 6000.4, likewise. Every object read
   must end exactly where its last field does, so a layout misread is an error rather than
   wrong numbers.
 - Packing rotation and flips, and tight packing (pixels outside the sprite's mesh are cleared,
@@ -88,7 +88,7 @@ Each of these gives an error naming it:
 
 - Encrypted bundles, the older `UnityWeb` / `UnityRaw` containers, and bundles whose textures
   stream from a different bundle.
-- Engine releases before 5.5 (textures) or 2019.1 (sprites), after 6000.4, alpha builds, and
+- Engine releases before 5.5 (textures) or 2018.1 (sprites), after 6000.4, alpha builds, and
   files whose engine version was stripped outside a bundle.
 - Every texture format not listed above: crunch-compressed, BC6H, ETC, EAC, ASTC, PVRTC, ATC
   and YUY2.
@@ -232,7 +232,9 @@ over mutated files (set `UBA_FUZZ_ITERS` to run longer); it is evidence, not pro
   to 136 pixels each. Across all 148 Unity files of the build (57 serialized files, built-in
   resources included, and 91 bundles), 6,054 textures decode; the 44 that do not are empty. Its 34 ARGB4444 textures match UnityPy exactly.
 - 737 asset bundles from a Unity 5.6.6, 5.6.7 and 2018.4 (.2, .11, .36) game and its mods: all
-  open, and 15,193 textures export; the one failure is a dynamic font texture stored empty. On
+  open, and 15,193 textures export; the one failure is a dynamic font texture stored empty.
+  Its 19 sprites (2018.4) export and match unity-rs-core 0.5.2 up to the colour of fully
+  transparent pixels. On
   a sample of 171 bundles, 3,042 of the 3,056 textures UnityPy could decode are pixel-identical
   to its output, and the other 14 are the Alpha8 colour convention above, with identical alpha.
   Four of those bundles repacked as LZMA export byte-identical PNGs.

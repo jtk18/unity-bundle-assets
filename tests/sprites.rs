@@ -653,10 +653,88 @@ fn sub_mesh_ranges_must_fit_the_index_buffer() {
     }
 }
 
+/// A tight sprite over [`TRIANGLE`] in the 2018 layout, with a four-component channel of
+/// `extra` format after the position: 2018's numbering, whose sizes differ from 2019's for it.
+fn tight_2018(source_skin: Option<usize>, extra: u8) -> Vec<u8> {
+    let r = [0.0, 0.0, 4.0, 4.0];
+    let mesh = Mesh {
+        extra_channel: Some((extra, 4)),
+        ..TRIANGLE
+    };
+    sprite_ext(
+        false,
+        false,
+        "s",
+        r,
+        [0.0, 0.0],
+        1,
+        0,
+        TEX,
+        0,
+        r,
+        0,
+        1.0,
+        &mesh,
+        1.0,
+        [0.0, 0.0],
+        &SpriteExtras {
+            before_2019: true,
+            source_skin,
+            ..Default::default()
+        },
+    )
+}
+
+#[test]
+fn sprites_from_2018() {
+    let tex = |layout| {
+        texture(
+            layout,
+            false,
+            "tex",
+            4,
+            4,
+            format::RGBA32,
+            &Pixels::Inline(&rgba_4x4()),
+            &[],
+        )
+    };
+    let export = |unity: &str, sprite: Vec<u8>| {
+        // Texture2D changed layout at 2018.2 as well.
+        let layout = if unity.starts_with("2018.1") {
+            Layout::U2017_3
+        } else {
+            Layout::U2018_4
+        };
+        let (_d, mut a) = open_with(
+            &[(TEX, TEXTURE_2D, tex(layout)), (1, SPRITE, sprite)],
+            unity,
+            Limits::default(),
+        );
+        export_one(&mut a, "s")
+    };
+    // 2018's SNorm8 (4) and SInt16 (10) are a byte and two bytes a component; read with 2019's
+    // numbering (UNorm16, UInt32) they would be two and four, and the positions would move.
+    for extra in [4, 10] {
+        let img = export("2018.4.36f1", tight_2018(None, extra)).unwrap();
+        assert_eq!(kept(&img), LOWER_LEFT, "format {extra}");
+    }
+    // 2018.1 carries m_SourceSkin after the bind poses; 2018.2 on does not.
+    assert_eq!(
+        kept(&export("2018.1.9f2", tight_2018(Some(2), 4)).unwrap()),
+        LOWER_LEFT
+    );
+    assert!(export("2018.2.21f1", tight_2018(Some(2), 4)).is_err());
+    assert!(export("2018.1.9f2", tight_2018(None, 4)).is_err());
+    // The 2018 layout is not 2019's, nor the other way round.
+    assert!(export("2019.1.14f1", tight_2018(None, 4)).is_err());
+    assert!(export("2018.4.36f1", tight(false, false, &TRIANGLE)).is_err());
+}
+
 #[test]
 fn old_engines_list_their_sprites_as_skipped() {
     let s = own("s", [1.0, 1.0, 2.0, 2.0], RECT);
-    let (_d, a) = open_with(&[(1, SPRITE, s)], "2018.4.36f1", Limits::default());
+    let (_d, a) = open_with(&[(1, SPRITE, s)], "2017.4.40f1", Limits::default());
     let list = a.sprites(|_| true);
     assert!(list.sprites.is_empty());
     assert!(matches!(list.skipped[0].error, Error::Unsupported(_)));

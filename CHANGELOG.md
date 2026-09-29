@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- `Sprite` and `SpriteAtlas` from Unity 2018.1 (was 2019.1): no secondary textures before
+  2019.1, the 2017-2018 vertex format numbering, and 2018.1's `m_SourceSkin`. The 19 real
+  2018.4 sprites in the test corpus match unity-rs-core 0.5.2 up to transparent colour.
 - Texture formats R8, RG16, R16, RG32, BGR24, RGB48, RGBA64, RHalf, RGHalf, RGBAHalf, RFloat,
   RGFloat, RGBAFloat, RGB9e5, DXT3, BC4, BC5 and BC7, each checked byte for byte against
   unity-rs-core 0.5.2 on random data, and BC7 on real textures too. Formats stored wider than

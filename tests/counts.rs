@@ -153,6 +153,7 @@ fn object_and_bundle_counts() {
         secondary_textures: &[(11, "_Normal")],
         bindposes: 0,
         outlines: &[outline],
+        ..Default::default()
     };
     // Each object last in its file, padded at its end.
     let in_file = |class: i32, mut object: Vec<u8>, pad: usize, unity: &str| {

@@ -312,6 +312,10 @@ pub struct SpriteExtras<'a> {
     pub bindposes: usize,
     /// `m_PhysicsShape`: outlines of points.
     pub outlines: &'a [&'a [[f32; 2]]],
+    /// The 2018 layout: no `secondaryTextures`, and vertex formats numbered as before 2019.
+    pub before_2019: bool,
+    /// `m_SourceSkin` entries (2018.1 only), written after the bind poses.
+    pub source_skin: Option<usize>,
 }
 
 /// [`sprite`] with pixels per unit and the texture rect's offset within the full rect.
@@ -392,10 +396,19 @@ pub fn sprite_ext(
     o.pptr(0, atlas);
     // m_RD
     o.pptr(0, texture).pptr(0, alpha_texture);
-    o.i32(extras.secondary_textures.len() as i32); // secondaryTextures
-    for &(texture, name) in extras.secondary_textures {
-        o.pptr(0, texture).string(name);
+    if !extras.before_2019 {
+        o.i32(extras.secondary_textures.len() as i32); // secondaryTextures
+        for &(texture, name) in extras.secondary_textures {
+            o.pptr(0, texture).string(name);
+        }
     }
+    let size = |format: u8| {
+        if extras.before_2019 {
+            vertex_format_size_2018(format)
+        } else {
+            vertex_format_size(format)
+        }
+    };
     let b = mesh.base_vertex as usize;
     // Unused vertices before the mesh's own, reached only through the base vertex; and, for
     // `junk_lines`, a huge triangle after them.
@@ -447,10 +460,10 @@ pub fn sprite_ext(
     } else {
         (1, 0)
     };
-    let pos_bytes = usize::from(mesh.pos_dims) * vertex_format_size(mesh.pos_format);
+    let pos_bytes = usize::from(mesh.pos_dims) * size(mesh.pos_format);
     let extra_bytes = mesh
         .extra_channel
-        .map_or(0, |(f, d)| usize::from(d) * vertex_format_size(f));
+        .map_or(0, |(f, d)| usize::from(d) * size(f));
     o.i32(2 + i32::from(mesh.extra_channel.is_some()));
     o.raw(&[ps, 0, mesh.pos_format, mesh.pos_dims]);
     if let Some((format, dims)) = mesh.extra_channel {
@@ -476,7 +489,7 @@ pub fn sprite_ext(
     };
     let uvs = |vb: &mut W| {
         for _ in &verts {
-            vb.zeros(2 * vertex_format_size(mesh.uv_format));
+            vb.zeros(2 * size(mesh.uv_format));
         }
     };
     let pad = |vb: &mut W| {
@@ -496,6 +509,10 @@ pub fn sprite_ext(
     o.bytes(&vb.buf);
     o.i32(extras.bindposes as i32); // m_Bindpose
     o.zeros(64 * extras.bindposes);
+    if let Some(n) = extras.source_skin {
+        o.i32(n as i32); // m_SourceSkin: BoneWeights4
+        o.zeros(32 * n);
+    }
     o.rect(
         texture_rect[0],
         texture_rect[1],
@@ -528,6 +545,17 @@ pub const fn vertex_format_size(format: u8) -> usize {
         1 | 4 | 5 | 8 | 9 => 2, // Float16, UNorm16, SNorm16, UInt16, SInt16
         2 | 3 | 6 | 7 => 1,     // UNorm8, SNorm8, UInt8, SInt8
         _ => 4,                 // Float32, UInt32, SInt32 (0, 10, 11); others unused
+    }
+}
+
+/// Bytes per component of the vertex formats of 2017 and 2018, which put `Color` (one byte a
+/// component) at 2 and number every later format one higher than 2019 does. From Unity's
+/// documentation of that release, not from the crate.
+pub const fn vertex_format_size_2018(format: u8) -> usize {
+    match format {
+        1 | 5 | 6 | 9 | 10 => 2, // Float16, UNorm16, SNorm16, UInt16, SInt16
+        2 | 3 | 4 | 7 | 8 => 1,  // Color, UNorm8, SNorm8, UInt8, SInt8
+        _ => 4,                  // Float32, UInt32, SInt32 (0, 11, 12); others unused
     }
 }
 

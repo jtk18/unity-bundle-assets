@@ -10,7 +10,7 @@ use crate::{check_release, quoted, Error, LimitKind, Result, Version};
 use std::collections::HashMap;
 
 /// Sprites and sprite atlases are read from this release on.
-const OLDEST: [u32; 3] = [2019, 1, 0];
+const OLDEST: [u32; 3] = [2018, 1, 0];
 
 /// A reference to an object, possibly in another file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -194,7 +194,7 @@ impl std::fmt::Debug for Sprite {
 }
 
 impl Sprite {
-    /// Read a `Sprite` object, Unity 2019.1 through 6000.4: final, patch, China and beta
+    /// Read a `Sprite` object, Unity 2018.1 through 6000.4: final, patch, China and beta
     /// builds (6000.4 finals are read with its betas' layout, which is all that was checked).
     ///
     /// # Errors
@@ -266,13 +266,19 @@ fn read_sprite(
     // m_RD
     let texture = PPtr::read(r)?;
     let alpha_texture = PPtr::read(r)?;
-    for _ in 0..r.len(16)? {
-        PPtr::read(r)?; // secondaryTextures
-        r.skip_string()?;
+    if v >= [2019, 1, 0] {
+        for _ in 0..r.len(16)? {
+            PPtr::read(r)?; // secondaryTextures
+            r.skip_string()?;
+        }
     }
-    let triangles = read_mesh(r, big_endian, budget)?;
+    let triangles = read_mesh(r, big_endian, budget, v)?;
     let bindposes = r.len(64)?;
     r.skip(bindposes * 64)?;
+    if v < [2018, 2, 0] {
+        let weights = r.len(32)?; // m_SourceSkin, 2018.1 only: BoneWeights4
+        r.skip(weights * 32)?;
+    }
     let texture_rect = Rect::read(r)?;
     let texture_rect_offset = [r.f32()?, r.f32()?];
     r.skip(8)?; // atlasRectOffset
@@ -323,8 +329,18 @@ fn read_sprite(
     })
 }
 
-/// Bytes per component of each `VertexFormat` (Unity 2019 and on).
-const fn component_size(format: u8) -> Option<usize> {
+/// Bytes per component of each `VertexFormat`: from Unity 2019 on, or before (2017 and 2018),
+/// when a `Color` format came at 2 and pushed every later one up by one.
+const fn component_size(format: u8, before_2019: bool) -> Option<usize> {
+    let format = if !before_2019 {
+        format
+    } else if format == 2 {
+        return Some(1); // Color: four bytes, one a component
+    } else if format > 2 {
+        format - 1
+    } else {
+        format
+    };
     Some(match format {
         0 | 10 | 11 => 4,       // Float, UInt32, SInt32
         1 | 4 | 5 | 8 | 9 => 2, // Float16, UNorm16, SNorm16, UInt16, SInt16
@@ -341,6 +357,7 @@ fn read_mesh(
     r: &mut Reader,
     big_endian: bool,
     budget: Budget,
+    v: [u32; 3],
 ) -> Result<Option<Vec<[[f32; 2]; 3]>>> {
     struct SubMesh {
         first_byte: u32,
@@ -419,7 +436,7 @@ fn read_mesh(
         if d > 0 {
             let slot = &mut strides[usize::from(stream)];
             *slot = slot
-                .zip(component_size(format))
+                .zip(component_size(format, v < [2019, 1, 0]))
                 .map(|(s, size)| s.saturating_add(size.saturating_mul(d as usize)));
         }
     }
@@ -499,7 +516,7 @@ impl std::fmt::Debug for SpriteAtlas {
 }
 
 impl SpriteAtlas {
-    /// Read a `SpriteAtlas` object, Unity 2019.1 through 6000.4: final, patch, China and beta
+    /// Read a `SpriteAtlas` object, Unity 2018.1 through 6000.4: final, patch, China and beta
     /// builds (6000.4 finals are read with its betas' layout, which is all that was checked).
     ///
     /// # Errors
